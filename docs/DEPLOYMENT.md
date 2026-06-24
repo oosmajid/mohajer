@@ -4,6 +4,26 @@ Target: a small Debian/Ubuntu VPS. Everything listens on `127.0.0.1`; the only t
 facing the internet is the `cloudflared` outbound tunnel. ~512MB RAM is enough but
 leaves little headroom (see OPERATIONS.md).
 
+## The easy path: the wizard
+
+```bash
+git clone <your-repo> mohajer && cd mohajer
+sudo bash scripts/wizard.sh
+```
+
+`scripts/wizard.sh` does everything below interactively: installs xray + cloudflared,
+prompts for domain/token/admin id, runs the Cloudflare login, creates the tunnel +
+DNS, **generates all three configs from one source of truth** (random WS paths, ports,
+and the matching ENDPOINTS — so the tag/port/path triple can't drift), writes a
+`chmod 600` `bot.env`, installs the systemd units, and starts the stack. The only
+manual step is the browser login it launches.
+
+The rest of this document is the **manual / explanatory** version — read it if you
+want to understand each piece, customise beyond what the wizard asks, or adopt the
+existing production server.
+
+---
+
 ## 0. Prerequisites
 - A domain on **Cloudflare** (orange-cloud/proxied). Example: `cdn.example.ir`.
 - A Telegram bot token (@BotFather) and your numeric admin id (@userinfobot).

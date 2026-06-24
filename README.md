@@ -59,14 +59,24 @@ mohajer/
 └── README.md                   # this file
 ```
 
-## Quick start
+## Quick start — one wizard
 
-1. Read **[AGENTS.md](AGENTS.md)** (orientation) and **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**.
-2. On the VPS: install `xray-core` + `cloudflared`, create the tunnel + DNS.
-3. `cp config/bot.env.example /opt/mohajer/bot.env` and fill it in (`chmod 600`).
-4. Drop `config/xray.config.json` → `/usr/local/etc/xray/config.json`,
-   `config/cloudflared.config.yml` → `/root/.cloudflared/config.yml`.
-5. `sudo bash scripts/install.sh` → `/start` your bot.
+On a fresh Debian/Ubuntu VPS, clone the repo and run the wizard. It installs
+`xray-core` + `cloudflared`, asks a handful of questions (domain, bot token, admin
+id), generates all three configs from a single source of truth (so tag/port/path
+never drift), and starts everything:
+
+```bash
+git clone <your-repo> mohajer && cd mohajer
+sudo bash scripts/wizard.sh
+```
+
+The only manual moment is the Cloudflare browser login the wizard launches for you.
+After it finishes, open your bot and send `/start`.
+
+> Prefer to do it by hand or understand each step? See **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**.
+> `scripts/install.sh` is the lower-level helper (bot + sub + units only) that the
+> wizard builds on. New here? Read **[AGENTS.md](AGENTS.md)** first.
 
 ## Security notes
 

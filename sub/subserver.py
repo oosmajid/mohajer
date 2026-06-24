@@ -6,9 +6,12 @@
 import os, re, json, html, time, base64, sqlite3, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-ROOT = "/opt/dpsub"
-DB_PATH = "/opt/dpbot/dpbot.db"
-HOST, PORT = "127.0.0.1", 8090
+# Paths come from env (set by the systemd unit / wizard); defaults match the
+# legacy live server so nothing breaks if env is absent.
+ROOT = os.environ.get("SUB_DIR", "/opt/dpsub")
+DB_PATH = os.environ.get("DB", "/opt/dpbot/dpbot.db")
+HOST = os.environ.get("SUB_HOST", "127.0.0.1")
+PORT = int(os.environ.get("SUB_PORT", "8090"))
 SAFE = re.compile(r"^sub-[A-Za-z0-9_.-]+$")
 GB = 1024 ** 3
 

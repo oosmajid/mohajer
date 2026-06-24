@@ -7,6 +7,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# Reuse the same env file as the bot (subserver reads SUB_DIR, DB, SUB_HOST, SUB_PORT).
+# '-' = optional; if absent, subserver falls back to its built-in defaults.
+EnvironmentFile=-/opt/mohajer/bot.env
 ExecStart=/usr/bin/python3 /opt/mohajer/sub/subserver.py
 Restart=always
 RestartSec=3
