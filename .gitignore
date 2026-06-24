@@ -1,0 +1,22 @@
+# secrets — never commit
+bot.env
+config/bot.env
+*.env
+!*.env.example
+
+# runtime state
+*.db
+*.db-journal
+*.db-wal
+sub-*
+dpbot.db
+
+# os / editor
+.DS_Store
+*.swp
+__pycache__/
+*.pyc
+
+# local export scratch
+mhx/
+*.tgz

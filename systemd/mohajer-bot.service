@@ -1,0 +1,17 @@
+# Mohajer Telegram admin panel (the bot).
+# Deployed as /etc/systemd/system/mohajer-bot.service (on the live server this is dpbot.service).
+[Unit]
+Description=Mohajer Telegram panel bot
+After=network-online.target xray.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=DPBOT_ENV=/opt/mohajer/bot.env
+ExecStart=/usr/bin/python3 /opt/mohajer/bot/bot.py
+Restart=always
+RestartSec=3
+# bot.env holds the token — keep it 600 and out of git.
+
+[Install]
+WantedBy=multi-user.target

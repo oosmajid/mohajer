@@ -1,0 +1,36 @@
+# Mohajer — cloudflared tunnel config (/root/.cloudflared/config.yml on the server).
+# The tunnel is OUTBOUND-ONLY: it dials Cloudflare from the VPS, so it works behind
+# NAT and bypasses the inbound-IP throttling that hits the server's own IP from Iran.
+#
+# Cloudflare routes by Host/SNI + path to this tunnel; each ingress rule maps a
+# WS/XHTTP path to the matching local xray inbound. Paths MUST match xray's
+# wsSettings/xhttpSettings.path AND the bot's ENDPOINTS[].path.
+#
+# Replace <TUNNEL-UUID> and the hostname. The credentials-file is created by
+# `cloudflared tunnel create`. The last rule MUST be a bare catch-all (no hostname).
+
+tunnel: <TUNNEL-UUID>
+credentials-file: /root/.cloudflared/<TUNNEL-UUID>.json
+
+ingress:
+  # --- xray inbounds (path-routed) ---
+  - hostname: cdn.example.ir
+    path: ^/1afb5cae5563
+    service: http://127.0.0.1:10000        # vless-ws
+  - hostname: cdn.example.ir
+    path: ^/xh38900ed9
+    service: http://127.0.0.1:10001        # vless-xh
+  - hostname: cdn.example.ir
+    path: ^/tr4b0be2a3
+    service: http://127.0.0.1:10002        # trojan-ws
+  - hostname: cdn.example.ir
+    path: ^/vmd32dedfa
+    service: http://127.0.0.1:10003        # vmess-ws
+
+  # --- subscription pages / files ---
+  - hostname: cdn.example.ir
+    path: ^/sub-
+    service: http://127.0.0.1:8090         # mohajer sub-server
+
+  # --- mandatory catch-all (no hostname filter) ---
+  - service: http_status:404
