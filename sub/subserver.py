@@ -53,7 +53,7 @@ def bars_html(info):
         pct = min(100.0, used / lim * 100.0)
         col = "#16a34a" if pct < 70 else ("#d97706" if pct < 90 else "#dc2626")
         val = "%s / %s" % (fmt_bytes(used), fmt_bytes(lim))
-        out.append('<div class="stat"><div class="lbl"><span>📦 حجم مصرفی</span><span>%s</span></div>'
+        out.append('<div class="stat"><div class="lbl"><span>📦 حجم مصرفی</span><span class="v">%s</span></div>'
                    '<div class="track"><div class="fill" style="width:%.1f%%;background:%s"></div></div></div>' % (val, pct, col))
     else:
         out.append('<div class="stat"><div class="lbl"><span>📦 حجم</span><span>نامحدود</span></div>'
@@ -99,6 +99,7 @@ h1{font-size:17px;margin:4px 2px 10px}
 .stats{background:#14181f;border:1px solid #222836;border-radius:14px;padding:13px 14px;margin:0 0 14px}
 .stat{margin-bottom:12px}.stat:last-child{margin-bottom:0}
 .lbl{display:flex;justify-content:space-between;font-size:12.5px;color:#aeb4bf;margin-bottom:6px}
+.lbl .v{direction:ltr;unicode-bidi:isolate;white-space:nowrap}
 .track{height:9px;background:#1b2030;border-radius:6px;overflow:hidden}
 .fill{height:100%;border-radius:6px}
 .sub{font-size:12px;color:#7c828d;margin:0 2px 12px}
