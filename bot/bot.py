@@ -31,6 +31,7 @@ POLL        = int(ENV.get("POLL_SECONDS", "30"))
 ENDPOINTS   = json.loads(ENV.get("ENDPOINTS", "[]"))
 DEFAULT_IPS = [x.strip() for x in ENV.get("IPS", "104.16.96.1,104.21.96.1,104.19.96.1").split(",") if x.strip()]
 GB = 1024 ** 3
+GRACE_SECONDS = 48 * 3600  # after quota/time runs out, keep the link (disabled) this long for renewal, then auto-delete
 API_URL = "https://api.telegram.org/bot%s/" % TOKEN
 SSLCTX = ssl.create_default_context()
 
@@ -43,8 +44,12 @@ def init_db():
     c.execute("""CREATE TABLE IF NOT EXISTS users(
         token TEXT PRIMARY KEY, uuid TEXT, email TEXT UNIQUE, label TEXT,
         limit_bytes INTEGER, expiry_ts INTEGER, created_ts INTEGER,
-        base_bytes INTEGER DEFAULT 0, last_raw INTEGER DEFAULT 0, used_bytes INTEGER DEFAULT 0)""")
+        base_bytes INTEGER DEFAULT 0, last_raw INTEGER DEFAULT 0, used_bytes INTEGER DEFAULT 0,
+        disabled_ts INTEGER DEFAULT 0)""")
     c.execute("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)")
+    cols = [r[1] for r in c.execute("PRAGMA table_info(users)").fetchall()]
+    if "disabled_ts" not in cols:  # migrate existing DBs
+        c.execute("ALTER TABLE users ADD COLUMN disabled_ts INTEGER DEFAULT 0")
     c.commit(); c.close()
 
 def meta_get(k, d=None):
@@ -244,6 +249,30 @@ def delete_user(token):
         c.execute("DELETE FROM users WHERE token=?", (token,)); c.commit()
     c.close()
 
+def exhaust_reason(u, now=None):
+    now = now or int(time.time())
+    if (u["limit_bytes"] or 0) > 0 and u["used_bytes"] >= u["limit_bytes"]: return "حجم تمام شد"
+    if (u["expiry_ts"] or 0) > 0 and now >= u["expiry_ts"]: return "زمان تمام شد"
+    return None
+
+def disable_user(token):
+    # exhausted: stop service (remove from xray) but KEEP the row + sub file so it can be renewed within the grace window
+    xr_remove_user(token)
+    c = db(); c.execute("UPDATE users SET disabled_ts=? WHERE token=?", (int(time.time()), token)); c.commit(); c.close()
+
+def reenable_user(token):
+    c = db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone(); c.close()
+    if not u: return
+    xr_add_user(token, u["uuid"]); write_sub(token, u["uuid"], u["label"])
+    c = db(); c.execute("UPDATE users SET disabled_ts=0 WHERE token=?", (token,)); c.commit(); c.close()
+
+def maybe_reenable(token):
+    # after an extend: if it was disabled but now has quota/time again, bring it back live immediately
+    c = db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone(); c.close()
+    if u and u["disabled_ts"] and not exhaust_reason(u):
+        reenable_user(token); return True
+    return False
+
 def refresh_usage(token):
     c = db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone()
     if not u: c.close(); return
@@ -277,8 +306,9 @@ def refresh_all_usage():
     c.commit(); c.close()
 
 def resync_all():
-    c = db(); rows = c.execute("SELECT token,uuid,label FROM users").fetchall(); c.close()
+    c = db(); rows = c.execute("SELECT token,uuid,label,disabled_ts FROM users").fetchall(); c.close()
     for u in rows:
+        if u["disabled_ts"]: continue   # in 48h grace — keep it out of xray (stays renewable)
         xr_add_user(u["token"], u["uuid"]); write_sub(u["token"], u["uuid"], u["label"])
 
 def notify_admin(text):
@@ -315,7 +345,7 @@ def dur_kb():
 
 def list_kb():
     c = db(); rows = c.execute("SELECT * FROM users ORDER BY created_ts DESC").fetchall(); c.close()
-    kb = [[{"text": "🔗 %s · %s/%s · %s" % (u["label"], fmt_bytes(u["used_bytes"]), human_limit(u["limit_bytes"]), human_expiry(u["expiry_ts"])),
+    kb = [[{"text": "%s %s · %s/%s · %s" % (("⏸" if u["disabled_ts"] else "🔗"), u["label"], fmt_bytes(u["used_bytes"]), human_limit(u["limit_bytes"]), human_expiry(u["expiry_ts"])),
             "callback_data": "u:%s" % u["token"]}] for u in rows]
     kb.append([{"text": "بازگشت", "callback_data": "menu"}]); return kb
 
@@ -327,8 +357,13 @@ def result_text(token):
             % (html.escape(u["label"]), human_limit(u["limit_bytes"]), human_expiry(u["expiry_ts"]), sub_url(token)))
 
 def detail_text(u):
-    return ("🔗 <b>%s</b>\n\n📦 مصرف: %s از %s\n⏳ %s\n🆔 <code>u_%s</code>\n\n🔗 <code>%s</code>"
-            % (html.escape(u["label"]), fmt_bytes(u["used_bytes"]), human_limit(u["limit_bytes"]),
+    status = ""
+    dts = u["disabled_ts"] if "disabled_ts" in u.keys() else 0
+    if dts:
+        left_h = max(0, (dts + GRACE_SECONDS - int(time.time())) // 3600)
+        status = "⏸ <b>غیرفعال شد</b> (%s) — تا ~%d ساعت دیگر قابل تمدید است، وگرنه خودکار حذف می‌شود.\n\n" % (exhaust_reason(u) or "اتمام", left_h)
+    return ("%s🔗 <b>%s</b>\n\n📦 مصرف: %s از %s\n⏳ %s\n🆔 <code>u_%s</code>\n\n🔗 <code>%s</code>"
+            % (status, html.escape(u["label"]), fmt_bytes(u["used_bytes"]), human_limit(u["limit_bytes"]),
                human_expiry(u["expiry_ts"]), u["token"], sub_url(u["token"])))
 
 def detail_kb(token):
@@ -411,7 +446,7 @@ def route_cb(chat, mid, data, cbid):
         if val == "unlim": set_unlimited(token, "limit_bytes" if is_vol else "expiry_ts")
         elif is_vol:       extend_volume(token, val)
         else:              extend_time(token, val)
-        answer(cbid, "بروز شد ✅"); refresh_usage(token)
+        answer(cbid, "بروز شد ✅"); refresh_usage(token); maybe_reenable(token)
         c = db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone(); c.close()
         if u: edit(chat, mid, detail_text(u), detail_kb(token))
         return
@@ -455,7 +490,7 @@ def handle_update(up):
         is_vol = st["stage"] == "addvol_custom"; token = st["token"]
         try: n = float(text.replace(",", ".")) if is_vol else int(text)
         except Exception: send(chat, "یک عدد بفرست:"); return
-        (extend_volume if is_vol else extend_time)(token, n); pending.pop(chat, None); refresh_usage(token)
+        (extend_volume if is_vol else extend_time)(token, n); pending.pop(chat, None); refresh_usage(token); maybe_reenable(token)
         c = db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone(); c.close()
         if u: send(chat, "✅ بروز شد.\n\n" + detail_text(u), detail_kb(token))
         return
@@ -485,14 +520,20 @@ def enforcer():
             if pid and pid != "0" and pid != last_pid:
                 resync_all(); last_pid = pid; meta_set("xray_pid", pid)
             refresh_all_usage()
-            c = db(); rows = c.execute("SELECT token,used_bytes,limit_bytes,expiry_ts,label FROM users").fetchall(); c.close()
+            c = db(); rows = c.execute("SELECT token,uuid,used_bytes,limit_bytes,expiry_ts,label,disabled_ts FROM users").fetchall(); c.close()
             now = int(time.time())
             for cur in rows:
-                reason = None
-                if cur["limit_bytes"] > 0 and cur["used_bytes"] >= cur["limit_bytes"]: reason = "حجم تمام شد"
-                elif cur["expiry_ts"] > 0 and now >= cur["expiry_ts"]: reason = "زمان تمام شد"
+                reason = exhaust_reason(cur, now)
                 if reason:
-                    delete_user(cur["token"]); notify_admin("⛔️ لینک «%s» خودکار غیرفعال و حذف شد (%s)." % (cur["label"], reason))
+                    if not cur["disabled_ts"]:                       # just ran out -> disable + notify, start 48h grace
+                        disable_user(cur["token"])
+                        notify_admin("⏸ لینک «%s» غیرفعال شد (%s).\nتا ۴۸ ساعت قابل تمدید است؛ بعد از آن خودکار حذف می‌شود." % (cur["label"], reason))
+                    elif now - cur["disabled_ts"] >= GRACE_SECONDS:  # grace over -> delete + notify
+                        delete_user(cur["token"])
+                        notify_admin("🗑 لینک «%s» پس از ۴۸ ساعت مهلتِ تمدید، خودکار حذف شد." % cur["label"])
+                elif cur["disabled_ts"]:                             # got renewed -> bring back live + notify
+                    reenable_user(cur["token"])
+                    notify_admin("▶️ لینک «%s» تمدید شد و دوباره فعال شد." % cur["label"])
         except Exception as e:
             print("enforcer err", e, flush=True)
         time.sleep(POLL)
