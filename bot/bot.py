@@ -674,75 +674,86 @@ def users_overview():
     return out
 
 ADMIN_CSS = """
-:root{--bg:#0b1316;--panel:#111d22;--panel2:#16242b;--line:#213840;--tx:#e8eff1;--mut:#8ba1a8;--sig:#35e0c4;--sig2:#6ee7a8;--warn:#f4b543;--dng:#ff6b6b;--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;--sans:Tahoma,"Segoe UI",-apple-system,system-ui,sans-serif}
+:root{--paper:#F4F1E8;--card:#FFFFFF;--ink:#111111;--accent:#FFDD2D;--ok:#2FCB74;--warn:#FFB020;--dng:#FF5A47;--mut:#6B675C;--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;--sans:Tahoma,"Segoe UI",-apple-system,system-ui,sans-serif}
 *{box-sizing:border-box}
 html,body{margin:0;max-width:100%}
-body{background:radial-gradient(1100px 460px at 100% -8%,#12262b 0,transparent 58%),var(--bg);color:var(--tx);font-family:var(--sans);line-height:1.6;padding:18px 14px 44px;-webkit-font-smoothing:antialiased}
+body{background:var(--paper);color:var(--ink);font-family:var(--sans);line-height:1.55;padding:18px 14px 48px;-webkit-font-smoothing:antialiased}
 .wrap{max-width:840px;margin:0 auto}
-a{color:var(--sig)}
+a{color:var(--ink);text-decoration:none}
 .mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.bar{cursor:pointer}
+.tt{position:fixed;display:none;background:var(--ink);color:var(--paper);border:2px solid var(--ink);padding:5px 9px;font-family:var(--mono);font-size:12px;font-weight:700;pointer-events:none;z-index:60;box-shadow:3px 3px 0 rgba(0,0,0,.28)}
 .n{unicode-bidi:isolate;direction:ltr}
-.eyebrow{font-size:11px;color:var(--mut);font-weight:600;margin-bottom:6px}
-.top{display:flex;align-items:center;gap:10px;margin:0 2px 18px}
-.brand{display:flex;align-items:center;gap:9px;font-weight:700;font-size:16px;letter-spacing:.02em}
-.dot-sig{width:9px;height:9px;border-radius:50%;background:var(--sig);box-shadow:0 0 0 3px rgba(53,224,196,.14),0 0 12px var(--sig)}
-.crumb{font-size:13px}
+.eyebrow{display:inline-block;font-size:11px;font-weight:800;background:var(--ink);color:var(--paper);padding:3px 8px;margin-bottom:10px}
+.top{display:flex;align-items:center;gap:10px;margin:0 2px 20px}
+.brand{display:flex;align-items:center;gap:9px;font-weight:800;font-size:19px}
+.dot-sig{width:15px;height:15px;background:var(--accent);border:2px solid var(--ink)}
+.crumb{font-size:13px;font-weight:800}
 .rightnav{margin-inline-start:auto;display:flex;align-items:center;gap:10px}
-.card{background:linear-gradient(180deg,var(--panel),#0f1a1f);border:1px solid var(--line);border-radius:16px;padding:16px;margin:0 0 14px}
-.card h2{margin:0 0 12px;font-size:12px;color:var(--mut);font-weight:600}
-.hero{position:relative;overflow:hidden}
-.hero::before{content:"";position:absolute;left:0;right:0;top:0;height:1px;background:linear-gradient(90deg,transparent,var(--sig),transparent);opacity:.55}
-.big{font-family:var(--mono);font-size:42px;font-weight:600;line-height:1.05}
-.big small{font-family:var(--sans);font-size:15px;color:var(--mut);margin-inline-start:6px}
-.title{font-size:22px;font-weight:700;margin:2px 0}
-.metrics{display:flex;gap:24px;flex-wrap:wrap;margin-top:10px}
-.metric .k{font-size:12px;color:var(--mut)}
-.metric .v{font-size:17px;font-weight:600;margin-top:2px}
+.card{background:var(--card);border:3px solid var(--ink);box-shadow:5px 5px 0 var(--ink);padding:16px;margin:0 0 18px}
+.card h2{margin:0 0 12px;font-size:12px;color:var(--ink);font-weight:800}
+.hero{background:var(--accent)}
+.big{font-family:var(--mono);font-size:44px;font-weight:800;line-height:1.02}
+.big small{font-family:var(--sans);font-size:15px;font-weight:700;margin-inline-start:6px}
+.title{font-size:24px;font-weight:800;margin:2px 0}
+.metrics{display:flex;gap:20px;flex-wrap:wrap;margin-top:12px}
+.metric .k{font-size:11px;color:var(--ink);font-weight:800}
+.metric .v{font-size:18px;font-weight:800;margin-top:3px}
 .pills{display:flex;gap:8px;margin-top:14px}
-.pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--mut);background:var(--panel2);border:1px solid var(--line);border-radius:999px;padding:4px 11px}
-.d{width:7px;height:7px;border-radius:50%}
-.d.ok{background:var(--sig);box-shadow:0 0 8px var(--sig)}
-.d.off{background:var(--mut)}
+.pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:700;color:var(--ink);background:var(--card);border:2px solid var(--ink);padding:4px 10px}
+.d{width:9px;height:9px;border:2px solid var(--ink)}
+.d.ok{background:var(--ok)}
+.d.off{background:var(--paper)}
 .chart{margin-top:16px}
 svg{display:block;width:100%}
-.u{display:flex;align-items:center;gap:12px;padding:12px 6px;border-top:1px solid var(--line);color:var(--tx);border-radius:10px}
-.u:first-of-type{border-top:0}
-.u:hover{background:var(--panel2)}
-.st{width:9px;height:9px;border-radius:50%;flex:0 0 auto}
-.st.ok{background:var(--sig);box-shadow:0 0 8px var(--sig)}
+.u{display:grid;grid-template-columns:14px 1fr 72px 84px;align-items:center;gap:10px;padding:12px;border:2px solid var(--ink);background:var(--card);color:var(--ink);margin-top:10px}
+.u:first-of-type{margin-top:0}
+.u:hover{transform:translate(-2px,-2px);box-shadow:4px 4px 0 var(--ink)}
+.st{width:12px;height:12px;border:2px solid var(--ink);flex:0 0 auto}
+.st.ok{background:var(--ok)}
 .st.warn{background:var(--warn)}
 .st.dng{background:var(--dng)}
-.st.off{background:var(--mut)}
+.st.off{background:var(--paper)}
 .nm{flex:1 1 auto;min-width:0;display:flex;flex-direction:column}
-.nm b{font-weight:600;font-size:14px}
-.nm .sub{font-size:11px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.meter{flex:0 0 76px}
-.trk{display:block;height:6px;background:var(--panel2);border:1px solid var(--line);border-radius:5px;overflow:hidden}
-.fil{display:block;height:100%;background:linear-gradient(90deg,var(--sig2),var(--sig))}
-.rt{font-size:12px;color:var(--mut);text-align:end;flex:0 0 auto;min-width:66px;line-height:1.35}
-.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;font-family:inherit;font-size:13px;font-weight:600;border:1px solid transparent;border-radius:10px;padding:10px 15px;cursor:pointer;text-decoration:none;color:#04231e;background:linear-gradient(180deg,var(--sig2),var(--sig));transition:transform .08s,box-shadow .2s}
-.btn:hover{box-shadow:0 6px 20px rgba(53,224,196,.22)}
-.btn:active{transform:translateY(1px)}
-.btn.ghost{background:var(--panel2);color:var(--tx);border-color:var(--line)}
-.btn.ghost:hover{box-shadow:none;border-color:var(--sig)}
-.btn.danger{background:transparent;color:var(--dng);border-color:rgba(255,107,107,.42)}
-.btn.danger:hover{background:rgba(255,107,107,.1);box-shadow:none}
-input[type=text],input[type=number]{background:var(--panel2);border:1px solid var(--line);color:var(--tx);border-radius:10px;padding:10px 12px;font-family:inherit;font-size:14px;flex:1 1 130px;min-width:0;max-width:260px;outline:none}
-input::placeholder{color:#5f757c}
-input:focus{border-color:var(--sig);box-shadow:0 0 0 3px rgba(53,224,196,.15)}
+.nm b{font-weight:800;font-size:14px}
+.nm .sub{font-size:11px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-family:var(--mono)}
+.meter{min-width:0}
+.trk{display:block;height:10px;background:var(--card);border:2px solid var(--ink);overflow:hidden}
+.fil{display:block;height:100%;background:var(--ink)}
+.rt{font-size:12px;color:var(--mut);text-align:end;min-width:0;line-height:1.3;font-weight:700}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;font-family:inherit;font-size:13px;font-weight:800;border:3px solid var(--ink);padding:9px 14px;cursor:pointer;text-decoration:none;color:var(--ink);background:var(--accent);box-shadow:3px 3px 0 var(--ink);transition:transform .06s,box-shadow .06s}
+.btn:hover{transform:translate(-1px,-1px);box-shadow:4px 4px 0 var(--ink)}
+.btn:active{transform:translate(3px,3px);box-shadow:0 0 0 var(--ink)}
+.btn.ghost{background:var(--card)}
+.btn.danger{background:var(--dng);color:#fff}
+input[type=text],input[type=number],textarea{background:var(--card);border:3px solid var(--ink);color:var(--ink);border-radius:0;padding:9px 11px;font-family:inherit;font-size:14px;flex:1 1 130px;min-width:0;max-width:280px;outline:none}
+input[type=number]{max-width:96px}
+textarea{width:100%;max-width:100%;font-family:var(--mono);resize:vertical}
+input::placeholder,textarea::placeholder{color:#9a958a}
+input:focus,textarea:focus{box-shadow:3px 3px 0 var(--accent)}
+input[type=checkbox]{width:20px;height:20px;accent-color:var(--ink);flex:0 0 auto}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 form.row{margin:0 0 8px}
-.grid{display:grid;gap:8px}
-code{font-family:var(--mono);background:var(--panel2);border:1px solid var(--line);padding:4px 8px;border-radius:8px;word-break:break-all;font-size:12px;color:var(--sig2)}
-:focus-visible{outline:2px solid var(--sig);outline-offset:2px}
+.grid{display:grid;gap:10px}
+.eprow{display:flex;align-items:center;gap:10px;justify-content:space-between;border:2px solid var(--ink);padding:10px 12px;background:var(--card)}
+.eplabel{display:flex;align-items:center;gap:10px;flex:1;min-width:0;cursor:pointer}
+.eplabel b{font-weight:800}
+.eptag{display:block;font-size:11px;color:var(--mut);font-family:var(--mono);margin-top:2px}
+code{font-family:var(--mono);background:var(--paper);border:2px solid var(--ink);padding:6px 8px;word-break:break-all;font-size:12px;color:var(--ink);display:block}
+:focus-visible{outline:3px solid var(--ink);outline-offset:2px}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 """
 
 def _page(title, inner):
     return ("<!doctype html><html lang=fa dir=rtl><head><meta charset=utf-8>"
             "<meta name=viewport content='width=device-width,initial-scale=1'>"
-            "<meta name=color-scheme content=dark><title>%s</title>"
-            "<style>%s</style></head><body><div class=wrap>%s</div></body></html>" % (html.escape(title), ADMIN_CSS, inner))
+            "<meta name=color-scheme content=light><title>%s</title>"
+            "<style>%s</style></head><body><div class=wrap>%s</div><div id=tt class=tt></div>"
+            "<script>(function(){var t=document.getElementById('tt');document.addEventListener('click',function(e){"
+            "var b=e.target.closest&&e.target.closest('.bar');if(b){t.textContent=b.getAttribute('data-t')+' — '+b.getAttribute('data-v');"
+            "t.style.display='block';var w=t.offsetWidth;t.style.left=Math.max(6,Math.min(e.clientX-w/2,window.innerWidth-w-6))+'px';"
+            "t.style.top=Math.max(6,e.clientY-40)+'px';}else{t.style.display='none';}});})();</script>"
+            "</body></html>" % (html.escape(title), ADMIN_CSS, inner))
 
 def _html(page):
     return 200, {"Content-Type": "text/html; charset=utf-8"}, page.encode("utf-8")
@@ -764,13 +775,13 @@ def _metric_big(b):
 def svg_bars(series, w=760, h=96):
     vals = [v for _, v in series]; mx = max(vals + [1]); n = len(series) or 1; bw = w / n; bars = ""
     for i, (lab, v) in enumerate(series):
-        bh = max(2.0, (v / mx) * (h - 8))
-        bars += ('<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" rx="3" fill="url(#sig)" opacity="%s">'
-                 '<title>%s: %s</title></rect>') % (i * bw + 3, h - bh, max(2.0, bw - 6), bh,
-                 ("1" if v > 0 else "0.25"), html.escape(lab), fmt_bytes(v))
+        bh = max(3.0, (v / mx) * (h - 6)); val = fmt_bytes(v)
+        bars += ('<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" fill="#111111" opacity="%s"></rect>'
+                 ) % (i * bw + 3, h - bh, max(3.0, bw - 6), bh, ("1" if v > 0 else "0.18"))
+        # full-height transparent hit target -> tappable on touch; carries the value for the tooltip
+        bars += ('<rect class="bar" x="%.1f" y="0" width="%.1f" height="%d" fill="transparent" data-t="%s" data-v="%s">'
+                 '<title>%s: %s</title></rect>') % (i * bw, bw, h, html.escape(lab), html.escape(val), html.escape(lab), val)
     return ('<svg viewBox="0 0 %d %d" width="100%%" height="%d" preserveAspectRatio="none" role="img" aria-label="نمودار مصرف">'
-            '<defs><linearGradient id="sig" x1="0" y1="0" x2="0" y2="1">'
-            '<stop offset="0" stop-color="#6ee7a8"/><stop offset="1" stop-color="#2fbfa6"/></linearGradient></defs>'
             '%s</svg>') % (w, h, h, bars)
 
 def render_expired():
