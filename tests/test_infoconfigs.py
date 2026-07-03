@@ -26,5 +26,30 @@ class TestRelabel(unittest.TestCase):
         self.assertEqual(j["add"], "1.2.3.4")  # body untouched
 
 
+class TestDecorate(unittest.TestCase):
+    def _info(self, **kw):
+        base = {"used_bytes": 0, "limit_bytes": 0, "expiry_ts": 0, "disabled_ts": 0}
+        base.update(kw); return base
+
+    def test_active_prepends_two_working_clones(self):
+        links = [VLESS, make_vmess("Real2")]
+        out = s.decorate(links, self._info(limit_bytes=100, used_bytes=40))
+        self.assertEqual(len(out), 4)
+        self.assertTrue(out[0].startswith("vless://11111111-"))  # a real working clone
+        self.assertIn("باقی‌مانده", s.parse_label(out[0])[0])
+        self.assertIn("آپدیت", s.parse_label(out[1])[0])
+        self.assertEqual(out[2:], links)  # real configs preserved, in order
+
+    def test_disabled_keeps_only_info_configs(self):
+        links = [VLESS, make_vmess("Real2")]
+        out = s.decorate(links, self._info(disabled_ts=123))
+        self.assertEqual(len(out), 2)
+        self.assertIn("تمام شد", s.parse_label(out[0])[0])
+
+    def test_empty_or_none_unchanged(self):
+        self.assertEqual(s.decorate([], self._info()), [])
+        self.assertEqual(s.decorate([VLESS], None), [VLESS])
+
+
 if __name__ == "__main__":
     unittest.main()

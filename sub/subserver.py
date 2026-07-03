@@ -96,6 +96,26 @@ def relabel(link, name):
     base = link.rsplit("#", 1)[0] if "#" in link else link
     return base + "#" + urllib.parse.quote(name)
 
+def status_name(info):
+    if info.get("disabled_ts"):
+        return "⛔ اعتبار تمام شد — تمدید کنید"
+    lim, used, exp = info["limit_bytes"], info["used_bytes"], info["expiry_ts"]
+    voltxt = fmt_bytes(max(0, lim - used)) if (lim and lim > 0) else "نامحدود"
+    timetxt = human_left(exp) if (exp and exp > 0) else "نامحدود"
+    return "📦 باقی‌مانده: %s · ⏳ %s" % (voltxt, timetxt)
+
+def update_name(info):
+    return "🔄 بعد از تمدید، آپدیت کنید" if info.get("disabled_ts") else "🔄 هر روز یک‌بار آپدیت کنید"
+
+def decorate(links, info):
+    if not links or not info:
+        return links
+    tmpl = links[0]
+    out = [relabel(tmpl, status_name(info)), relabel(tmpl, update_name(info))]
+    if info.get("disabled_ts"):
+        return out
+    return out + links
+
 PAGE = """<!doctype html><html lang="fa" dir="rtl"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 <title>کانفیگ‌ها</title>
