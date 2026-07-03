@@ -55,3 +55,25 @@ The operator's machine runs a local proxy: `127.0.0.1:10808` (SOCKS5),
 `127.0.0.1:10809` (HTTP). `api.github.com` is blocked on that network — route `gh`
 through the HTTP proxy. zsh does NOT word-split unquoted vars, so pass ssh options
 inline or via a bash array, not via an unquoted `$SSH` string.
+
+## Web admin panel (`/a/*`)
+The bot serves a web admin panel on `127.0.0.1:${ADMIN_PORT:-8091}` (in-process,
+so it shares the single-writer path). Route it through the tunnel by adding an
+ingress rule **before** the catch-all in the cloudflared config, then reload:
+
+```yaml
+ingress:
+  - hostname: cdn.delplayer.ir
+    path: /a/*
+    service: http://127.0.0.1:8091   # admin panel (must come BEFORE the catch-all)
+  # ... existing sub rule(s) ...
+  - hostname: cdn.delplayer.ir
+    service: http://127.0.0.1:8090   # sub server (catch-all, stays last)
+  - service: http_status:404
+```
+`systemctl restart cloudflared` (or reload). Get in by sending `/admin` to the
+bot: it returns a one-time link (`<SUB_BASE>/a/login/<token>`) valid 10 minutes,
+which sets a 24h HttpOnly session cookie scoped to `/a`. All mutations are
+CSRF-protected; delete needs a second confirm. A bot restart clears all
+sessions/login-links — just send `/admin` again. The panel binds `127.0.0.1`
+only, so it is unreachable except through this ingress.

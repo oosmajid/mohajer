@@ -6,6 +6,8 @@
 import os, re, sys, json, time, html, base64, sqlite3, secrets, threading, subprocess
 import uuid as uuidlib
 import urllib.request, urllib.parse, ssl
+import http.cookies
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 def load_env(path):
     env = {}
@@ -28,10 +30,17 @@ SUB_DIR     = ENV.get("SUB_DIR", "/opt/dpsub")
 SUB_BASE    = ENV.get("SUB_BASE_URL", "https://cdn.delplayer.ir")
 DB_PATH     = ENV.get("DB", "/opt/dpbot/dpbot.db")
 POLL        = int(ENV.get("POLL_SECONDS", "30"))
+ADMIN_PORT  = int(ENV.get("ADMIN_PORT", "8091"))
 ENDPOINTS   = json.loads(ENV.get("ENDPOINTS", "[]"))
 DEFAULT_IPS = [x.strip() for x in ENV.get("IPS", "104.16.96.1,104.21.96.1,104.19.96.1").split(",") if x.strip()]
 GB = 1024 ** 3
+IRAN_OFFSET = 3 * 3600 + 30 * 60  # UTC+03:30; Iran has no DST since 2022
 GRACE_SECONDS = 48 * 3600  # after quota/time runs out, keep the link (disabled) this long for renewal, then auto-delete
+
+def day_key(ts=None):
+    if ts is None:
+        ts = time.time()
+    return time.strftime("%Y-%m-%d", time.gmtime(ts + IRAN_OFFSET))
 API_URL = "https://api.telegram.org/bot%s/" % TOKEN
 SSLCTX = ssl.create_default_context()
 
@@ -47,6 +56,9 @@ def init_db():
         base_bytes INTEGER DEFAULT 0, last_raw INTEGER DEFAULT 0, used_bytes INTEGER DEFAULT 0,
         disabled_ts INTEGER DEFAULT 0)""")
     c.execute("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)")
+    c.execute("""CREATE TABLE IF NOT EXISTS usage_daily(
+        token TEXT, day TEXT, start_used INTEGER, end_used INTEGER,
+        PRIMARY KEY(token, day))""")
     cols = [r[1] for r in c.execute("PRAGMA table_info(users)").fetchall()]
     if "disabled_ts" not in cols:  # migrate existing DBs
         c.execute("ALTER TABLE users ADD COLUMN disabled_ts INTEGER DEFAULT 0")
@@ -298,12 +310,32 @@ def xr_usage_all():
         return {}
 
 def refresh_all_usage():
-    raws = xr_usage_all(); c = db()
+    raws = xr_usage_all(); c = db(); today = day_key()
     for u in c.execute("SELECT token,base_bytes,last_raw FROM users").fetchall():
         raw = raws.get(u["token"], 0); base = u["base_bytes"]
         if raw < u["last_raw"]: base += u["last_raw"]
-        c.execute("UPDATE users SET base_bytes=?,last_raw=?,used_bytes=? WHERE token=?", (base, raw, base + raw, u["token"]))
+        used = base + raw
+        c.execute("UPDATE users SET base_bytes=?,last_raw=?,used_bytes=? WHERE token=?", (base, raw, used, u["token"]))
+        record_daily(c, u["token"], used, today)
+    prune_daily(c)
     c.commit(); c.close()
+
+def record_daily(c, token, used, day):
+    r = c.execute("SELECT start_used,end_used FROM usage_daily WHERE token=? AND day=?", (token, day)).fetchone()
+    if r is None:
+        c.execute("INSERT INTO usage_daily(token,day,start_used,end_used) VALUES(?,?,?,?)", (token, day, used, used))
+    elif used > r["end_used"]:
+        c.execute("UPDATE usage_daily SET end_used=? WHERE token=? AND day=?", (used, token, day))
+
+def prune_daily(c, keep_days=30):
+    cutoff = day_key(time.time() - keep_days * 86400)
+    c.execute("DELETE FROM usage_daily WHERE day < ?", (cutoff,))
+
+def panel_usage_summary():
+    c = db(); day = day_key()
+    total = c.execute("SELECT COALESCE(SUM(used_bytes),0) v FROM users").fetchone()["v"]
+    today = c.execute("SELECT COALESCE(SUM(max(end_used-start_used,0)),0) v FROM usage_daily WHERE day=?", (day,)).fetchone()["v"]
+    c.close(); return int(total), int(today)
 
 def resync_all():
     c = db(); rows = c.execute("SELECT token,uuid,label,disabled_ts FROM users").fetchall(); c.close()
@@ -456,7 +488,12 @@ def route_cb(chat, mid, data, cbid):
         token = data[3:]; answer(cbid); edit(chat, mid, "⏳ چقدر زمان اضافه شود؟", addtime_kb(token)); return
     if data == "list":
         answer(cbid); c = db(); n = c.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]; c.close()
-        edit(chat, mid, "📋 لینک‌های فعال:" if n else "هنوز لینکی نساخته‌ای. با ➕ شروع کن.", list_kb()); return
+        if n:
+            total, today = panel_usage_summary()
+            head = "📋 لینک‌های فعال:\n📊 مصرف کل: %s · امروز: %s" % (fmt_bytes(total), fmt_bytes(today))
+        else:
+            head = "هنوز لینکی نساخته‌ای. با ➕ شروع کن."
+        edit(chat, mid, head, list_kb()); return
     if data.startswith("u:"):
         token = data[2:]; refresh_usage(token)
         c = db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone(); c.close()
@@ -508,6 +545,9 @@ def handle_update(up):
         token = create_user(st.get("vol_gb", 0), st.get("dur_days", 0), label=(text.strip()[:40] or None)); pending.pop(chat, None)
         send(chat, result_text(token) if token else "❌ خطا در ساخت کاربر.",
              [[{"text": "بازگشت به منو", "callback_data": "menu"}]] if token else main_menu_kb()); return
+    if text.startswith("/admin"):
+        tok = mint_login()
+        send(chat, "🔐 لینک ورود به پنل (۱۰ دقیقه اعتبار، یک‌بار مصرف):\n<code>%s/a/login/%s</code>" % (SUB_BASE, tok)); return
     if text.startswith("/start"):
         pending.pop(chat, None); send(chat, WELCOME, main_menu_kb()); return
     send(chat, "از دکمه‌ها استفاده کن 👇", main_menu_kb())
@@ -538,10 +578,246 @@ def enforcer():
             print("enforcer err", e, flush=True)
         time.sleep(POLL)
 
+# ================= ADMIN PANEL (web) =================
+LOGIN_TTL = 600      # one-time login link lifetime (s)
+SESS_TTL  = 86400    # session cookie lifetime (s)
+_login_tokens = {}   # token -> expires_ts
+_sessions = {}       # sid -> {"exp": ts, "csrf": str}
+
+def _prune_auth(now):
+    for k in [k for k, v in _login_tokens.items() if v <= now]: _login_tokens.pop(k, None)
+    for k in [k for k, s in _sessions.items() if s["exp"] <= now]: _sessions.pop(k, None)
+
+def mint_login(now=None):
+    now = now or int(time.time()); _prune_auth(now)
+    tok = secrets.token_urlsafe(24); _login_tokens[tok] = now + LOGIN_TTL; return tok
+
+def consume_login(tok, now=None):
+    now = now or int(time.time())
+    exp = _login_tokens.pop(tok, None)
+    return bool(exp and exp > now)
+
+def new_session(now=None):
+    now = now or int(time.time())
+    sid = secrets.token_urlsafe(24); csrf = secrets.token_urlsafe(16)
+    _sessions[sid] = {"exp": now + SESS_TTL, "csrf": csrf}
+    return sid, csrf
+
+def session_csrf(sid, now=None):
+    now = now or int(time.time())
+    s = _sessions.get(sid) if sid else None
+    if not s or s["exp"] <= now:
+        if sid: _sessions.pop(sid, None)
+        return None
+    return s["csrf"]
+
+def cookie_sid(cookie_header):
+    try:
+        c = http.cookies.SimpleCookie(); c.load(cookie_header or "")
+        return c["mj_sess"].value if "mj_sess" in c else None
+    except Exception:
+        return None
+
+def daily_series(days=7, token=None, now=None):
+    base = now or time.time()
+    keys = [day_key(base - (days - 1 - i) * 86400) for i in range(days)]
+    c = db()
+    if token:
+        rows = c.execute("SELECT day, max(end_used-start_used,0) v FROM usage_daily WHERE token=? AND day>=?",
+                         (token, keys[0])).fetchall()
+    else:
+        rows = c.execute("SELECT day, SUM(max(end_used-start_used,0)) v FROM usage_daily WHERE day>=? GROUP BY day",
+                         (keys[0],)).fetchall()
+    c.close()
+    m = {r["day"]: int(r["v"] or 0) for r in rows}
+    return [(k, m.get(k, 0)) for k in keys]
+
+def users_overview():
+    c = db(); today = day_key()
+    rows = c.execute("SELECT token,label,used_bytes,limit_bytes,expiry_ts,disabled_ts,created_ts FROM users ORDER BY created_ts DESC").fetchall()
+    daily = {r["token"]: int(r["v"] or 0) for r in
+             c.execute("SELECT token, max(end_used-start_used,0) v FROM usage_daily WHERE day=?", (today,)).fetchall()}
+    c.close()
+    out = []
+    for r in rows:
+        d = dict(r); d["today"] = daily.get(r["token"], 0); out.append(d)
+    return out
+
+ADMIN_CSS = ("body{font-family:-apple-system,Segoe UI,Roboto,Tahoma,sans-serif;background:#0e1014;color:#e8eaed;"
+             "margin:0;padding:16px;line-height:1.6}a{color:#5b9dff}.wrap{max-width:820px;margin:0 auto}"
+             "h1{font-size:19px}h2{font-size:15px;color:#aeb4bf}.card{background:#14181f;border:1px solid #222836;"
+             "border-radius:12px;padding:14px;margin:12px 0}table{width:100%;border-collapse:collapse;font-size:13px}"
+             "th,td{text-align:right;padding:8px 6px;border-bottom:1px solid #222836}"
+             "svg rect{fill:#2563eb}.btn{display:inline-block;background:#2563eb;color:#fff;border:0;border-radius:8px;"
+             "padding:9px 14px;font-size:13px;cursor:pointer;text-decoration:none}.btn.g{background:#1b2030;color:#cdd2db}"
+             "input,form{margin:4px 0}input[type=text],input[type=number]{background:#0e1014;border:1px solid #2a3140;"
+             "color:#e8eaed;border-radius:8px;padding:8px;width:120px}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}"
+             "code{background:#0e1014;padding:2px 6px;border-radius:6px;word-break:break-all}")
+
+def _page(title, inner):
+    return ("<!doctype html><html lang=fa dir=rtl><head><meta charset=utf-8>"
+            "<meta name=viewport content='width=device-width,initial-scale=1'><title>%s</title>"
+            "<style>%s</style></head><body><div class=wrap>%s</div></body></html>" % (html.escape(title), ADMIN_CSS, inner))
+
+def _html(page):
+    return 200, {"Content-Type": "text/html; charset=utf-8"}, page.encode("utf-8")
+
+def svg_bars(series, w=780, h=90):
+    mx = max([v for _, v in series] + [1]); n = len(series) or 1; bw = w / n; bars = ""
+    for i, (lab, v) in enumerate(series):
+        bh = (v / mx) * (h - 4); y = h - bh
+        bars += '<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" rx="2"><title>%s: %s</title></rect>' % (
+            i * bw + 2, y, bw - 4, bh, html.escape(lab), fmt_bytes(v))
+    return '<svg viewBox="0 0 %d %d" width="100%%" height="%d" preserveAspectRatio="none">%s</svg>' % (w, h, h, bars)
+
+def render_expired():
+    return _page("منقضی", "<h1>لینک منقضی شد</h1><p>برای ورود دوباره، در ربات دستور <code>/admin</code> را بزن.</p>")
+
+def render_dashboard():
+    total, today = panel_usage_summary()
+    ov = users_overview()
+    active = sum(1 for u in ov if not u["disabled_ts"]); disabled = len(ov) - active
+    chart = svg_bars(daily_series(7))
+    head = ("<h1>📊 پنل Mohajer</h1><div class=card><div class=row>"
+            "<div>مصرف کل: <b>%s</b></div><div>امروز: <b>%s</b></div>"
+            "<div>لینک‌ها: <b>%d</b> (فعال %d / غیرفعال %d)</div></div>"
+            "<h2>مصرف ۷ روز اخیر</h2>%s</div>" % (fmt_bytes(total), fmt_bytes(today), len(ov), active, disabled, chart))
+    rows = "".join(
+        "<tr><td><a href='/a/user?token=%s'>%s%s</a></td><td>%s / %s</td><td>%s</td><td>%s</td></tr>" % (
+            u["token"], ("⏸ " if u["disabled_ts"] else ""), html.escape(u["label"]),
+            fmt_bytes(u["used_bytes"]), human_limit(u["limit_bytes"]), fmt_bytes(u["today"]), human_expiry(u["expiry_ts"]))
+        for u in ov) or "<tr><td colspan=4>لینکی نیست</td></tr>"
+    table = ("<div class=card><div class=row style='justify-content:space-between'><h2>کاربران</h2>"
+             "<a class=btn href='/a/new'>➕ لینک جدید</a></div>"
+             "<table><tr><th>نام</th><th>مصرف/سقف</th><th>امروز</th><th>انقضا</th></tr>%s</table></div>" % rows)
+    return _page("پنل", head + table)
+
+def _form(action, fields, csrf, btn, cls="btn"):
+    inner = "".join(fields) + "<input type=hidden name=csrf value='%s'>" % csrf
+    return "<form method=post action='%s' class=row>%s<button class='%s'>%s</button></form>" % (action, inner, cls, btn)
+
+def render_user(token, csrf):
+    c = db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone(); c.close()
+    if not u:
+        return _page("یافت نشد", "<h1>یافت نشد</h1><a href='/a/'>بازگشت</a>")
+    today_u = daily_series(1, token=token)[-1][1]
+    chart = svg_bars(daily_series(30, token=token))
+    tk = "<input type=hidden name=token value='%s'>" % token
+    forms = (
+        _form("/a/addvol", [tk, "<input type=number name=gb placeholder='GB'>"], csrf, "➕ حجم") +
+        _form("/a/addtime", [tk, "<input type=number name=days placeholder='روز'>"], csrf, "➕ زمان") +
+        _form("/a/rename", [tk, "<input type=text name=name placeholder='نام'>"], csrf, "✏️ نام") +
+        _form("/a/unlimit", [tk, "<input type=hidden name=field value=limit_bytes>"], csrf, "♾ حجم نامحدود", "btn g") +
+        _form("/a/unlimit", [tk, "<input type=hidden name=field value=expiry_ts>"], csrf, "♾ زمان نامحدود", "btn g"))
+    dele = "<a class='btn g' href='/a/del?token=%s' style='background:#dc2626;color:#fff'>🗑 حذف لینک</a>" % token
+    body = ("<h1>%s%s</h1><p><a href='/a/'>← داشبورد</a></p>"
+            "<div class=card>مصرف: <b>%s</b> از %s · امروز: %s · انقضا: %s<br>لینک: <code>%s</code></div>"
+            "<div class=card><h2>۳۰ روز اخیر</h2>%s</div>"
+            "<div class=card><h2>عملیات</h2>%s<div style='margin-top:10px'>%s</div></div>" % (
+                ("⏸ " if u["disabled_ts"] else ""), html.escape(u["label"]),
+                fmt_bytes(u["used_bytes"]), human_limit(u["limit_bytes"]), fmt_bytes(today_u),
+                human_expiry(u["expiry_ts"]), sub_url(token), chart, forms, dele))
+    return _page("کاربر", body)
+
+def render_new(csrf):
+    f = _form("/a/new", ["<input type=number name=gb placeholder='حجم GB (۰=نامحدود)'>",
+                         "<input type=number name=days placeholder='روز (۰=نامحدود)'>",
+                         "<input type=text name=name placeholder='نام'>"], csrf, "ساخت")
+    return _page("لینک جدید", "<h1>➕ لینک جدید</h1><p><a href='/a/'>← داشبورد</a></p><div class=card>%s</div>" % f)
+
+def render_delconfirm(token, csrf):
+    f = _form("/a/delete", ["<input type=hidden name=token value='%s'>" % token,
+                            "<input type=hidden name=confirm value=yes>"], csrf, "بله، حذف کن")
+    return _page("حذف", "<h1>حذف لینک؟</h1><p>این کار برگشت‌ناپذیر است.</p><div class=card>%s "
+                        "<a class='btn g' href='/a/user?token=%s'>انصراف</a></div>" % (f, token))
+
+def route_admin(method, path, query, cookie_header, body, now=None):
+    now = now or int(time.time())
+    if path.startswith("/a/login/"):
+        if consume_login(path[len("/a/login/"):], now):
+            sid, _ = new_session(now)
+            ck = "mj_sess=%s; HttpOnly; Secure; SameSite=Strict; Path=/a; Max-Age=%d" % (sid, SESS_TTL)
+            return 302, {"Location": "/a/", "Set-Cookie": ck}, b""
+        return 200, {"Content-Type": "text/html; charset=utf-8"}, render_expired().encode("utf-8")
+    csrf = session_csrf(cookie_sid(cookie_header), now)
+    if not csrf:
+        return 200, {"Content-Type": "text/html; charset=utf-8"}, render_expired().encode("utf-8")
+    if method == "GET":
+        if path in ("/a", "/a/"):      return _html(render_dashboard())
+        if path == "/a/user":          return _html(render_user(query.get("token", [""])[0], csrf))
+        if path == "/a/new":           return _html(render_new(csrf))
+        if path == "/a/del":           return _html(render_delconfirm(query.get("token", [""])[0], csrf))
+        return 404, {"Content-Type": "text/plain"}, b"not found"
+    return route_admin_post(method, path, query, csrf, body, now)
+
+def _redirect(loc):
+    return 302, {"Location": loc}, b""
+
+def route_admin_post(method, path, query, csrf, body, now):
+    form = {k: v[0] for k, v in urllib.parse.parse_qs(body.decode("utf-8", "ignore")).items()}
+    if form.get("csrf") != csrf:
+        return 403, {"Content-Type": "text/plain"}, b"forbidden"
+    token = form.get("token", "")
+    def _num(x, cast):
+        try: return cast(str(x).replace(",", "."))
+        except Exception: return None
+    if path == "/a/addvol":
+        gb = _num(form.get("gb"), float)
+        if gb: extend_volume(token, gb)
+        refresh_usage(token); maybe_reenable(token); return _redirect("/a/user?token=" + token)
+    if path == "/a/addtime":
+        days = _num(form.get("days"), int)
+        if days: extend_time(token, days)
+        maybe_reenable(token); return _redirect("/a/user?token=" + token)
+    if path == "/a/rename":
+        name = (form.get("name") or "").strip()[:40]
+        if name:
+            c = db(); c.execute("UPDATE users SET label=? WHERE token=?", (name, token)); c.commit(); c.close()
+        return _redirect("/a/user?token=" + token)
+    if path == "/a/unlimit":
+        field = form.get("field")
+        if field in ("limit_bytes", "expiry_ts"): set_unlimited(token, field)
+        maybe_reenable(token); return _redirect("/a/user?token=" + token)
+    if path == "/a/delete":
+        if form.get("confirm") == "yes" and token: delete_user(token)
+        return _redirect("/a/")
+    if path == "/a/new":
+        gb = _num(form.get("gb"), float) or 0
+        days = _num(form.get("days"), int) or 0
+        name = (form.get("name") or "").strip()[:40] or None
+        create_user(gb, days, label=name)
+        return _redirect("/a/")
+    return 404, {"Content-Type": "text/plain"}, b"not found"
+
+class AdminHandler(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def _run(self, method):
+        u = urllib.parse.urlparse(self.path)
+        query = urllib.parse.parse_qs(u.query)
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        body = self.rfile.read(length) if length else b""
+        cookie = self.headers.get("Cookie", "")
+        try:
+            status, headers, out = route_admin(method, u.path, query, cookie, body)
+        except Exception as e:
+            print("admin err", e, flush=True)
+            status, headers, out = 500, {"Content-Type": "text/plain"}, b"error"
+        self.send_response(status)
+        for k, v in headers.items(): self.send_header(k, v)
+        self.send_header("Content-Length", str(len(out)))
+        self.end_headers()
+        if out: self.wfile.write(out)
+    def do_GET(self):  self._run("GET")
+    def do_POST(self): self._run("POST")
+
+def admin_server():
+    ThreadingHTTPServer(("127.0.0.1", ADMIN_PORT), AdminHandler).serve_forever()
+
 def main():
     if not TOKEN: print("no BOT_TOKEN", flush=True); sys.exit(1)
     init_db(); tg("deleteWebhook")
     threading.Thread(target=enforcer, daemon=True).start()
+    threading.Thread(target=admin_server, daemon=True).start()
     print("dpbot started; endpoints=%d" % len(ENDPOINTS), flush=True)
     offset = None
     while True:
