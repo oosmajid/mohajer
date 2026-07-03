@@ -86,6 +86,16 @@ def parse_label(link):
     except Exception:
         return "config", "?"
 
+def relabel(link, name):
+    link = link.strip()
+    if link.startswith("vmess://"):
+        raw = link[8:]
+        j = json.loads(base64.b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8", "ignore"))
+        j["ps"] = name
+        return "vmess://" + base64.b64encode(json.dumps(j).encode()).decode()
+    base = link.rsplit("#", 1)[0] if "#" in link else link
+    return base + "#" + urllib.parse.quote(name)
+
 PAGE = """<!doctype html><html lang="fa" dir="rtl"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 <title>کانفیگ‌ها</title>
