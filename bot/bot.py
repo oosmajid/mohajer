@@ -615,6 +615,31 @@ def cookie_sid(cookie_header):
     except Exception:
         return None
 
+def daily_series(days=7, token=None, now=None):
+    base = now or time.time()
+    keys = [day_key(base - (days - 1 - i) * 86400) for i in range(days)]
+    c = db()
+    if token:
+        rows = c.execute("SELECT day, max(end_used-start_used,0) v FROM usage_daily WHERE token=? AND day>=?",
+                         (token, keys[0])).fetchall()
+    else:
+        rows = c.execute("SELECT day, SUM(max(end_used-start_used,0)) v FROM usage_daily WHERE day>=? GROUP BY day",
+                         (keys[0],)).fetchall()
+    c.close()
+    m = {r["day"]: int(r["v"] or 0) for r in rows}
+    return [(k, m.get(k, 0)) for k in keys]
+
+def users_overview():
+    c = db(); today = day_key()
+    rows = c.execute("SELECT token,label,used_bytes,limit_bytes,expiry_ts,disabled_ts,created_ts FROM users ORDER BY created_ts DESC").fetchall()
+    daily = {r["token"]: int(r["v"] or 0) for r in
+             c.execute("SELECT token, max(end_used-start_used,0) v FROM usage_daily WHERE day=?", (today,)).fetchall()}
+    c.close()
+    out = []
+    for r in rows:
+        d = dict(r); d["today"] = daily.get(r["token"], 0); out.append(d)
+    return out
+
 def main():
     if not TOKEN: print("no BOT_TOKEN", flush=True); sys.exit(1)
     init_db(); tg("deleteWebhook")
