@@ -53,6 +53,9 @@ def init_db():
         base_bytes INTEGER DEFAULT 0, last_raw INTEGER DEFAULT 0, used_bytes INTEGER DEFAULT 0,
         disabled_ts INTEGER DEFAULT 0)""")
     c.execute("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)")
+    c.execute("""CREATE TABLE IF NOT EXISTS usage_daily(
+        token TEXT, day TEXT, start_used INTEGER, end_used INTEGER,
+        PRIMARY KEY(token, day))""")
     cols = [r[1] for r in c.execute("PRAGMA table_info(users)").fetchall()]
     if "disabled_ts" not in cols:  # migrate existing DBs
         c.execute("ALTER TABLE users ADD COLUMN disabled_ts INTEGER DEFAULT 0")
@@ -310,6 +313,19 @@ def refresh_all_usage():
         if raw < u["last_raw"]: base += u["last_raw"]
         c.execute("UPDATE users SET base_bytes=?,last_raw=?,used_bytes=? WHERE token=?", (base, raw, base + raw, u["token"]))
     c.commit(); c.close()
+
+def record_daily(c, token, used, day):
+    r = c.execute("SELECT start_used,end_used FROM usage_daily WHERE token=? AND day=?", (token, day)).fetchone()
+    if r is None:
+        c.execute("INSERT INTO usage_daily(token,day,start_used,end_used) VALUES(?,?,?,?)", (token, day, used, used))
+    elif used > r["end_used"]:
+        c.execute("UPDATE usage_daily SET end_used=? WHERE token=? AND day=?", (used, token, day))
+
+def panel_usage_summary():
+    c = db(); day = day_key()
+    total = c.execute("SELECT COALESCE(SUM(used_bytes),0) v FROM users").fetchone()["v"]
+    today = c.execute("SELECT COALESCE(SUM(max(end_used-start_used,0)),0) v FROM usage_daily WHERE day=?", (day,)).fetchone()["v"]
+    c.close(); return int(total), int(today)
 
 def resync_all():
     c = db(); rows = c.execute("SELECT token,uuid,label,disabled_ts FROM users").fetchall(); c.close()

@@ -17,5 +17,43 @@ class TestDayKey(unittest.TestCase):
         self.assertEqual(bot.day_key(20 * 3600 + 1800), "1970-01-02")
 
 
+class TestDailyRecord(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self._orig = bot.DB_PATH
+        bot.DB_PATH = self.tmp.name
+        bot.init_db()
+        c = bot.db()
+        c.execute("INSERT INTO users(token,uuid,email,label,limit_bytes,expiry_ts,created_ts,base_bytes,last_raw,used_bytes) "
+                  "VALUES('aa','u','u_aa','A',0,0,0,0,0,0)")
+        c.commit(); c.close()
+
+    def tearDown(self):
+        bot.DB_PATH = self._orig
+        os.unlink(self.tmp.name)
+
+    def test_record_and_today_delta(self):
+        day = bot.day_key()
+        c = bot.db()
+        bot.record_daily(c, "aa", 100, day)     # first poll of the day
+        bot.record_daily(c, "aa", 500, day)     # later poll
+        c.execute("UPDATE users SET used_bytes=500 WHERE token='aa'")
+        c.commit(); c.close()
+        total, today = bot.panel_usage_summary()
+        self.assertEqual(total, 500)
+        self.assertEqual(today, 400)            # 500 - 100
+
+    def test_end_used_never_decreases(self):
+        day = bot.day_key()
+        c = bot.db()
+        bot.record_daily(c, "aa", 500, day)
+        bot.record_daily(c, "aa", 300, day)     # counter reset attempt -> ignored
+        row = c.execute("SELECT start_used,end_used FROM usage_daily WHERE token='aa' AND day=?", (day,)).fetchone()
+        c.close()
+        self.assertEqual(row["start_used"], 500)
+        self.assertEqual(row["end_used"], 500)
+
+
 if __name__ == "__main__":
     unittest.main()
