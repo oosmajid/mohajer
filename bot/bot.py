@@ -6,6 +6,8 @@
 import os, re, sys, json, time, html, base64, sqlite3, secrets, threading, subprocess
 import uuid as uuidlib
 import urllib.request, urllib.parse, ssl
+import http.cookies
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 def load_env(path):
     env = {}
@@ -28,6 +30,7 @@ SUB_DIR     = ENV.get("SUB_DIR", "/opt/dpsub")
 SUB_BASE    = ENV.get("SUB_BASE_URL", "https://cdn.delplayer.ir")
 DB_PATH     = ENV.get("DB", "/opt/dpbot/dpbot.db")
 POLL        = int(ENV.get("POLL_SECONDS", "30"))
+ADMIN_PORT  = int(ENV.get("ADMIN_PORT", "8091"))
 ENDPOINTS   = json.loads(ENV.get("ENDPOINTS", "[]"))
 DEFAULT_IPS = [x.strip() for x in ENV.get("IPS", "104.16.96.1,104.21.96.1,104.19.96.1").split(",") if x.strip()]
 GB = 1024 ** 3
@@ -571,6 +574,46 @@ def enforcer():
         except Exception as e:
             print("enforcer err", e, flush=True)
         time.sleep(POLL)
+
+# ================= ADMIN PANEL (web) =================
+LOGIN_TTL = 600      # one-time login link lifetime (s)
+SESS_TTL  = 86400    # session cookie lifetime (s)
+_login_tokens = {}   # token -> expires_ts
+_sessions = {}       # sid -> {"exp": ts, "csrf": str}
+
+def _prune_auth(now):
+    for k in [k for k, v in _login_tokens.items() if v <= now]: _login_tokens.pop(k, None)
+    for k in [k for k, s in _sessions.items() if s["exp"] <= now]: _sessions.pop(k, None)
+
+def mint_login(now=None):
+    now = now or int(time.time()); _prune_auth(now)
+    tok = secrets.token_urlsafe(24); _login_tokens[tok] = now + LOGIN_TTL; return tok
+
+def consume_login(tok, now=None):
+    now = now or int(time.time())
+    exp = _login_tokens.pop(tok, None)
+    return bool(exp and exp > now)
+
+def new_session(now=None):
+    now = now or int(time.time())
+    sid = secrets.token_urlsafe(24); csrf = secrets.token_urlsafe(16)
+    _sessions[sid] = {"exp": now + SESS_TTL, "csrf": csrf}
+    return sid, csrf
+
+def session_csrf(sid, now=None):
+    now = now or int(time.time())
+    s = _sessions.get(sid) if sid else None
+    if not s or s["exp"] <= now:
+        if sid: _sessions.pop(sid, None)
+        return None
+    return s["csrf"]
+
+def cookie_sid(cookie_header):
+    try:
+        c = http.cookies.SimpleCookie(); c.load(cookie_header or "")
+        return c["mj_sess"].value if "mj_sess" in c else None
+    except Exception:
+        return None
 
 def main():
     if not TOKEN: print("no BOT_TOKEN", flush=True); sys.exit(1)
