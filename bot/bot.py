@@ -31,7 +31,13 @@ POLL        = int(ENV.get("POLL_SECONDS", "30"))
 ENDPOINTS   = json.loads(ENV.get("ENDPOINTS", "[]"))
 DEFAULT_IPS = [x.strip() for x in ENV.get("IPS", "104.16.96.1,104.21.96.1,104.19.96.1").split(",") if x.strip()]
 GB = 1024 ** 3
+IRAN_OFFSET = 3 * 3600 + 30 * 60  # UTC+03:30; Iran has no DST since 2022
 GRACE_SECONDS = 48 * 3600  # after quota/time runs out, keep the link (disabled) this long for renewal, then auto-delete
+
+def day_key(ts=None):
+    if ts is None:
+        ts = time.time()
+    return time.strftime("%Y-%m-%d", time.gmtime(ts + IRAN_OFFSET))
 API_URL = "https://api.telegram.org/bot%s/" % TOKEN
 SSLCTX = ssl.create_default_context()
 
