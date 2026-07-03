@@ -51,5 +51,34 @@ class TestDecorate(unittest.TestCase):
         self.assertEqual(s.decorate([VLESS], None), [VLESS])
 
 
+class TestBuildResponse(unittest.TestCase):
+    def _b64(self, links):
+        return base64.b64encode("\n".join(links).encode()).decode()
+
+    def _info(self, **kw):
+        base = {"used_bytes": 40, "limit_bytes": 100, "expiry_ts": 0, "created_ts": 0, "label": "x", "disabled_ts": 0}
+        base.update(kw); return base
+
+    def test_raw_active_has_info_plus_real(self):
+        b64 = self._b64([VLESS, make_vmess("Real2")])
+        code, ctype, body, extra = s.build_response("sub-u-aa", b64, self._info(), "v2rayNG", False)
+        self.assertEqual(code, 200)
+        lines = base64.b64decode(body).decode().splitlines()
+        self.assertEqual(len(lines), 4)  # 2 info + 2 real
+        self.assertIn("Subscription-Userinfo", extra)
+
+    def test_raw_disabled_only_info(self):
+        b64 = self._b64([VLESS, make_vmess("Real2")])
+        code, ctype, body, extra = s.build_response("sub-u-aa", b64, self._info(disabled_ts=99), "v2rayNG", False)
+        lines = base64.b64decode(body).decode().splitlines()
+        self.assertEqual(len(lines), 2)
+
+    def test_html_for_browser(self):
+        b64 = self._b64([VLESS])
+        code, ctype, body, extra = s.build_response("sub-u-aa", b64, self._info(), "Mozilla/5.0", False)
+        self.assertIn("text/html", ctype)
+        self.assertIn("باقی‌مانده", body.decode("utf-8"))
+
+
 if __name__ == "__main__":
     unittest.main()

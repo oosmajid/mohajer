@@ -23,7 +23,7 @@ def user_info(name):
     try:
         c = sqlite3.connect("file:%s?mode=ro" % DB_PATH, uri=True, timeout=5)
         c.row_factory = sqlite3.Row
-        r = c.execute("SELECT used_bytes,limit_bytes,expiry_ts,created_ts,label FROM users WHERE token=?", (token,)).fetchone()
+        r = c.execute("SELECT used_bytes,limit_bytes,expiry_ts,created_ts,label,disabled_ts FROM users WHERE token=?", (token,)).fetchone()
         c.close()
         return dict(r) if r else None
     except Exception:
@@ -171,6 +171,30 @@ ROW = ('<div class="card"><div class="meta"><div class="name">%s</div>'
        '<div class="proto">%s</div></div>'
        '<button class="copy" onclick="copyOne(%d,this)">کپی</button></div>')
 
+def decode_links(b64):
+    try:
+        return [l for l in base64.b64decode(b64 + "=" * (-len(b64) % 4)).decode("utf-8", "ignore").splitlines() if l.strip()]
+    except Exception:
+        return []
+
+def build_response(name, b64, info, ua, wants_raw):
+    links = decorate(decode_links(b64), info)
+    if wants_raw or "Mozilla" not in ua:
+        body = base64.b64encode("\n".join(links).encode()).decode().encode()
+        extra = {"Profile-Update-Interval": "12"}
+        if info:
+            parts = ["upload=0", "download=%d" % int(info["used_bytes"])]
+            if info["limit_bytes"] and info["limit_bytes"] > 0: parts.append("total=%d" % int(info["limit_bytes"]))
+            if info["expiry_ts"] and info["expiry_ts"] > 0: parts.append("expire=%d" % int(info["expiry_ts"]))
+            extra["Subscription-Userinfo"] = "; ".join(parts)
+        return 200, "text/plain; charset=utf-8", body, extra
+    rows = "".join(ROW % (html.escape(parse_label(l)[0]), html.escape(parse_label(l)[1]), i) for i, l in enumerate(links)) or "<p>خالی</p>"
+    page = (PAGE.replace("%STATS%", bars_html(info))
+                .replace("%ROWS%", rows)
+                .replace("%COUNT%", str(len(links)))
+                .replace("%CONFIGS%", json.dumps(links).replace("</", "<\\/")))
+    return 200, "text/html; charset=utf-8", page.encode("utf-8"), {}
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
 
@@ -189,24 +213,8 @@ class H(BaseHTTPRequestHandler):
         info = user_info(name)
         ua = self.headers.get("User-Agent", "")
         wants_raw = "raw" in urllib.parse.parse_qs(u.query)
-        if wants_raw or "Mozilla" not in ua:
-            extra = {"Profile-Update-Interval": "12"}
-            if info:
-                parts = ["upload=0", "download=%d" % int(info["used_bytes"])]
-                if info["limit_bytes"] and info["limit_bytes"] > 0: parts.append("total=%d" % int(info["limit_bytes"]))
-                if info["expiry_ts"] and info["expiry_ts"] > 0: parts.append("expire=%d" % int(info["expiry_ts"]))
-                extra["Subscription-Userinfo"] = "; ".join(parts)
-            self._send(200, "text/plain; charset=utf-8", b64.encode(), extra); return
-        try:
-            links = [l for l in base64.b64decode(b64 + "=" * (-len(b64) % 4)).decode("utf-8", "ignore").splitlines() if l.strip()]
-        except Exception:
-            links = []
-        rows = "".join(ROW % (html.escape(parse_label(l)[0]), html.escape(parse_label(l)[1]), i) for i, l in enumerate(links)) or "<p>خالی</p>"
-        page = (PAGE.replace("%STATS%", bars_html(info))
-                    .replace("%ROWS%", rows)
-                    .replace("%COUNT%", str(len(links)))
-                    .replace("%CONFIGS%", json.dumps(links).replace("</", "<\\/")))
-        self._send(200, "text/html; charset=utf-8", page.encode("utf-8"))
+        code, ctype, body, extra = build_response(name, b64, info, ua, wants_raw)
+        self._send(code, ctype, body, extra)
 
 if __name__ == "__main__":
     ThreadingHTTPServer((HOST, PORT), H).serve_forever()
