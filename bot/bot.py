@@ -743,6 +743,11 @@ def render_expired():
                  "<div class=eyebrow>دسترسی</div><div class=title>لینک منقضی شد</div>"
                  "<p style='color:var(--mut);margin:6px 0 0'>برای ورود دوباره، در ربات دستور <code>/admin</code> را بزن.</p></div>")
 
+def render_loggedout():
+    return _page("خروج", _top() + "<div class='card hero' style='text-align:center;padding:34px 18px'>"
+                 "<div class=eyebrow>خروج</div><div class=title>با موفقیت خارج شدی</div>"
+                 "<p style='color:var(--mut);margin:6px 0 0'>برای ورودِ دوباره، در ربات دستور <code>/admin</code> را بزن.</p></div>")
+
 def _user_row(u):
     lim = u["limit_bytes"] or 0; used = u["used_bytes"] or 0; dis = u["disabled_ts"]
     if lim > 0:
@@ -841,15 +846,19 @@ def route_admin(method, path, query, cookie_header, body, now=None):
         if path == "/a/new":           return _html(render_new(csrf))
         if path == "/a/del":           return _html(render_delconfirm(query.get("token", [""])[0], csrf))
         return 404, {"Content-Type": "text/plain"}, b"not found"
-    return route_admin_post(method, path, query, csrf, body, now)
+    return route_admin_post(method, path, query, csrf, body, now, cookie_sid(cookie_header))
 
 def _redirect(loc):
     return 302, {"Location": loc}, b""
 
-def route_admin_post(method, path, query, csrf, body, now):
+def route_admin_post(method, path, query, csrf, body, now, sid):
     form = {k: v[0] for k, v in urllib.parse.parse_qs(body.decode("utf-8", "ignore")).items()}
     if form.get("csrf") != csrf:
         return 403, {"Content-Type": "text/plain"}, b"forbidden"
+    if path == "/a/logout":
+        _sessions.pop(sid, None)
+        ck = "mj_sess=; HttpOnly; Secure; SameSite=Strict; Path=/a; Max-Age=0"
+        return 200, {"Content-Type": "text/html; charset=utf-8", "Set-Cookie": ck}, render_loggedout().encode("utf-8")
     token = form.get("token", "")
     def _num(x, cast):
         try: return cast(str(x).replace(",", "."))

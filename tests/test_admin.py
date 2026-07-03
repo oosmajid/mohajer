@@ -127,6 +127,24 @@ class TestRoutePost(TestStats):
         c = bot.db(); n = c.execute("SELECT COUNT(*) c FROM users WHERE label='Fresh'").fetchone()["c"]; c.close()
         self.assertEqual(n, 1)
 
+    def test_logout_invalidates_session(self):
+        st, hdr, body = self._post("/a/logout", {"csrf": self.csrf})
+        self.assertEqual(st, 200)
+        self.assertNotIn(self.sid, bot._sessions)          # server-side invalidation
+        self.assertIn("Max-Age=0", hdr["Set-Cookie"])      # cookie cleared
+        self.assertIn("خارج", body.decode("utf-8"))
+
+    def test_logout_csrf_mismatch_keeps_session(self):
+        st, hdr, _ = self._post("/a/logout", {"csrf": "WRONG"})
+        self.assertEqual(st, 403)
+        self.assertIn(self.sid, bot._sessions)
+
+    def test_after_logout_dashboard_denied(self):
+        self._post("/a/logout", {"csrf": self.csrf})
+        st, hdr, body = bot.route_admin("GET", "/a/", {}, self.cookie, b"", now=1002)
+        self.assertEqual(st, 200)
+        self.assertIn("منقضی", body.decode("utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()
