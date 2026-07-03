@@ -94,9 +94,16 @@ ssh -p 49531 -o "ProxyCommand=nc -x 127.0.0.1:10808 -X 5 %h %p" root@23.94.29.30
   matching inbound to `xray.config.json` AND the ingress rule in cloudflared. Restart
   xray + cloudflared; the enforcer re-syncs users. `write_sub` auto-emits a config per
   TLS/no-TLS port.
-- **Change clean IPs:** use the bot panel (preferred — live, no restart) or set
-  `IPS=` in `bot.env` as the default. Stored override lives in `meta.clean_ips`.
-  Use `scripts/cf-clean-ip-scan.sh <host>` from a client network to pick them.
+- **Change clean IPs:** use the bot panel or the web panel's `/a/config` page
+  (both live, no restart) or set `IPS=` in `bot.env` as the default. Stored override
+  lives in `meta.clean_ips`. Use `scripts/cf-clean-ip-scan.sh <host>` from a client
+  network to pick them.
+- **Config recipe (types & counts):** the web panel's `/a/config` page (stored in
+  `meta.config_recipe` JSON) sets, per endpoint, `enabled` + `count` = how many
+  configs of that type to emit. Default (no override) = one per TLS/no-TLS port, i.e.
+  the legacy output. `count` is UNCAPPED; when it exceeds an endpoint's port-slots the
+  extra configs cycle over ports × clean IPs (`write_sub` honors this). Saving
+  regenerates every sub. `get_recipe()`/`set_recipe()` live next to `get_ips()`.
 - **Edit bot logic:** it's one file, stdlib only. After editing, copy to the server
   path (see table) and `systemctl restart dpbot` (live) / `mohajer-bot` (fresh).
 - **Inspect state:** `sqlite3 <db> "SELECT label,used_bytes,limit_bytes,expiry_ts FROM users"`.
@@ -125,7 +132,7 @@ users(
   last_raw    INTEGER,      -- last raw counter value seen (reset detection)
   used_bytes  INTEGER       -- base + last_raw (what UIs show)
 )
-meta(k TEXT PRIMARY KEY, v TEXT)   -- clean_ips, xray_pid, admin_id (bootstrap)
+meta(k TEXT PRIMARY KEY, v TEXT)   -- clean_ips, config_recipe, xray_pid, admin_id (bootstrap)
 ```
 
 See `docs/ARCHITECTURE.md` for the full flow diagrams and `docs/OPERATIONS.md` for

@@ -153,5 +153,61 @@ class TestRoutePost(TestStats):
         self.assertIn("منقضی", body.decode("utf-8"))
 
 
+class TestConfigPage(TestStats):
+    def setUp(self):
+        super().setUp()
+        bot.xr_add_user = lambda *a, **k: True
+        bot.xr_remove_user = lambda *a, **k: None
+        bot.SUB_DIR = tempfile.mkdtemp()
+        self._eps, self._dom = bot.ENDPOINTS, bot.DOMAIN
+        bot.ENDPOINTS = [
+            {"proto": "vless", "net": "ws", "tag": "vless-ws", "port": 10000, "path": "/p1",
+             "label": "VLESS-WS", "tls_ports": [443, 2053], "notls_ports": [80, 8080]},
+            {"proto": "trojan", "net": "ws", "tag": "trojan-ws", "port": 10002, "path": "/p3",
+             "label": "TROJAN-WS", "tls_ports": [2087], "notls_ports": [8880]}]
+        bot.DOMAIN = "cdn.example.ir"
+        bot._sessions.clear()
+        self.sid, self.csrf = bot.new_session(now=1000)
+        self.cookie = "mj_sess=%s" % self.sid
+
+    def tearDown(self):
+        bot.ENDPOINTS, bot.DOMAIN = self._eps, self._dom
+        super().tearDown()
+
+    def _post(self, fields):
+        body = urllib.parse.urlencode(fields).encode()
+        return bot.route_admin("POST", "/a/config", {}, self.cookie, body, now=1001)
+
+    def test_config_get_shows_endpoints_and_ips(self):
+        st, hdr, body = bot.route_admin("GET", "/a/config", {}, self.cookie, b"", now=1001)
+        page = body.decode("utf-8")
+        self.assertEqual(st, 200)
+        self.assertIn("VLESS-WS", page)
+        self.assertIn("trojan-ws", page)
+        self.assertIn("name=ips", page)               # clean-IPs textarea present
+
+    def test_config_post_saves_recipe_and_ips(self):
+        st, hdr, _ = self._post({
+            "en_vless-ws": "on", "cnt_vless-ws": "2",
+            "cnt_trojan-ws": "1",                      # trojan checkbox omitted -> disabled
+            "ips": "9.9.9.9, 8.8.8.8", "csrf": self.csrf})
+        self.assertEqual(st, 302)
+        rec = bot.get_recipe()
+        self.assertEqual(rec["vless-ws"], {"enabled": True, "count": 2})
+        self.assertFalse(rec["trojan-ws"]["enabled"])
+        self.assertEqual(bot.get_ips(), ["9.9.9.9", "8.8.8.8"])
+
+    def test_config_post_bad_ips_keeps_old(self):
+        bot.set_ips(["5.5.5.5"])
+        st, hdr, _ = self._post({"en_vless-ws": "on", "cnt_vless-ws": "1",
+                                 "ips": "not-an-ip", "csrf": self.csrf})
+        self.assertEqual(st, 302)
+        self.assertEqual(bot.get_ips(), ["5.5.5.5"])   # invalid input ignored, old IPs kept
+
+    def test_dashboard_links_to_config(self):
+        st, hdr, body = bot.route_admin("GET", "/a/", {}, self.cookie, b"", now=1001)
+        self.assertIn("/a/config", body.decode("utf-8"))
+
+
 if __name__ == "__main__":
     unittest.main()

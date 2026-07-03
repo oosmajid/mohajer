@@ -51,25 +51,25 @@ def bars_html(info):
     used, lim = info["used_bytes"], info["limit_bytes"]
     if lim and lim > 0:
         pct = min(100.0, used / lim * 100.0)
-        col = "#16a34a" if pct < 70 else ("#d97706" if pct < 90 else "#dc2626")
+        col = "#2FCB74" if pct < 70 else ("#FFB020" if pct < 90 else "#FF5A47")
         val = "%s / %s" % (fmt_bytes(used), fmt_bytes(lim))
         out.append('<div class="stat"><div class="lbl"><span>📦 حجم مصرفی</span><span class="v">%s</span></div>'
                    '<div class="track"><div class="fill" style="width:%.1f%%;background:%s"></div></div></div>' % (val, pct, col))
     else:
         out.append('<div class="stat"><div class="lbl"><span>📦 حجم</span><span>نامحدود</span></div>'
-                   '<div class="track"><div class="fill" style="width:100%;background:#2a3140"></div></div></div>')
+                   '<div class="track"><div class="fill" style="width:100%;background:#111111"></div></div></div>')
     # time
     exp, cr = info["expiry_ts"], info["created_ts"] or 0
     if exp and exp > 0:
         total = max(1, exp - cr); elapsed = max(0, int(time.time()) - cr)
         pct = min(100.0, elapsed / total * 100.0)
         left = human_left(exp)
-        col = "#16a34a" if pct < 70 else ("#d97706" if pct < 90 else "#dc2626")
+        col = "#2FCB74" if pct < 70 else ("#FFB020" if pct < 90 else "#FF5A47")
         out.append('<div class="stat"><div class="lbl"><span>⏳ زمان باقی‌مانده</span><span>%s</span></div>'
                    '<div class="track"><div class="fill" style="width:%.1f%%;background:%s"></div></div></div>' % (html.escape(left), pct, col))
     else:
         out.append('<div class="stat"><div class="lbl"><span>⏳ زمان</span><span>نامحدود</span></div>'
-                   '<div class="track"><div class="fill" style="width:100%;background:#2a3140"></div></div></div>')
+                   '<div class="track"><div class="fill" style="width:100%;background:#111111"></div></div></div>')
     out.append("</div>")
     return "".join(out)
 
@@ -140,32 +140,35 @@ def decorate(links, info):
 
 PAGE = """<!doctype html><html lang="fa" dir="rtl"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<meta name="color-scheme" content="light">
 <title>کانفیگ‌ها</title>
 <style>
-:root{color-scheme:dark}
+:root{--paper:#F4F1E8;--card:#FFFFFF;--ink:#111111;--accent:#FFDD2D;--ok:#2FCB74;--warn:#FFB020;--dng:#FF5A47;--mut:#6B675C;--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html,body{margin:0;max-width:100%;overflow-x:hidden}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Vazirmatn,Tahoma,sans-serif;background:#0e1014;color:#e8eaed;padding:14px 12px 28px;line-height:1.5}
+body{font-family:Tahoma,"Segoe UI",-apple-system,system-ui,Vazirmatn,sans-serif;background:var(--paper);color:var(--ink);padding:16px 12px 30px;line-height:1.5}
 .wrap{max-width:560px;margin:0 auto}
-h1{font-size:17px;margin:4px 2px 10px}
-.stats{background:#14181f;border:1px solid #222836;border-radius:14px;padding:13px 14px;margin:0 0 14px}
-.stat{margin-bottom:12px}.stat:last-child{margin-bottom:0}
-.lbl{display:flex;justify-content:space-between;font-size:12.5px;color:#aeb4bf;margin-bottom:6px}
-.lbl .v{direction:ltr;unicode-bidi:isolate;white-space:nowrap}
-.track{height:9px;background:#1b2030;border-radius:6px;overflow:hidden}
-.fill{height:100%;border-radius:6px}
-.sub{font-size:12px;color:#7c828d;margin:0 2px 12px}
-.bar{position:sticky;top:0;background:#0e1014;padding:8px 0;display:flex;gap:8px;z-index:5}
+h1{font-size:20px;font-weight:800;margin:2px 2px 14px}
+.stats{background:var(--card);border:3px solid var(--ink);box-shadow:5px 5px 0 var(--ink);padding:14px;margin:0 0 16px}
+.stat{margin-bottom:14px}.stat:last-child{margin-bottom:0}
+.lbl{display:flex;justify-content:space-between;font-size:12.5px;font-weight:700;margin-bottom:7px}
+.lbl .v{direction:ltr;unicode-bidi:isolate;white-space:nowrap;font-family:var(--mono)}
+.track{height:14px;background:var(--card);border:2px solid var(--ink);overflow:hidden}
+.fill{height:100%}
+.sub{font-size:12px;color:var(--mut);font-weight:700;margin:0 2px 12px}
+.bar{position:sticky;top:0;background:var(--paper);padding:8px 0;display:flex;gap:8px;z-index:5}
 .bar button{flex:1}
-button{font-family:inherit;font-size:14px;font-weight:600;border:0;border-radius:12px;padding:13px 10px;cursor:pointer;background:#2563eb;color:#fff}
-button.sec{background:#1b2030;color:#cdd2db}button:active{transform:scale(.98)}
-.card{background:#161a21;border:1px solid #232936;border-radius:14px;padding:12px 14px;margin-bottom:10px;display:flex;align-items:center;gap:12px}
+button{font-family:inherit;font-size:14px;font-weight:800;border:3px solid var(--ink);padding:12px 10px;cursor:pointer;background:var(--accent);color:var(--ink);box-shadow:3px 3px 0 var(--ink);transition:transform .06s,box-shadow .06s}
+button:hover{transform:translate(-1px,-1px);box-shadow:4px 4px 0 var(--ink)}
+button:active{transform:translate(3px,3px);box-shadow:0 0 0 var(--ink)}
+button.sec{background:var(--card)}
+.card{background:var(--card);border:2px solid var(--ink);padding:11px 13px;margin-bottom:10px;display:flex;align-items:center;gap:12px}
 .meta{flex:1 1 auto;min-width:0}
-.name{font-weight:600;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;direction:ltr;text-align:right}
-.proto{font-size:11px;color:#8b93a3;margin-top:3px;text-transform:uppercase;letter-spacing:.04em}
-.copy{flex:0 0 auto;background:#1b2030;color:#cdd2db;padding:10px 16px;border-radius:10px;font-size:13px}
-.copy.ok{background:#16a34a;color:#fff}
-.foot{color:#5b616c;font-size:12px;text-align:center;margin-top:18px}
+.name{font-weight:800;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;direction:ltr;text-align:right;font-family:var(--mono)}
+.proto{font-size:11px;color:var(--mut);font-weight:700;margin-top:3px;text-transform:uppercase;letter-spacing:.04em}
+.copy{flex:0 0 auto;background:var(--card);color:var(--ink);border:2px solid var(--ink);box-shadow:2px 2px 0 var(--ink);padding:9px 15px;font-size:13px;font-weight:800}
+.copy.ok{background:var(--ok);color:#04231e}
+.foot{color:var(--mut);font-size:12px;font-weight:700;text-align:center;margin-top:18px}
 #buf{position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;border:0;padding:0}
 </style></head><body><div class="wrap">
 <h1>📋 کانفیگ‌ها</h1>
