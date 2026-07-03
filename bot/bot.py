@@ -814,7 +814,9 @@ def render_dashboard(csrf):
         _metric_big(today), fmt_bytes(total), fmt_bytes(last30), active, disabled, chart)
     rows = "".join(_user_row(u) for u in ov) or "<div class=u><span class=nm style='color:var(--mut)'>هنوز لینکی نساخته‌ای</span></div>"
     users = ("<div class=card><div class=row style='justify-content:space-between;margin-bottom:8px'>"
-             "<h2 style='margin:0'>لینک‌ها</h2><a class=btn href='/a/new'>+ لینک جدید</a></div>%s</div>") % rows
+             "<h2 style='margin:0'>لینک‌ها</h2><span class=row>"
+             "<a class='btn ghost' href='/a/config'>⚙ پیکربندی</a>"
+             "<a class=btn href='/a/new'>+ لینک جدید</a></span></div>%s</div>") % rows
     return _page("پنل", _top("", csrf) + hero + users)
 
 def _form(action, fields, csrf, btn, cls="btn"):
@@ -864,6 +866,25 @@ def render_delconfirm(token, csrf):
                  "این کار برگشت‌ناپذیر است؛ لینک و کانفیگ‌های این مشتری حذف می‌شوند.</p>"
                  "<div class=row>%s<a class='btn ghost' href='/a/user?token=%s'>انصراف</a></div></div>" % (f, token))
 
+def render_config(csrf):
+    recipe = get_recipe(); ips = get_ips(); rows = ""
+    for ep in ENDPOINTS:
+        tag = ep["tag"]; r = recipe.get(tag, {"enabled": True, "count": 0}); maxn = len(_ep_slots(ep))
+        rows += ("<div class=eprow>"
+                 "<label class=eplabel><input type=checkbox name='en_%s'%s>"
+                 "<span><b>%s</b><span class=eptag>%s · حداکثر ~%d</span></span></label>"
+                 "<input type=number name='cnt_%s' value='%d' min=0 max=20 aria-label='تعداد %s'>"
+                 "</div>") % (tag, (" checked" if r["enabled"] else ""), html.escape(ep.get("label", tag)),
+                              html.escape(tag), maxn, tag, r["count"], html.escape(tag))
+    body = ("<form method=post action='/a/config' class=grid>"
+            "<h2>نوع و تعداد کانفیگ‌ها</h2>%s"
+            "<h2 style='margin-top:16px'>آی‌پی‌های تمیز کلادفلر</h2>"
+            "<textarea name=ips rows=4 placeholder='104.16.96.1, 104.21.96.1'>%s</textarea>"
+            "<input type=hidden name=csrf value='%s'>"
+            "<button class=btn style='margin-top:12px'>ذخیره و بازتولیدِ همه لینک‌ها</button></form>") % (
+        rows, html.escape("\n".join(ips)), csrf)
+    return _page("پیکربندی", _top("<a href='/a/'>← داشبورد</a>", csrf) + "<div class=card>%s</div>" % body)
+
 def route_admin(method, path, query, cookie_header, body, now=None):
     now = now or int(time.time())
     if path.startswith("/a/login/"):
@@ -879,6 +900,7 @@ def route_admin(method, path, query, cookie_header, body, now=None):
         if path in ("/a", "/a/"):      return _html(render_dashboard(csrf))
         if path == "/a/user":          return _html(render_user(query.get("token", [""])[0], csrf))
         if path == "/a/new":           return _html(render_new(csrf))
+        if path == "/a/config":        return _html(render_config(csrf))
         if path == "/a/del":           return _html(render_delconfirm(query.get("token", [""])[0], csrf))
         return 404, {"Content-Type": "text/plain"}, b"not found"
     return route_admin_post(method, path, query, csrf, body, now, cookie_sid(cookie_header))
@@ -924,6 +946,15 @@ def route_admin_post(method, path, query, csrf, body, now, sid):
         name = (form.get("name") or "").strip()[:40] or None
         create_user(gb, days, label=name)
         return _redirect("/a/")
+    if path == "/a/config":
+        recipe = {ep["tag"]: {"enabled": form.get("en_" + ep["tag"]) is not None,
+                              "count": max(0, _num(form.get("cnt_" + ep["tag"]), int) or 0)}
+                  for ep in ENDPOINTS}
+        set_recipe(recipe)
+        ips = parse_ips(form.get("ips", ""))
+        if ips: set_ips(ips)
+        regenerate_all_subs()
+        return _redirect("/a/config")
     return 404, {"Content-Type": "text/plain"}, b"not found"
 
 class AdminHandler(BaseHTTPRequestHandler):
