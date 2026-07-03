@@ -199,13 +199,42 @@ def get_ips():
 def set_ips(ips):
     meta_set("clean_ips", ",".join(ips))
 
+def parse_ips(text):
+    # shared IP parser (Telegram + web panel): split on commas/space/newlines, drop :port, keep valid IPv4
+    toks = [t.split(":")[0].strip() for t in re.split(r"[\s,]+", (text or "").strip()) if t.strip()]
+    return [t for t in toks if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", t) and all(0 <= int(o) <= 255 for o in t.split("."))]
+
+def _ep_slots(ep):
+    # ordered (port, security) slots for an endpoint: TLS ports first, then no-TLS
+    return [(p, "tls") for p in ep.get("tls_ports", [])] + [(p, "none") for p in ep.get("notls_ports", [])]
+
+def get_recipe():
+    # {tag: {"enabled": bool, "count": int}} — how many configs each endpoint emits.
+    # Default (no override): every endpoint on, one config per slot -> reproduces legacy output.
+    rec = {ep["tag"]: {"enabled": True, "count": len(_ep_slots(ep))} for ep in ENDPOINTS}
+    stored = meta_get("config_recipe")
+    if stored:
+        try:
+            for tag, v in json.loads(stored).items():
+                if tag in rec:
+                    rec[tag] = {"enabled": bool(v.get("enabled", True)), "count": max(0, int(v.get("count", 0)))}
+        except Exception:
+            pass
+    return rec
+
+def set_recipe(recipe):
+    meta_set("config_recipe", json.dumps(recipe))
+
 def write_sub(token, secret, label):
-    ips = get_ips() or DEFAULT_IPS; links = []; gi = 0
+    ips = get_ips() or DEFAULT_IPS; recipe = get_recipe(); links = []; gi = 0
     for ep in ENDPOINTS:
-        for port in ep.get("tls_ports", []):
-            links.append(_ws_link(ep, secret, ips[gi % len(ips)], port, "tls")); gi += 1
-        for port in ep.get("notls_ports", []):
-            links.append(_ws_link(ep, secret, ips[gi % len(ips)], port, "none")); gi += 1
+        r = recipe.get(ep["tag"], {"enabled": True, "count": len(_ep_slots(ep))})
+        slots = _ep_slots(ep)
+        if not r.get("enabled") or not slots:
+            continue
+        for k in range(int(r.get("count", 0))):
+            port, sec = slots[k % len(slots)]
+            links.append(_ws_link(ep, secret, ips[gi % len(ips)], port, sec)); gi += 1
     open(sub_path(token), "w").write(base64.b64encode("\n".join(l for l in links if l).encode()).decode())
 
 def regenerate_all_subs():
@@ -518,8 +547,7 @@ def handle_update(up):
     if not is_admin(uid): send(chat, "⛔️ این ربات خصوصی است."); return
     st = pending.get(chat)
     if st and st.get("stage") == "ips_edit":
-        toks = [t.split(":")[0].strip() for t in re.split(r"[\s,]+", text.strip()) if t.strip()]
-        valid = [t for t in toks if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", t) and all(0 <= int(o) <= 255 for o in t.split("."))]
+        valid = parse_ips(text)
         pending.pop(chat, None)
         if not valid:
             send(chat, "❌ هیچ IP معتبری پیدا نشد. مثل <code>104.16.96.1, 104.21.96.1</code> بفرست.", main_menu_kb()); return
