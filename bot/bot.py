@@ -307,11 +307,14 @@ def xr_usage_all():
         return {}
 
 def refresh_all_usage():
-    raws = xr_usage_all(); c = db()
+    raws = xr_usage_all(); c = db(); today = day_key()
     for u in c.execute("SELECT token,base_bytes,last_raw FROM users").fetchall():
         raw = raws.get(u["token"], 0); base = u["base_bytes"]
         if raw < u["last_raw"]: base += u["last_raw"]
-        c.execute("UPDATE users SET base_bytes=?,last_raw=?,used_bytes=? WHERE token=?", (base, raw, base + raw, u["token"]))
+        used = base + raw
+        c.execute("UPDATE users SET base_bytes=?,last_raw=?,used_bytes=? WHERE token=?", (base, raw, used, u["token"]))
+        record_daily(c, u["token"], used, today)
+    prune_daily(c)
     c.commit(); c.close()
 
 def record_daily(c, token, used, day):
@@ -482,7 +485,12 @@ def route_cb(chat, mid, data, cbid):
         token = data[3:]; answer(cbid); edit(chat, mid, "⏳ چقدر زمان اضافه شود؟", addtime_kb(token)); return
     if data == "list":
         answer(cbid); c = db(); n = c.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]; c.close()
-        edit(chat, mid, "📋 لینک‌های فعال:" if n else "هنوز لینکی نساخته‌ای. با ➕ شروع کن.", list_kb()); return
+        if n:
+            total, today = panel_usage_summary()
+            head = "📋 لینک‌های فعال:\n📊 مصرف کل: %s · امروز: %s" % (fmt_bytes(total), fmt_bytes(today))
+        else:
+            head = "هنوز لینکی نساخته‌ای. با ➕ شروع کن."
+        edit(chat, mid, head, list_kb()); return
     if data.startswith("u:"):
         token = data[2:]; refresh_usage(token)
         c = db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone(); c.close()

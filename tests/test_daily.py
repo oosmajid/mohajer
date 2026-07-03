@@ -67,5 +67,27 @@ class TestDailyRecord(unittest.TestCase):
         self.assertNotIn("2000-01-01", rows)
 
 
+class TestEnforcerHook(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False); self.tmp.close()
+        self._orig = bot.DB_PATH; bot.DB_PATH = self.tmp.name; bot.init_db()
+        c = bot.db()
+        c.execute("INSERT INTO users(token,uuid,email,label,limit_bytes,expiry_ts,created_ts,base_bytes,last_raw,used_bytes) "
+                  "VALUES('bb','u','u_bb','B',0,0,0,0,0,0)")
+        c.commit(); c.close()
+
+    def tearDown(self):
+        bot.DB_PATH = self._orig; os.unlink(self.tmp.name)
+
+    def test_refresh_all_usage_writes_daily(self):
+        day = bot.day_key()
+        c = bot.db(); bot.record_daily(c, "bb", 100, day); c.commit(); c.close()  # simulate earlier poll
+        bot.xr_usage_all = lambda: {"bb": 250}
+        bot.refresh_all_usage()
+        total, today = bot.panel_usage_summary()
+        self.assertEqual(total, 250)
+        self.assertEqual(today, 150)   # 250 - 100
+
+
 if __name__ == "__main__":
     unittest.main()
