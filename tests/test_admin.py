@@ -57,5 +57,39 @@ class TestStats(unittest.TestCase):
         self.assertEqual(ov[0]["used_bytes"], 300)
 
 
+class TestRouteGet(TestStats):  # reuse the seeded DB from TestStats.setUp
+    def _session_cookie(self):
+        bot._sessions.clear()
+        sid, csrf = bot.new_session(now=1000)
+        return "mj_sess=%s" % sid, csrf
+
+    def test_no_session_returns_expired(self):
+        st, hdr, body = bot.route_admin("GET", "/a/", {}, "", b"", now=1000)
+        self.assertEqual(st, 200)
+        self.assertIn("منقضی", body.decode("utf-8"))
+
+    def test_login_sets_cookie_and_redirects(self):
+        tok = bot.mint_login(now=1000)
+        st, hdr, body = bot.route_admin("GET", "/a/login/" + tok, {}, "", b"", now=1001)
+        self.assertEqual(st, 302)
+        self.assertEqual(hdr["Location"], "/a/")
+        self.assertIn("mj_sess=", hdr["Set-Cookie"])
+        self.assertIn("HttpOnly", hdr["Set-Cookie"])
+
+    def test_dashboard_lists_user(self):
+        cookie, csrf = self._session_cookie()
+        st, hdr, body = bot.route_admin("GET", "/a/", {}, cookie, b"", now=1001)
+        self.assertEqual(st, 200)
+        self.assertIn("One", body.decode("utf-8"))        # the seeded label
+        self.assertIn("<svg", body.decode("utf-8"))       # panel chart
+
+    def test_user_detail(self):
+        cookie, csrf = self._session_cookie()
+        st, hdr, body = bot.route_admin("GET", "/a/user", {"token": ["t1"]}, cookie, b"", now=1001)
+        self.assertEqual(st, 200)
+        self.assertIn("One", body.decode("utf-8"))
+        self.assertIn(csrf, body.decode("utf-8"))         # forms carry the csrf token
+
+
 if __name__ == "__main__":
     unittest.main()

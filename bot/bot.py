@@ -640,6 +640,113 @@ def users_overview():
         d = dict(r); d["today"] = daily.get(r["token"], 0); out.append(d)
     return out
 
+ADMIN_CSS = ("body{font-family:-apple-system,Segoe UI,Roboto,Tahoma,sans-serif;background:#0e1014;color:#e8eaed;"
+             "margin:0;padding:16px;line-height:1.6}a{color:#5b9dff}.wrap{max-width:820px;margin:0 auto}"
+             "h1{font-size:19px}h2{font-size:15px;color:#aeb4bf}.card{background:#14181f;border:1px solid #222836;"
+             "border-radius:12px;padding:14px;margin:12px 0}table{width:100%;border-collapse:collapse;font-size:13px}"
+             "th,td{text-align:right;padding:8px 6px;border-bottom:1px solid #222836}"
+             "svg rect{fill:#2563eb}.btn{display:inline-block;background:#2563eb;color:#fff;border:0;border-radius:8px;"
+             "padding:9px 14px;font-size:13px;cursor:pointer;text-decoration:none}.btn.g{background:#1b2030;color:#cdd2db}"
+             "input,form{margin:4px 0}input[type=text],input[type=number]{background:#0e1014;border:1px solid #2a3140;"
+             "color:#e8eaed;border-radius:8px;padding:8px;width:120px}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}"
+             "code{background:#0e1014;padding:2px 6px;border-radius:6px;word-break:break-all}")
+
+def _page(title, inner):
+    return ("<!doctype html><html lang=fa dir=rtl><head><meta charset=utf-8>"
+            "<meta name=viewport content='width=device-width,initial-scale=1'><title>%s</title>"
+            "<style>%s</style></head><body><div class=wrap>%s</div></body></html>" % (html.escape(title), ADMIN_CSS, inner))
+
+def _html(page):
+    return 200, {"Content-Type": "text/html; charset=utf-8"}, page.encode("utf-8")
+
+def svg_bars(series, w=780, h=90):
+    mx = max([v for _, v in series] + [1]); n = len(series) or 1; bw = w / n; bars = ""
+    for i, (lab, v) in enumerate(series):
+        bh = (v / mx) * (h - 4); y = h - bh
+        bars += '<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" rx="2"><title>%s: %s</title></rect>' % (
+            i * bw + 2, y, bw - 4, bh, html.escape(lab), fmt_bytes(v))
+    return '<svg viewBox="0 0 %d %d" width="100%%" height="%d" preserveAspectRatio="none">%s</svg>' % (w, h, h, bars)
+
+def render_expired():
+    return _page("منقضی", "<h1>لینک منقضی شد</h1><p>برای ورود دوباره، در ربات دستور <code>/admin</code> را بزن.</p>")
+
+def render_dashboard():
+    total, today = panel_usage_summary()
+    ov = users_overview()
+    active = sum(1 for u in ov if not u["disabled_ts"]); disabled = len(ov) - active
+    chart = svg_bars(daily_series(7))
+    head = ("<h1>📊 پنل Mohajer</h1><div class=card><div class=row>"
+            "<div>مصرف کل: <b>%s</b></div><div>امروز: <b>%s</b></div>"
+            "<div>لینک‌ها: <b>%d</b> (فعال %d / غیرفعال %d)</div></div>"
+            "<h2>مصرف ۷ روز اخیر</h2>%s</div>" % (fmt_bytes(total), fmt_bytes(today), len(ov), active, disabled, chart))
+    rows = "".join(
+        "<tr><td><a href='/a/user?token=%s'>%s%s</a></td><td>%s / %s</td><td>%s</td><td>%s</td></tr>" % (
+            u["token"], ("⏸ " if u["disabled_ts"] else ""), html.escape(u["label"]),
+            fmt_bytes(u["used_bytes"]), human_limit(u["limit_bytes"]), fmt_bytes(u["today"]), human_expiry(u["expiry_ts"]))
+        for u in ov) or "<tr><td colspan=4>لینکی نیست</td></tr>"
+    table = ("<div class=card><div class=row style='justify-content:space-between'><h2>کاربران</h2>"
+             "<a class=btn href='/a/new'>➕ لینک جدید</a></div>"
+             "<table><tr><th>نام</th><th>مصرف/سقف</th><th>امروز</th><th>انقضا</th></tr>%s</table></div>" % rows)
+    return _page("پنل", head + table)
+
+def _form(action, fields, csrf, btn, cls="btn"):
+    inner = "".join(fields) + "<input type=hidden name=csrf value='%s'>" % csrf
+    return "<form method=post action='%s' class=row>%s<button class='%s'>%s</button></form>" % (action, inner, cls, btn)
+
+def render_user(token, csrf):
+    c = db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone(); c.close()
+    if not u:
+        return _page("یافت نشد", "<h1>یافت نشد</h1><a href='/a/'>بازگشت</a>")
+    today_u = daily_series(1, token=token)[-1][1]
+    chart = svg_bars(daily_series(30, token=token))
+    tk = "<input type=hidden name=token value='%s'>" % token
+    forms = (
+        _form("/a/addvol", [tk, "<input type=number name=gb placeholder='GB'>"], csrf, "➕ حجم") +
+        _form("/a/addtime", [tk, "<input type=number name=days placeholder='روز'>"], csrf, "➕ زمان") +
+        _form("/a/rename", [tk, "<input type=text name=name placeholder='نام'>"], csrf, "✏️ نام") +
+        _form("/a/unlimit", [tk, "<input type=hidden name=field value=limit_bytes>"], csrf, "♾ حجم نامحدود", "btn g") +
+        _form("/a/unlimit", [tk, "<input type=hidden name=field value=expiry_ts>"], csrf, "♾ زمان نامحدود", "btn g"))
+    dele = "<a class='btn g' href='/a/del?token=%s' style='background:#dc2626;color:#fff'>🗑 حذف لینک</a>" % token
+    body = ("<h1>%s%s</h1><p><a href='/a/'>← داشبورد</a></p>"
+            "<div class=card>مصرف: <b>%s</b> از %s · امروز: %s · انقضا: %s<br>لینک: <code>%s</code></div>"
+            "<div class=card><h2>۳۰ روز اخیر</h2>%s</div>"
+            "<div class=card><h2>عملیات</h2>%s<div style='margin-top:10px'>%s</div></div>" % (
+                ("⏸ " if u["disabled_ts"] else ""), html.escape(u["label"]),
+                fmt_bytes(u["used_bytes"]), human_limit(u["limit_bytes"]), fmt_bytes(today_u),
+                human_expiry(u["expiry_ts"]), sub_url(token), chart, forms, dele))
+    return _page("کاربر", body)
+
+def render_new(csrf):
+    f = _form("/a/new", ["<input type=number name=gb placeholder='حجم GB (۰=نامحدود)'>",
+                         "<input type=number name=days placeholder='روز (۰=نامحدود)'>",
+                         "<input type=text name=name placeholder='نام'>"], csrf, "ساخت")
+    return _page("لینک جدید", "<h1>➕ لینک جدید</h1><p><a href='/a/'>← داشبورد</a></p><div class=card>%s</div>" % f)
+
+def render_delconfirm(token, csrf):
+    f = _form("/a/delete", ["<input type=hidden name=token value='%s'>" % token,
+                            "<input type=hidden name=confirm value=yes>"], csrf, "بله، حذف کن")
+    return _page("حذف", "<h1>حذف لینک؟</h1><p>این کار برگشت‌ناپذیر است.</p><div class=card>%s "
+                        "<a class='btn g' href='/a/user?token=%s'>انصراف</a></div>" % (f, token))
+
+def route_admin(method, path, query, cookie_header, body, now=None):
+    now = now or int(time.time())
+    if path.startswith("/a/login/"):
+        if consume_login(path[len("/a/login/"):], now):
+            sid, _ = new_session(now)
+            ck = "mj_sess=%s; HttpOnly; Secure; SameSite=Strict; Path=/a; Max-Age=%d" % (sid, SESS_TTL)
+            return 302, {"Location": "/a/", "Set-Cookie": ck}, b""
+        return 200, {"Content-Type": "text/html; charset=utf-8"}, render_expired().encode("utf-8")
+    csrf = session_csrf(cookie_sid(cookie_header), now)
+    if not csrf:
+        return 200, {"Content-Type": "text/html; charset=utf-8"}, render_expired().encode("utf-8")
+    if method == "GET":
+        if path in ("/a", "/a/"):      return _html(render_dashboard())
+        if path == "/a/user":          return _html(render_user(query.get("token", [""])[0], csrf))
+        if path == "/a/new":           return _html(render_new(csrf))
+        if path == "/a/del":           return _html(render_delconfirm(query.get("token", [""])[0], csrf))
+        return 404, {"Content-Type": "text/plain"}, b"not found"
+    return route_admin_post(method, path, query, csrf, body, now)
+
 def main():
     if not TOKEN: print("no BOT_TOKEN", flush=True); sys.exit(1)
     init_db(); tg("deleteWebhook")
