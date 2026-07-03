@@ -747,6 +747,45 @@ def route_admin(method, path, query, cookie_header, body, now=None):
         return 404, {"Content-Type": "text/plain"}, b"not found"
     return route_admin_post(method, path, query, csrf, body, now)
 
+def _redirect(loc):
+    return 302, {"Location": loc}, b""
+
+def route_admin_post(method, path, query, csrf, body, now):
+    form = {k: v[0] for k, v in urllib.parse.parse_qs(body.decode("utf-8", "ignore")).items()}
+    if form.get("csrf") != csrf:
+        return 403, {"Content-Type": "text/plain"}, b"forbidden"
+    token = form.get("token", "")
+    def _num(x, cast):
+        try: return cast(str(x).replace(",", "."))
+        except Exception: return None
+    if path == "/a/addvol":
+        gb = _num(form.get("gb"), float)
+        if gb: extend_volume(token, gb)
+        refresh_usage(token); maybe_reenable(token); return _redirect("/a/user?token=" + token)
+    if path == "/a/addtime":
+        days = _num(form.get("days"), int)
+        if days: extend_time(token, days)
+        maybe_reenable(token); return _redirect("/a/user?token=" + token)
+    if path == "/a/rename":
+        name = (form.get("name") or "").strip()[:40]
+        if name:
+            c = db(); c.execute("UPDATE users SET label=? WHERE token=?", (name, token)); c.commit(); c.close()
+        return _redirect("/a/user?token=" + token)
+    if path == "/a/unlimit":
+        field = form.get("field")
+        if field in ("limit_bytes", "expiry_ts"): set_unlimited(token, field)
+        maybe_reenable(token); return _redirect("/a/user?token=" + token)
+    if path == "/a/delete":
+        if form.get("confirm") == "yes" and token: delete_user(token)
+        return _redirect("/a/")
+    if path == "/a/new":
+        gb = _num(form.get("gb"), float) or 0
+        days = _num(form.get("days"), int) or 0
+        name = (form.get("name") or "").strip()[:40] or None
+        create_user(gb, days, label=name)
+        return _redirect("/a/")
+    return 404, {"Content-Type": "text/plain"}, b"not found"
+
 def main():
     if not TOKEN: print("no BOT_TOKEN", flush=True); sys.exit(1)
     init_db(); tg("deleteWebhook")

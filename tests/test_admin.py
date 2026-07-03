@@ -91,5 +91,42 @@ class TestRouteGet(TestStats):  # reuse the seeded DB from TestStats.setUp
         self.assertIn(csrf, body.decode("utf-8"))         # forms carry the csrf token
 
 
+class TestRoutePost(TestStats):
+    def setUp(self):
+        super().setUp()
+        bot.xr_add_user = lambda *a, **k: True       # stub xray
+        bot.xr_remove_user = lambda *a, **k: None
+        bot.SUB_DIR = tempfile.mkdtemp()             # write_sub target
+        bot._sessions.clear()
+        self.sid, self.csrf = bot.new_session(now=1000)
+        self.cookie = "mj_sess=%s" % self.sid
+
+    def _post(self, path, fields):
+        body = urllib.parse.urlencode(fields).encode()
+        return bot.route_admin("POST", path, {}, self.cookie, body, now=1001)
+
+    def test_addvol_increases_limit(self):
+        st, hdr, _ = self._post("/a/addvol", {"token": "t1", "gb": "5", "csrf": self.csrf})
+        self.assertEqual(st, 302)
+        c = bot.db(); lim = c.execute("SELECT limit_bytes FROM users WHERE token='t1'").fetchone()["limit_bytes"]; c.close()
+        self.assertEqual(lim, 1000 + 5 * bot.GB)
+
+    def test_csrf_mismatch_rejected(self):
+        st, hdr, _ = self._post("/a/addvol", {"token": "t1", "gb": "5", "csrf": "WRONG"})
+        self.assertEqual(st, 403)
+
+    def test_delete_requires_confirm_and_removes(self):
+        st, _, _ = self._post("/a/delete", {"token": "t1", "confirm": "yes", "csrf": self.csrf})
+        self.assertEqual(st, 302)
+        c = bot.db(); n = c.execute("SELECT COUNT(*) c FROM users WHERE token='t1'").fetchone()["c"]; c.close()
+        self.assertEqual(n, 0)
+
+    def test_new_creates_link(self):
+        st, hdr, _ = self._post("/a/new", {"gb": "10", "days": "30", "name": "Fresh", "csrf": self.csrf})
+        self.assertEqual(st, 302)
+        c = bot.db(); n = c.execute("SELECT COUNT(*) c FROM users WHERE label='Fresh'").fetchone()["c"]; c.close()
+        self.assertEqual(n, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
