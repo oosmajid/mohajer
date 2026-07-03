@@ -90,6 +90,13 @@ class TestRouteGet(TestStats):  # reuse the seeded DB from TestStats.setUp
         self.assertIn("One", body.decode("utf-8"))
         self.assertIn(csrf, body.decode("utf-8"))         # forms carry the csrf token
 
+    def test_dashboard_has_logout(self):
+        cookie, csrf = self._session_cookie()
+        st, hdr, body = bot.route_admin("GET", "/a/", {}, cookie, b"", now=1001)
+        page = body.decode("utf-8")
+        self.assertIn("/a/logout", page)   # logout form present
+        self.assertIn(csrf, page)          # and it carries the csrf token
+
 
 class TestRoutePost(TestStats):
     def setUp(self):

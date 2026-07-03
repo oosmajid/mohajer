@@ -658,7 +658,8 @@ a{color:var(--sig)}
 .top{display:flex;align-items:center;gap:10px;margin:0 2px 18px}
 .brand{display:flex;align-items:center;gap:9px;font-weight:700;font-size:16px;letter-spacing:.02em}
 .dot-sig{width:9px;height:9px;border-radius:50%;background:var(--sig);box-shadow:0 0 0 3px rgba(53,224,196,.14),0 0 12px var(--sig)}
-.crumb{margin-inline-start:auto;font-size:13px}
+.crumb{font-size:13px}
+.rightnav{margin-inline-start:auto;display:flex;align-items:center;gap:10px}
 .card{background:linear-gradient(180deg,var(--panel),#0f1a1f);border:1px solid var(--line);border-radius:16px;padding:16px;margin:0 0 14px}
 .card h2{margin:0 0 12px;font-size:12px;color:var(--mut);font-weight:600}
 .hero{position:relative;overflow:hidden}
@@ -718,9 +719,15 @@ def _page(title, inner):
 def _html(page):
     return 200, {"Content-Type": "text/html; charset=utf-8"}, page.encode("utf-8")
 
-def _top(crumb=""):
+def _top(crumb="", csrf=None):
+    right = ("<span class=crumb>%s</span>" % crumb) if crumb else ""
+    if csrf:
+        right += ("<form method=post action='/a/logout' style='margin:0'>"
+                  "<input type=hidden name=csrf value='%s'>"
+                  "<button class='btn ghost'>خروج</button></form>") % csrf
+    rightnav = ("<span class=rightnav>%s</span>" % right) if right else ""
     return ("<header class=top><span class=brand><span class=dot-sig></span>Mohajer</span>%s</header>"
-            % (("<span class=crumb>%s</span>" % crumb) if crumb else ""))
+            % rightnav)
 
 def _metric_big(b):
     s = fmt_bytes(b); p = s.rsplit(" ", 1)
@@ -765,7 +772,7 @@ def _user_row(u):
         fmt_bytes(used), human_limit(lim), fill,
         fmt_bytes(u["today"]), human_expiry(u["expiry_ts"]))
 
-def render_dashboard():
+def render_dashboard(csrf):
     total, today, last30 = panel_usage_summary()
     ov = users_overview()
     active = sum(1 for u in ov if not u["disabled_ts"]); disabled = len(ov) - active
@@ -780,7 +787,7 @@ def render_dashboard():
     rows = "".join(_user_row(u) for u in ov) or "<div class=u><span class=nm style='color:var(--mut)'>هنوز لینکی نساخته‌ای</span></div>"
     users = ("<div class=card><div class=row style='justify-content:space-between;margin-bottom:8px'>"
              "<h2 style='margin:0'>لینک‌ها</h2><a class=btn href='/a/new'>+ لینک جدید</a></div>%s</div>") % rows
-    return _page("پنل", _top() + hero + users)
+    return _page("پنل", _top("", csrf) + hero + users)
 
 def _form(action, fields, csrf, btn, cls="btn"):
     inner = "".join(fields) + "<input type=hidden name=csrf value='%s'>" % csrf
@@ -789,7 +796,7 @@ def _form(action, fields, csrf, btn, cls="btn"):
 def render_user(token, csrf):
     c = db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone(); c.close()
     if not u:
-        return _page("یافت نشد", _top("<a href='/a/'>← داشبورد</a>") + "<div class=card>لینکی با این شناسه پیدا نشد.</div>")
+        return _page("یافت نشد", _top("<a href='/a/'>← داشبورد</a>", csrf) + "<div class=card>لینکی با این شناسه پیدا نشد.</div>")
     today_u = daily_series(1, token=token)[-1][1]
     chart = svg_bars(daily_series(30, token=token))
     dis = bool(u["disabled_ts"]); st = "dng" if dis else "ok"; stlabel = "غیرفعال" if dis else "فعال"
@@ -812,19 +819,19 @@ def render_user(token, csrf):
         human_expiry(u["expiry_ts"]), chart)
     link = "<div class=card><h2>لینک اشتراک</h2><code>%s</code></div>" % sub_url(token)
     actions = "<div class=card><h2>مدیریت</h2><div class=grid>%s</div><div style='margin-top:10px'>%s</div></div>" % (forms, dele)
-    return _page("کاربر", _top("<a href='/a/'>← داشبورد</a>") + hero + link + actions)
+    return _page("کاربر", _top("<a href='/a/'>← داشبورد</a>", csrf) + hero + link + actions)
 
 def render_new(csrf):
     f = _form("/a/new", ["<input type=number name=gb placeholder='حجم (گیگ) — ۰ = نامحدود'>",
                          "<input type=number name=days placeholder='مدت (روز) — ۰ = نامحدود'>",
                          "<input type=text name=name placeholder='نام مشتری'>"], csrf, "ساخت لینک")
-    return _page("لینک جدید", _top("<a href='/a/'>← داشبورد</a>") +
+    return _page("لینک جدید", _top("<a href='/a/'>← داشبورد</a>", csrf) +
                  "<div class=card><h2>لینک جدید</h2>%s</div>" % f)
 
 def render_delconfirm(token, csrf):
     f = _form("/a/delete", ["<input type=hidden name=token value='%s'>" % token,
                             "<input type=hidden name=confirm value=yes>"], csrf, "بله، حذف کن", "btn danger")
-    return _page("حذف", _top("<a href='/a/user?token=%s'>← بازگشت</a>" % token) +
+    return _page("حذف", _top("<a href='/a/user?token=%s'>← بازگشت</a>" % token, csrf) +
                  "<div class=card><h2>حذف لینک</h2><p style='color:var(--mut);margin:0 0 12px'>"
                  "این کار برگشت‌ناپذیر است؛ لینک و کانفیگ‌های این مشتری حذف می‌شوند.</p>"
                  "<div class=row>%s<a class='btn ghost' href='/a/user?token=%s'>انصراف</a></div></div>" % (f, token))
@@ -841,7 +848,7 @@ def route_admin(method, path, query, cookie_header, body, now=None):
     if not csrf:
         return 200, {"Content-Type": "text/html; charset=utf-8"}, render_expired().encode("utf-8")
     if method == "GET":
-        if path in ("/a", "/a/"):      return _html(render_dashboard())
+        if path in ("/a", "/a/"):      return _html(render_dashboard(csrf))
         if path == "/a/user":          return _html(render_user(query.get("token", [""])[0], csrf))
         if path == "/a/new":           return _html(render_new(csrf))
         if path == "/a/del":           return _html(render_delconfirm(query.get("token", [""])[0], csrf))
