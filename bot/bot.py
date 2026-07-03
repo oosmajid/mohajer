@@ -545,6 +545,9 @@ def handle_update(up):
         token = create_user(st.get("vol_gb", 0), st.get("dur_days", 0), label=(text.strip()[:40] or None)); pending.pop(chat, None)
         send(chat, result_text(token) if token else "❌ خطا در ساخت کاربر.",
              [[{"text": "بازگشت به منو", "callback_data": "menu"}]] if token else main_menu_kb()); return
+    if text.startswith("/admin"):
+        tok = mint_login()
+        send(chat, "🔐 لینک ورود به پنل (۱۰ دقیقه اعتبار، یک‌بار مصرف):\n<code>%s/a/login/%s</code>" % (SUB_BASE, tok)); return
     if text.startswith("/start"):
         pending.pop(chat, None); send(chat, WELCOME, main_menu_kb()); return
     send(chat, "از دکمه‌ها استفاده کن 👇", main_menu_kb())
@@ -786,10 +789,35 @@ def route_admin_post(method, path, query, csrf, body, now):
         return _redirect("/a/")
     return 404, {"Content-Type": "text/plain"}, b"not found"
 
+class AdminHandler(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def _run(self, method):
+        u = urllib.parse.urlparse(self.path)
+        query = urllib.parse.parse_qs(u.query)
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        body = self.rfile.read(length) if length else b""
+        cookie = self.headers.get("Cookie", "")
+        try:
+            status, headers, out = route_admin(method, u.path, query, cookie, body)
+        except Exception as e:
+            print("admin err", e, flush=True)
+            status, headers, out = 500, {"Content-Type": "text/plain"}, b"error"
+        self.send_response(status)
+        for k, v in headers.items(): self.send_header(k, v)
+        self.send_header("Content-Length", str(len(out)))
+        self.end_headers()
+        if out: self.wfile.write(out)
+    def do_GET(self):  self._run("GET")
+    def do_POST(self): self._run("POST")
+
+def admin_server():
+    ThreadingHTTPServer(("127.0.0.1", ADMIN_PORT), AdminHandler).serve_forever()
+
 def main():
     if not TOKEN: print("no BOT_TOKEN", flush=True); sys.exit(1)
     init_db(); tg("deleteWebhook")
     threading.Thread(target=enforcer, daemon=True).start()
+    threading.Thread(target=admin_server, daemon=True).start()
     print("dpbot started; endpoints=%d" % len(ENDPOINTS), flush=True)
     offset = None
     while True:
