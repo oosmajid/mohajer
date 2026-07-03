@@ -96,13 +96,35 @@ def relabel(link, name):
     base = link.rsplit("#", 1)[0] if "#" in link else link
     return base + "#" + urllib.parse.quote(name)
 
+def _fa_digits(s):
+    return s.translate(str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹"))
+
+def fmt_vol_fa(b):
+    # RTL-safe volume: Persian unit + Persian digits, no Latin letters (Latin "GB" breaks bidi in client lists)
+    b = float(b)
+    if b <= 0:
+        return "۰"
+    for u in ["بایت", "کیلوبایت", "مگ", "گیگ"]:
+        if b < 1024:
+            s = ("%.0f" % b) if u in ("بایت", "کیلوبایت") else ("%.1f" % b)
+            return _fa_digits(s) + " " + u
+        b /= 1024
+    return _fa_digits("%.1f" % b) + " ترابایت"
+
+def human_left_fa(ts):
+    left = ts - int(time.time())
+    if left <= 0:
+        return "منقضی"
+    d = left // 86400; h = (left % 86400) // 3600
+    return _fa_digits("%d روز و %d ساعت" % (d, h)) if d >= 1 else _fa_digits("%d ساعت" % h)
+
 def status_name(info):
     if info.get("disabled_ts"):
         return "⛔ اعتبار تمام شد — تمدید کنید"
     lim, used, exp = info["limit_bytes"], info["used_bytes"], info["expiry_ts"]
-    voltxt = fmt_bytes(max(0, lim - used)) if (lim and lim > 0) else "نامحدود"
-    timetxt = human_left(exp) if (exp and exp > 0) else "نامحدود"
-    return "📦 باقی‌مانده: %s · ⏳ %s" % (voltxt, timetxt)
+    voltxt = fmt_vol_fa(max(0, lim - used)) if (lim and lim > 0) else "نامحدود"
+    timetxt = human_left_fa(exp) if (exp and exp > 0) else "نامحدود"
+    return "باقیمانده %s / %s" % (voltxt, timetxt)
 
 def update_name(info):
     return "🔄 بعد از تمدید، آپدیت کنید" if info.get("disabled_ts") else "🔄 هر روز یک‌بار آپدیت کنید"

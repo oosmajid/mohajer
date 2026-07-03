@@ -36,7 +36,7 @@ class TestDecorate(unittest.TestCase):
         out = s.decorate(links, self._info(limit_bytes=100, used_bytes=40))
         self.assertEqual(len(out), 4)
         self.assertTrue(out[0].startswith("vless://11111111-"))  # a real working clone
-        self.assertIn("باقی‌مانده", s.parse_label(out[0])[0])
+        self.assertIn("باقیمانده ۶۰ بایت", s.parse_label(out[0])[0])  # RTL-safe: Persian unit + digits, no "GB"
         self.assertIn("آپدیت", s.parse_label(out[1])[0])
         self.assertEqual(out[2:], links)  # real configs preserved, in order
 
@@ -77,7 +77,7 @@ class TestBuildResponse(unittest.TestCase):
         b64 = self._b64([VLESS])
         code, ctype, body, extra = s.build_response("sub-u-aa", b64, self._info(), "Mozilla/5.0", False)
         self.assertIn("text/html", ctype)
-        self.assertIn("باقی‌مانده", body.decode("utf-8"))
+        self.assertIn("باقیمانده", body.decode("utf-8"))  # info-config status name in the page
 
 
 if __name__ == "__main__":
