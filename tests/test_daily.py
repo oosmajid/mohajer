@@ -54,6 +54,18 @@ class TestDailyRecord(unittest.TestCase):
         self.assertEqual(row["start_used"], 500)
         self.assertEqual(row["end_used"], 500)
 
+    def test_prune_removes_old_days(self):
+        c = bot.db()
+        c.execute("INSERT INTO usage_daily(token,day,start_used,end_used) VALUES('aa','2000-01-01',0,10)")
+        c.execute("INSERT INTO usage_daily(token,day,start_used,end_used) VALUES('aa',?,0,10)", (bot.day_key(),))
+        c.commit()
+        bot.prune_daily(c, keep_days=30)
+        c.commit()
+        rows = [r["day"] for r in c.execute("SELECT day FROM usage_daily").fetchall()]
+        c.close()
+        self.assertIn(bot.day_key(), rows)
+        self.assertNotIn("2000-01-01", rows)
+
 
 if __name__ == "__main__":
     unittest.main()

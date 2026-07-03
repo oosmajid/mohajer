@@ -321,6 +321,10 @@ def record_daily(c, token, used, day):
     elif used > r["end_used"]:
         c.execute("UPDATE usage_daily SET end_used=? WHERE token=? AND day=?", (used, token, day))
 
+def prune_daily(c, keep_days=30):
+    cutoff = day_key(time.time() - keep_days * 86400)
+    c.execute("DELETE FROM usage_daily WHERE day < ?", (cutoff,))
+
 def panel_usage_summary():
     c = db(); day = day_key()
     total = c.execute("SELECT COALESCE(SUM(used_bytes),0) v FROM users").fetchone()["v"]
