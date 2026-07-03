@@ -67,6 +67,16 @@ class TestWriteSubHonorsRecipe(RecipeBase):
         self.assertEqual(sum(l.startswith("vmess://") for l in links), 0)
         self.assertEqual(sum(l.startswith("trojan://") for l in links), 1)
 
+    def test_high_count_has_no_cap(self):
+        # user requirement: must be able to make e.g. 10 configs of one type
+        bot.set_recipe({"vless-ws": {"enabled": False, "count": 0},
+                        "vmess-ws": {"enabled": False, "count": 0},
+                        "trojan-ws": {"enabled": True, "count": 10}})
+        bot.write_sub("dd", "11111111-1111-1111-1111-111111111111", "D")
+        links = self._links("dd")
+        self.assertEqual(len(links), 10)
+        self.assertTrue(all(l.startswith("trojan://") for l in links))
+
     def test_count_cycles_ports_and_ips(self):
         # only vless-ws, count 6 > its 4 slots -> ports cycle, IPs round-robin
         bot.set_recipe({"vless-ws": {"enabled": True, "count": 6},

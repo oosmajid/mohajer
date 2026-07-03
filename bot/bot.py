@@ -739,6 +739,7 @@ form.row{margin:0 0 8px}
 .eplabel{display:flex;align-items:center;gap:10px;flex:1;min-width:0;cursor:pointer}
 .eplabel b{font-weight:800}
 .eptag{display:block;font-size:11px;color:var(--mut);font-family:var(--mono);margin-top:2px}
+.hint{font-size:12px;color:var(--mut);font-weight:700;margin:0 0 6px}
 code{font-family:var(--mono);background:var(--paper);border:2px solid var(--ink);padding:6px 8px;word-break:break-all;font-size:12px;color:var(--ink);display:block}
 :focus-visible{outline:3px solid var(--ink);outline-offset:2px}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
@@ -880,15 +881,16 @@ def render_delconfirm(token, csrf):
 def render_config(csrf):
     recipe = get_recipe(); ips = get_ips(); rows = ""
     for ep in ENDPOINTS:
-        tag = ep["tag"]; r = recipe.get(tag, {"enabled": True, "count": 0}); maxn = len(_ep_slots(ep))
+        tag = ep["tag"]; r = recipe.get(tag, {"enabled": True, "count": 0}); nports = len(_ep_slots(ep))
         rows += ("<div class=eprow>"
                  "<label class=eplabel><input type=checkbox name='en_%s'%s>"
-                 "<span><b>%s</b><span class=eptag>%s · حداکثر ~%d</span></span></label>"
-                 "<input type=number name='cnt_%s' value='%d' min=0 max=20 aria-label='تعداد %s'>"
+                 "<span><b>%s</b><span class=eptag>%s · %d پورت</span></span></label>"
+                 "<input type=number name='cnt_%s' value='%d' min=0 aria-label='تعداد %s'>"
                  "</div>") % (tag, (" checked" if r["enabled"] else ""), html.escape(ep.get("label", tag)),
-                              html.escape(tag), maxn, tag, r["count"], html.escape(tag))
+                              html.escape(tag), nports, tag, r["count"], html.escape(tag))
     body = ("<form method=post action='/a/config' class=grid>"
-            "<h2>نوع و تعداد کانفیگ‌ها</h2>%s"
+            "<h2>نوع و تعداد کانفیگ‌ها</h2>"
+            "<p class=hint>تعداد سقفی ندارد؛ بیشتر از تعداد پورت، روی آی‌پی‌های تمیز پخش می‌شود.</p>%s"
             "<h2 style='margin-top:16px'>آی‌پی‌های تمیز کلادفلر</h2>"
             "<textarea name=ips rows=4 placeholder='104.16.96.1, 104.21.96.1'>%s</textarea>"
             "<input type=hidden name=csrf value='%s'>"
