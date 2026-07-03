@@ -332,10 +332,11 @@ def prune_daily(c, keep_days=30):
     c.execute("DELETE FROM usage_daily WHERE day < ?", (cutoff,))
 
 def panel_usage_summary():
-    c = db(); day = day_key()
+    c = db(); day = day_key(); cutoff30 = day_key(time.time() - 30 * 86400)
     total = c.execute("SELECT COALESCE(SUM(used_bytes),0) v FROM users").fetchone()["v"]
     today = c.execute("SELECT COALESCE(SUM(max(end_used-start_used,0)),0) v FROM usage_daily WHERE day=?", (day,)).fetchone()["v"]
-    c.close(); return int(total), int(today)
+    last30 = c.execute("SELECT COALESCE(SUM(max(end_used-start_used,0)),0) v FROM usage_daily WHERE day>=?", (cutoff30,)).fetchone()["v"]
+    c.close(); return int(total), int(today), int(last30)
 
 def resync_all():
     c = db(); rows = c.execute("SELECT token,uuid,label,disabled_ts FROM users").fetchall(); c.close()
@@ -489,8 +490,9 @@ def route_cb(chat, mid, data, cbid):
     if data == "list":
         answer(cbid); c = db(); n = c.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]; c.close()
         if n:
-            total, today = panel_usage_summary()
-            head = "📋 لینک‌های فعال:\n📊 مصرف کل: %s · امروز: %s" % (fmt_bytes(total), fmt_bytes(today))
+            total, today, last30 = panel_usage_summary()
+            head = ("📋 لینک‌های فعال:\n📊 مصرف کل: %s · امروز: %s\n🗓 ۳۰ روز اخیر: %s"
+                    % (fmt_bytes(total), fmt_bytes(today), fmt_bytes(last30)))
         else:
             head = "هنوز لینکی نساخته‌ای. با ➕ شروع کن."
         edit(chat, mid, head, list_kb()); return
@@ -674,14 +676,14 @@ def render_expired():
     return _page("منقضی", "<h1>لینک منقضی شد</h1><p>برای ورود دوباره، در ربات دستور <code>/admin</code> را بزن.</p>")
 
 def render_dashboard():
-    total, today = panel_usage_summary()
+    total, today, last30 = panel_usage_summary()
     ov = users_overview()
     active = sum(1 for u in ov if not u["disabled_ts"]); disabled = len(ov) - active
     chart = svg_bars(daily_series(7))
     head = ("<h1>📊 پنل Mohajer</h1><div class=card><div class=row>"
-            "<div>مصرف کل: <b>%s</b></div><div>امروز: <b>%s</b></div>"
+            "<div>مصرف کل: <b>%s</b></div><div>امروز: <b>%s</b></div><div>۳۰ روز اخیر: <b>%s</b></div>"
             "<div>لینک‌ها: <b>%d</b> (فعال %d / غیرفعال %d)</div></div>"
-            "<h2>مصرف ۷ روز اخیر</h2>%s</div>" % (fmt_bytes(total), fmt_bytes(today), len(ov), active, disabled, chart))
+            "<h2>مصرف ۷ روز اخیر</h2>%s</div>" % (fmt_bytes(total), fmt_bytes(today), fmt_bytes(last30), len(ov), active, disabled, chart))
     rows = "".join(
         "<tr><td><a href='/a/user?token=%s'>%s%s</a></td><td>%s / %s</td><td>%s</td><td>%s</td></tr>" % (
             u["token"], ("⏸ " if u["disabled_ts"] else ""), html.escape(u["label"]),

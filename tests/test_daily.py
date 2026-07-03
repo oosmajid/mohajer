@@ -40,9 +40,10 @@ class TestDailyRecord(unittest.TestCase):
         bot.record_daily(c, "aa", 500, day)     # later poll
         c.execute("UPDATE users SET used_bytes=500 WHERE token='aa'")
         c.commit(); c.close()
-        total, today = bot.panel_usage_summary()
+        total, today, last30 = bot.panel_usage_summary()
         self.assertEqual(total, 500)
         self.assertEqual(today, 400)            # 500 - 100
+        self.assertEqual(last30, 400)
 
     def test_end_used_never_decreases(self):
         day = bot.day_key()
@@ -84,9 +85,10 @@ class TestEnforcerHook(unittest.TestCase):
         c = bot.db(); bot.record_daily(c, "bb", 100, day); c.commit(); c.close()  # simulate earlier poll
         bot.xr_usage_all = lambda: {"bb": 250}
         bot.refresh_all_usage()
-        total, today = bot.panel_usage_summary()
+        total, today, last30 = bot.panel_usage_summary()
         self.assertEqual(total, 250)
         self.assertEqual(today, 150)   # 250 - 100
+        self.assertEqual(last30, 150)
 
 
 if __name__ == "__main__":
