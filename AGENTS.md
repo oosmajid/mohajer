@@ -104,6 +104,14 @@ ssh -p 49531 -o "ProxyCommand=nc -x 127.0.0.1:10808 -X 5 %h %p" root@23.94.29.30
   the legacy output. `count` is UNCAPPED; when it exceeds an endpoint's port-slots the
   extra configs cycle over ports × clean IPs (`write_sub` honors this). Saving
   regenerates every sub. `get_recipe()`/`set_recipe()` live next to `get_ips()`.
+- **Light/dark theme:** both the admin panel (`ADMIN_CSS`/`_page`) and the subscriber
+  page (`subserver.py` `PAGE`) ship an icon-only toggle (🌙/☀️) at the top. Themes are
+  driven by `data-theme` on `<html>`; an early head script sets it from `localStorage`
+  (`mj-theme`), falling back to the OS `prefers-color-scheme` (no FOUC). The dark palette
+  is a `:root[data-theme=dark]{…}` override of the same tokens. Always-yellow surfaces
+  (`.hero`, primary `.btn`/`button`) pin dark ink so they stay high-contrast in dark, and
+  charts use `currentColor` so bars follow the theme. Never hardcode `#111111` on a
+  themeable surface — use `var(--ink)`.
 - **Edit bot logic:** it's one file, stdlib only. After editing, copy to the server
   path (see table) and `systemctl restart dpbot` (live) / `mohajer-bot` (fresh).
 - **Inspect state:** `sqlite3 <db> "SELECT label,used_bytes,limit_bytes,expiry_ts FROM users"`.

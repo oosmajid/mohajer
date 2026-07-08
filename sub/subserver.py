@@ -57,7 +57,7 @@ def bars_html(info):
                    '<div class="track"><div class="fill" style="width:%.1f%%;background:%s"></div></div></div>' % (val, pct, col))
     else:
         out.append('<div class="stat"><div class="lbl"><span>📦 حجم</span><span>نامحدود</span></div>'
-                   '<div class="track"><div class="fill" style="width:100%;background:#111111"></div></div></div>')
+                   '<div class="track"><div class="fill" style="width:100%;background:var(--ink)"></div></div></div>')
     # time
     exp, cr = info["expiry_ts"], info["created_ts"] or 0
     if exp and exp > 0:
@@ -69,7 +69,7 @@ def bars_html(info):
                    '<div class="track"><div class="fill" style="width:%.1f%%;background:%s"></div></div></div>' % (html.escape(left), pct, col))
     else:
         out.append('<div class="stat"><div class="lbl"><span>⏳ زمان</span><span>نامحدود</span></div>'
-                   '<div class="track"><div class="fill" style="width:100%;background:#111111"></div></div></div>')
+                   '<div class="track"><div class="fill" style="width:100%;background:var(--ink)"></div></div></div>')
     out.append("</div>")
     return "".join(out)
 
@@ -140,10 +140,13 @@ def decorate(links, info):
 
 PAGE = """<!doctype html><html lang="fa" dir="rtl"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
-<meta name="color-scheme" content="light">
+<meta name="color-scheme" content="light dark">
 <title>کانفیگ‌ها</title>
+<script>(function(){try{var t=localStorage.getItem('mj-theme')||((window.matchMedia&&matchMedia('(prefers-color-scheme:dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>
 <style>
 :root{--paper:#F4F1E8;--card:#FFFFFF;--ink:#111111;--accent:#FFDD2D;--ok:#2FCB74;--warn:#FFB020;--dng:#FF5A47;--mut:#6B675C;--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+:root[data-theme=dark]{--paper:#16150F;--card:#211F17;--ink:#F1EEE3;--mut:#9C978B}
+:root[data-theme=dark] button:not(.sec):not(.copy):not(.tbtn){color:#111111}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html,body{margin:0;max-width:100%;overflow-x:hidden}
 body{font-family:Tahoma,"Segoe UI",-apple-system,system-ui,Vazirmatn,sans-serif;background:var(--paper);color:var(--ink);padding:16px 12px 30px;line-height:1.5}
@@ -162,6 +165,11 @@ button{font-family:inherit;font-size:14px;font-weight:800;border:3px solid var(-
 button:hover{transform:translate(-1px,-1px);box-shadow:4px 4px 0 var(--ink)}
 button:active{transform:translate(3px,3px);box-shadow:0 0 0 var(--ink)}
 button.sec{background:var(--card)}
+.phead{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:2px 2px 14px}
+.phead h1{margin:0}
+.tbtn{display:inline-flex;align-items:center;justify-content:center;width:38px;height:38px;padding:0;font-size:17px;line-height:1;border:3px solid var(--ink);background:var(--card);color:var(--ink);cursor:pointer;box-shadow:3px 3px 0 var(--ink);transition:transform .06s,box-shadow .06s;flex:0 0 auto}
+.tbtn:hover{transform:translate(-1px,-1px);box-shadow:4px 4px 0 var(--ink)}
+.tbtn:active{transform:translate(3px,3px);box-shadow:0 0 0 var(--ink)}
 .card{background:var(--card);border:2px solid var(--ink);padding:11px 13px;margin-bottom:10px;display:flex;align-items:center;gap:12px}
 .meta{flex:1 1 auto;min-width:0}
 .name{font-weight:800;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;direction:ltr;text-align:right;font-family:var(--mono)}
@@ -171,7 +179,7 @@ button.sec{background:var(--card)}
 .foot{color:var(--mut);font-size:12px;font-weight:700;text-align:center;margin-top:18px}
 #buf{position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;border:0;padding:0}
 </style></head><body><div class="wrap">
-<h1>📋 کانفیگ‌ها</h1>
+<div class="phead"><h1>📋 کانفیگ‌ها</h1><button id="themebtn" type="button" class="tbtn" onclick="toggleTheme()" aria-label="تغییر تم" title="تغییر تم">🌙</button></div>
 %STATS%
 <p class="sub">%COUNT% کانفیگ — تکی کپی کن یا «کپی همه».</p>
 <div class="bar">
@@ -190,6 +198,8 @@ function cp(t,b){if(navigator.clipboard&&window.isSecureContext){navigator.clipb
 function copyOne(i,b){cp(CFG[i],b)}
 function copyAll(b){cp(CFG.join('\\n'),b)}
 function copyLink(b){cp(location.origin+location.pathname,b)}
+function toggleTheme(){var h=document.documentElement,d=h.getAttribute('data-theme')==='dark'?'light':'dark';h.setAttribute('data-theme',d);try{localStorage.setItem('mj-theme',d);}catch(e){}_syncTheme();}
+function _syncTheme(){var b=document.getElementById('themebtn');if(b)b.textContent=document.documentElement.getAttribute('data-theme')==='dark'?'☀️':'🌙';}_syncTheme();
 </script></body></html>"""
 
 ROW = ('<div class="card"><div class="meta"><div class="name">%s</div>'

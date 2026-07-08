@@ -675,6 +675,9 @@ def users_overview():
 
 ADMIN_CSS = """
 :root{--paper:#F4F1E8;--card:#FFFFFF;--ink:#111111;--accent:#FFDD2D;--ok:#2FCB74;--warn:#FFB020;--dng:#FF5A47;--mut:#6B675C;--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;--sans:Tahoma,"Segoe UI",-apple-system,system-ui,sans-serif}
+:root[data-theme=dark]{--paper:#16150F;--card:#211F17;--ink:#F1EEE3;--mut:#9C978B}
+:root[data-theme=dark] .hero{--ink:#111111;--paper:#F4F1E8;--card:#FFFFFF;--mut:#6B675C}
+:root[data-theme=dark] .btn:not(.ghost):not(.danger){color:#111111}
 *{box-sizing:border-box}
 html,body{margin:0;max-width:100%}
 body{background:var(--paper);color:var(--ink);font-family:var(--sans);line-height:1.55;padding:18px 14px 48px;-webkit-font-smoothing:antialiased}
@@ -692,7 +695,7 @@ a{color:var(--ink);text-decoration:none}
 .rightnav{margin-inline-start:auto;display:flex;align-items:center;gap:10px}
 .card{background:var(--card);border:3px solid var(--ink);box-shadow:5px 5px 0 var(--ink);padding:16px;margin:0 0 18px}
 .card h2{margin:0 0 12px;font-size:12px;color:var(--ink);font-weight:800}
-.hero{background:var(--accent)}
+.hero{background:var(--accent);color:var(--ink)}
 .big{font-family:var(--mono);font-size:44px;font-weight:800;line-height:1.02}
 .big small{font-family:var(--sans);font-size:15px;font-weight:700;margin-inline-start:6px}
 .title{font-size:24px;font-weight:800;margin:2px 0}
@@ -705,7 +708,7 @@ a{color:var(--ink);text-decoration:none}
 .d.ok{background:var(--ok)}
 .d.off{background:var(--paper)}
 .chart{margin-top:16px}
-svg{display:block;width:100%}
+svg{display:block;width:100%;color:var(--ink)}
 .u{display:grid;grid-template-columns:14px 1fr 72px 84px;align-items:center;gap:10px;padding:12px;border:2px solid var(--ink);background:var(--card);color:var(--ink);margin-top:10px}
 .u:first-of-type{margin-top:0}
 .u:hover{transform:translate(-2px,-2px);box-shadow:4px 4px 0 var(--ink)}
@@ -726,6 +729,9 @@ svg{display:block;width:100%}
 .btn:active{transform:translate(3px,3px);box-shadow:0 0 0 var(--ink)}
 .btn.ghost{background:var(--card)}
 .btn.danger{background:var(--dng);color:#fff}
+.tbtn{display:inline-flex;align-items:center;justify-content:center;width:38px;height:38px;padding:0;font-size:17px;line-height:1;border:3px solid var(--ink);background:var(--card);color:var(--ink);cursor:pointer;box-shadow:3px 3px 0 var(--ink);transition:transform .06s,box-shadow .06s}
+.tbtn:hover{transform:translate(-1px,-1px);box-shadow:4px 4px 0 var(--ink)}
+.tbtn:active{transform:translate(3px,3px);box-shadow:0 0 0 var(--ink)}
 input[type=text],input[type=number],textarea{background:var(--card);border:3px solid var(--ink);color:var(--ink);border-radius:0;padding:9px 11px;font-family:inherit;font-size:14px;flex:1 1 130px;min-width:0;max-width:280px;outline:none}
 input[type=number]{max-width:96px}
 textarea{width:100%;max-width:100%;font-family:var(--mono);resize:vertical}
@@ -748,9 +754,12 @@ code{font-family:var(--mono);background:var(--paper);border:2px solid var(--ink)
 def _page(title, inner):
     return ("<!doctype html><html lang=fa dir=rtl><head><meta charset=utf-8>"
             "<meta name=viewport content='width=device-width,initial-scale=1'>"
-            "<meta name=color-scheme content=light><title>%s</title>"
+            "<meta name=color-scheme content='light dark'><title>%s</title>"
+            "<script>(function(){try{var t=localStorage.getItem('mj-theme')||((window.matchMedia&&matchMedia('(prefers-color-scheme:dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>"
             "<style>%s</style></head><body><div class=wrap>%s</div><div id=tt class=tt></div>"
-            "<script>(function(){var t=document.getElementById('tt');document.addEventListener('click',function(e){"
+            "<script>function toggleTheme(){var h=document.documentElement,d=h.getAttribute('data-theme')==='dark'?'light':'dark';h.setAttribute('data-theme',d);try{localStorage.setItem('mj-theme',d);}catch(e){}_syncTheme();}"
+            "function _syncTheme(){var b=document.getElementById('themebtn');if(b)b.textContent=document.documentElement.getAttribute('data-theme')==='dark'?'☀️':'🌙';}_syncTheme();"
+            "(function(){var t=document.getElementById('tt');document.addEventListener('click',function(e){"
             "var b=e.target.closest&&e.target.closest('.bar');if(b){t.textContent=b.getAttribute('data-t')+' — '+b.getAttribute('data-v');"
             "t.style.display='block';var w=t.offsetWidth;t.style.left=Math.max(6,Math.min(e.clientX-w/2,window.innerWidth-w-6))+'px';"
             "t.style.top=Math.max(6,e.clientY-40)+'px';}else{t.style.display='none';}});})();</script>"
@@ -765,9 +774,10 @@ def _top(crumb="", csrf=None):
         right += ("<form method=post action='/a/logout' style='margin:0'>"
                   "<input type=hidden name=csrf value='%s'>"
                   "<button class='btn ghost'>خروج</button></form>") % csrf
-    rightnav = ("<span class=rightnav>%s</span>" % right) if right else ""
-    return ("<header class=top><span class=brand><span class=dot-sig></span>Mohajer</span>%s</header>"
-            % rightnav)
+    right += ("<button id=themebtn type=button class=tbtn onclick=\"toggleTheme()\" "
+              "aria-label='تغییر تم' title='تغییر تم'>🌙</button>")
+    return ("<header class=top><span class=brand><span class=dot-sig></span>Mohajer</span>"
+            "<span class=rightnav>%s</span></header>" % right)
 
 def _metric_big(b):
     s = fmt_bytes(b); p = s.rsplit(" ", 1)
@@ -777,7 +787,7 @@ def svg_bars(series, w=760, h=96):
     vals = [v for _, v in series]; mx = max(vals + [1]); n = len(series) or 1; bw = w / n; bars = ""
     for i, (lab, v) in enumerate(series):
         bh = max(3.0, (v / mx) * (h - 6)); val = fmt_bytes(v)
-        bars += ('<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" fill="#111111" opacity="%s"></rect>'
+        bars += ('<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" fill="currentColor" opacity="%s"></rect>'
                  ) % (i * bw + 3, h - bh, max(3.0, bw - 6), bh, ("1" if v > 0 else "0.18"))
         # full-height transparent hit target -> tappable on touch; carries the value for the tooltip
         bars += ('<rect class="bar" x="%.1f" y="0" width="%.1f" height="%d" fill="transparent" data-t="%s" data-v="%s">'
