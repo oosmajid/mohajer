@@ -25,6 +25,7 @@ TOKEN       = ENV.get("BOT_TOKEN", "")
 ADMIN_IDS   = set(int(x) for x in ENV.get("ADMIN_IDS", "").replace(" ", "").split(",") if x.isdigit())
 XRAY_BIN    = ENV.get("XRAY_BIN", "/usr/local/bin/xray")
 XRAY_API    = ENV.get("XRAY_API", "127.0.0.1:10085")
+XRAY_SERVICE = ENV.get("XRAY_SERVICE", "xray")  # systemd unit to watch for PID changes (multi-instance safe)
 DOMAIN      = ENV.get("DOMAIN", "cdn.delplayer.ir")
 SUB_DIR     = ENV.get("SUB_DIR", "/opt/dpsub")
 SUB_BASE    = ENV.get("SUB_BASE_URL", "https://cdn.delplayer.ir")
@@ -155,7 +156,7 @@ def xr_usage(token):
 
 def xray_pid():
     try:
-        return subprocess.run(["systemctl", "show", "xray", "-p", "MainPID", "--value"], capture_output=True, text=True, timeout=10).stdout.strip()
+        return subprocess.run(["systemctl", "show", XRAY_SERVICE, "-p", "MainPID", "--value"], capture_output=True, text=True, timeout=10).stdout.strip()
     except Exception:
         return ""
 
