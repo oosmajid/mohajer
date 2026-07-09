@@ -151,6 +151,49 @@ def xr_remove_user(token):
         except Exception as e:
             print("rmu err", e, flush=True)
 
+# ---- online presence + force-disconnect ----
+# xray's rmu blocks NEW auth but never tears down an already-established session; over
+# WS/CDN that session is one long-lived cloudflared<->xray localhost socket, so a removed
+# user keeps working for hours until they reconnect. We can't identify a single user's
+# localhost socket (xray logs the real client IP, not the socket), so to cut a live session
+# we `ss -K` the carrier sockets on the port(s) the target is using: every client there
+# reconnects in ~1s, valid users re-auth instantly (still in xray, no resync), the removed
+# user is blocked. Needs policy.levels.0.statsUserOnline=true (also powers the panel glow).
+def xr_online_map():
+    # {token: set(tags)} of users with a live session right now; None if xray can't tell.
+    try:
+        r = subprocess.run([XRAY_BIN, "api", "statsgetallonlineusers", "--server=%s" % XRAY_API],
+                           capture_output=True, text=True, timeout=10)
+        data = json.loads(r.stdout or "{}")
+    except Exception as e:
+        print("online-map err", e, flush=True); return None
+    m = {}
+    for s in (data.get("users") or []):        # each entry: "user>>>u_<token>.<tag>>>>online"
+        parts = s.split(">>>")
+        if len(parts) >= 2 and parts[1].startswith("u_") and "." in parts[1]:
+            tok, tag = parts[1][2:].split(".", 1)
+            m.setdefault(tok, set()).add(tag)
+    return m
+
+def online_tags_of(token):
+    m = xr_online_map()
+    return None if m is None else m.get(token, set())
+
+def ports_to_kick(online_tags):
+    # None -> unknown, reset every endpoint (safe fallback); empty -> offline, nothing;
+    # non-empty -> only the ports the target is actually on (spares other protocols).
+    if online_tags is None:
+        return sorted({ep["port"] for ep in ENDPOINTS})
+    return sorted({ep["port"] for ep in ENDPOINTS if ep["tag"] in online_tags})
+
+def force_disconnect(online_tags):
+    for p in ports_to_kick(online_tags):
+        try:
+            subprocess.run(["ss", "-K", "dst", "127.0.0.1", "dport", "=", ":%d" % p],
+                           capture_output=True, text=True, timeout=10)
+        except Exception as e:
+            print("kick err", e, flush=True)
+
 def xr_usage(token):
     try:
         r = subprocess.run([XRAY_BIN, "api", "statsquery", "--server=%s" % XRAY_API, "-pattern", "user>>>u_%s" % token],
@@ -293,8 +336,10 @@ def create_user(vol_gb, dur_days, label=None):
 def delete_user(token):
     c = db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone()
     if u:
+        tags = online_tags_of(token)     # capture BEFORE rmu (rmu clears the online stat)
         xr_remove_user(token); del_sub(token)
         c.execute("DELETE FROM users WHERE token=?", (token,)); c.commit()
+        force_disconnect(tags)           # cut the live session now (no-op if it was offline)
     c.close()
 
 def exhaust_reason(u, now=None):
@@ -305,8 +350,10 @@ def exhaust_reason(u, now=None):
 
 def disable_user(token):
     # exhausted: stop service (remove from xray) but KEEP the row + sub file so it can be renewed within the grace window
+    tags = online_tags_of(token)     # capture BEFORE rmu
     xr_remove_user(token)
     c = db(); c.execute("UPDATE users SET disabled_ts=? WHERE token=?", (int(time.time()), token)); c.commit(); c.close()
+    force_disconnect(tags)           # cut the live session so quota/expiry actually takes effect now
 
 def reenable_user(token):
     c = db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone(); c.close()
@@ -720,10 +767,13 @@ svg{display:block;width:100%;color:var(--ink)}
 .u:first-of-type{margin-top:0}
 .u:hover{transform:translate(-2px,-2px);box-shadow:4px 4px 0 var(--ink)}
 .st{width:12px;height:12px;border:2px solid var(--ink);flex:0 0 auto}
-.st.ok{background:var(--ok)}
-.st.warn{background:var(--warn)}
-.st.dng{background:var(--dng)}
-.st.off{background:var(--paper)}
+.st.ok{background:var(--ok);color:var(--ok)}
+.st.warn{background:var(--warn);color:var(--warn)}
+.st.dng{background:var(--dng);color:var(--dng)}
+.st.off{background:var(--paper);color:var(--mut)}
+.st.on{filter:saturate(1.45) brightness(1.12);animation:stglow 1.5s ease-in-out infinite}
+@keyframes stglow{0%,100%{box-shadow:0 0 3px 0 currentColor}50%{box-shadow:0 0 9px 2px currentColor}}
+@media (prefers-reduced-motion:reduce){.st.on{animation:none;box-shadow:0 0 7px 1px currentColor}}
 .nm{flex:1 1 auto;min-width:0;display:flex;flex-direction:column}
 .nm b{font-weight:800;font-size:14px}
 .nm .sub{font-size:11px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-family:var(--mono)}
@@ -812,7 +862,7 @@ def render_loggedout():
                  "<div class=eyebrow>خروج</div><div class=title>با موفقیت خارج شدی</div>"
                  "<p style='color:var(--mut);margin:6px 0 0'>برای ورودِ دوباره، در ربات دستور <code>/admin</code> را بزن.</p></div>")
 
-def _user_row(u):
+def _user_row(u, online=False):
     lim = u["limit_bytes"] or 0; used = u["used_bytes"] or 0; dis = u["disabled_ts"]
     if lim > 0:
         pct = min(100, int(used * 100 / lim))
@@ -821,6 +871,7 @@ def _user_row(u):
     else:
         st = "off" if dis else "ok"
         fill = "<span class=fil style='width:100%;opacity:.3'></span>"
+    if online: st += " on"              # live now -> pulsing halo in the square's own colour
     return ("<a class=u href='/a/user?token=%s'><span class='st %s'></span>"
             "<span class=nm><b>%s</b><span class=sub><span class=n>%s / %s</span></span></span>"
             "<span class=meter><span class=trk>%s</span></span>"
@@ -841,7 +892,8 @@ def render_dashboard(csrf):
             "<span class=pill><span class='d off'></span>%d غیرفعال</span></div>"
             "<div class=chart><div class=eyebrow>۷ روز اخیر</div>%s</div></div>") % (
         _metric_big(today), fmt_bytes(total), fmt_bytes(last30), active, disabled, chart)
-    rows = "".join(_user_row(u) for u in ov) or "<div class=u><span class=nm style='color:var(--mut)'>هنوز لینکی نساخته‌ای</span></div>"
+    onmap = xr_online_map() or {}
+    rows = "".join(_user_row(u, u["token"] in onmap) for u in ov) or "<div class=u><span class=nm style='color:var(--mut)'>هنوز لینکی نساخته‌ای</span></div>"
     users = ("<div class=card><div class=row style='justify-content:space-between;margin-bottom:8px'>"
              "<h2 style='margin:0'>لینک‌ها</h2><span class=row>"
              "<a class='btn ghost' href='/a/config'>⚙ پیکربندی</a>"
