@@ -47,7 +47,13 @@ SSLCTX = ssl.create_default_context()
 
 # ---------------- db ----------------
 def db():
-    c = sqlite3.connect(DB_PATH, timeout=15); c.row_factory = sqlite3.Row; return c
+    c = sqlite3.connect(DB_PATH, timeout=15); c.row_factory = sqlite3.Row
+    # WAL so the admin panel (reader) and the enforcer/main (writers) don't deadlock
+    # into "database is locked"; busy_timeout waits on writer-writer contention.
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA busy_timeout=15000")
+    c.execute("PRAGMA synchronous=NORMAL")
+    return c
 
 def init_db():
     c = db()

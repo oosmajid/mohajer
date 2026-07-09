@@ -21,7 +21,10 @@ def user_info(name):
         return None
     token = name[len("sub-u-"):]
     try:
-        c = sqlite3.connect("file:%s?mode=ro" % DB_PATH, uri=True, timeout=5)
+        # Not mode=ro: a read-only handle can't attach the WAL -shm file. We only
+        # ever SELECT here, so a normal handle is read-only in practice.
+        c = sqlite3.connect(DB_PATH, timeout=5)
+        c.execute("PRAGMA busy_timeout=5000")
         c.row_factory = sqlite3.Row
         r = c.execute("SELECT used_bytes,limit_bytes,expiry_ts,created_ts,label,disabled_ts FROM users WHERE token=?", (token,)).fetchone()
         c.close()
