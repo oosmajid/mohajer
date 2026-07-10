@@ -61,7 +61,7 @@ def init_db():
         token TEXT PRIMARY KEY, uuid TEXT, email TEXT UNIQUE, label TEXT,
         limit_bytes INTEGER, expiry_ts INTEGER, created_ts INTEGER,
         base_bytes INTEGER DEFAULT 0, last_raw INTEGER DEFAULT 0, used_bytes INTEGER DEFAULT 0,
-        disabled_ts INTEGER DEFAULT 0)""")
+        disabled_ts INTEGER DEFAULT 0, frozen INTEGER DEFAULT 0)""")
     c.execute("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)")
     c.execute("""CREATE TABLE IF NOT EXISTS usage_daily(
         token TEXT, day TEXT, start_used INTEGER, end_used INTEGER,
@@ -69,6 +69,8 @@ def init_db():
     cols = [r[1] for r in c.execute("PRAGMA table_info(users)").fetchall()]
     if "disabled_ts" not in cols:  # migrate existing DBs
         c.execute("ALTER TABLE users ADD COLUMN disabled_ts INTEGER DEFAULT 0")
+    if "frozen" not in cols:       # manual admin freeze (independent of quota/expiry disable)
+        c.execute("ALTER TABLE users ADD COLUMN frozen INTEGER DEFAULT 0")
     c.commit(); c.close()
 
 def meta_get(k, d=None):
@@ -368,6 +370,21 @@ def maybe_reenable(token):
         reenable_user(token); return True
     return False
 
+def freeze_user(token):
+    # manual admin freeze: cut the link NOW and keep it out of xray until unfrozen. Fully
+    # independent of the quota/expiry disable — no 48h grace, and the enforcer never touches it.
+    tags = online_tags_of(token)     # capture BEFORE rmu (rmu clears the online stat)
+    xr_remove_user(token)
+    c = db(); c.execute("UPDATE users SET frozen=1 WHERE token=?", (token,)); c.commit(); c.close()
+    force_disconnect(tags)           # drop the live session immediately
+
+def unfreeze_user(token):
+    c = db(); c.execute("UPDATE users SET frozen=0 WHERE token=?", (token,)); c.commit()
+    u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone(); c.close()
+    # bring it back live unless it's also quota/expiry-disabled or now exhausted
+    if u and not u["disabled_ts"] and not exhaust_reason(u):
+        xr_add_user(token, u["uuid"]); write_sub(token, u["uuid"], u["label"])
+
 def refresh_usage(token):
     c = db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone()
     if not u: c.close(); return
@@ -422,9 +439,9 @@ def panel_usage_summary():
     c.close(); return int(total), int(today), int(last30)
 
 def resync_all():
-    c = db(); rows = c.execute("SELECT token,uuid,label,disabled_ts FROM users").fetchall(); c.close()
+    c = db(); rows = c.execute("SELECT token,uuid,label,disabled_ts,frozen FROM users").fetchall(); c.close()
     for u in rows:
-        if u["disabled_ts"]: continue   # in 48h grace — keep it out of xray (stays renewable)
+        if u["disabled_ts"] or u["frozen"]: continue   # grace or manual freeze -> keep out of xray
         xr_add_user(u["token"], u["uuid"]); write_sub(u["token"], u["uuid"], u["label"])
 
 def notify_admin(text):
@@ -644,9 +661,10 @@ def enforcer():
             if pid and pid != "0" and pid != last_pid:
                 resync_all(); last_pid = pid; meta_set("xray_pid", pid)
             refresh_all_usage()
-            c = db(); rows = c.execute("SELECT token,uuid,used_bytes,limit_bytes,expiry_ts,label,disabled_ts FROM users").fetchall(); c.close()
+            c = db(); rows = c.execute("SELECT token,uuid,used_bytes,limit_bytes,expiry_ts,label,disabled_ts,frozen FROM users").fetchall(); c.close()
             now = int(time.time())
             for cur in rows:
+                if cur["frozen"]: continue   # manually frozen -> ignore all auto disable/grace/reenable
                 reason = exhaust_reason(cur, now)
                 if reason:
                     if not cur["disabled_ts"]:                       # just ran out -> disable + notify, start 48h grace
@@ -718,7 +736,7 @@ def daily_series(days=7, token=None, now=None):
 
 def users_overview():
     c = db(); today = day_key()
-    rows = c.execute("SELECT token,label,used_bytes,limit_bytes,expiry_ts,disabled_ts,created_ts FROM users ORDER BY created_ts DESC").fetchall()
+    rows = c.execute("SELECT token,label,used_bytes,limit_bytes,expiry_ts,disabled_ts,frozen,created_ts FROM users ORDER BY created_ts DESC").fetchall()
     daily = {r["token"]: int(r["v"] or 0) for r in
              c.execute("SELECT token, max(end_used-start_used,0) v FROM usage_daily WHERE day=?", (today,)).fetchall()}
     c.close()
@@ -728,7 +746,7 @@ def users_overview():
     return out
 
 ADMIN_CSS = """
-:root{--paper:#F4F1E8;--card:#FFFFFF;--ink:#111111;--accent:#FFDD2D;--ok:#2FCB74;--warn:#FFB020;--dng:#FF5A47;--mut:#6B675C;--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;--sans:Tahoma,"Segoe UI",-apple-system,system-ui,sans-serif}
+:root{--paper:#F4F1E8;--card:#FFFFFF;--ink:#111111;--accent:#FFDD2D;--ok:#2FCB74;--warn:#FFB020;--dng:#FF5A47;--frz:#3FA9F5;--mut:#6B675C;--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;--sans:Tahoma,"Segoe UI",-apple-system,system-ui,sans-serif}
 :root[data-theme=dark]{--paper:#16150F;--card:#211F17;--ink:#F1EEE3;--mut:#9C978B}
 :root[data-theme=dark] .hero{--ink:#111111;--paper:#F4F1E8;--card:#FFFFFF;--mut:#6B675C}
 :root[data-theme=dark] .btn:not(.ghost):not(.danger){color:#111111}
@@ -771,9 +789,20 @@ svg{display:block;width:100%;color:var(--ink)}
 .st.warn{background:var(--warn);color:var(--warn)}
 .st.dng{background:var(--dng);color:var(--dng)}
 .st.off{background:var(--paper);color:var(--mut)}
+.st.frz{background:var(--frz);color:var(--frz)}
 .st.on{filter:saturate(1.45) brightness(1.12);animation:stglow 1.5s ease-in-out infinite}
 @keyframes stglow{0%,100%{box-shadow:0 0 3px 0 currentColor}50%{box-shadow:0 0 9px 2px currentColor}}
 @media (prefers-reduced-motion:reduce){.st.on{animation:none;box-shadow:0 0 7px 1px currentColor}}
+.switch{display:flex;align-items:center;gap:12px;cursor:pointer;user-select:none}
+.switch input{position:absolute;opacity:0;width:0;height:0}
+.switch .knob{position:relative;flex:0 0 auto;width:48px;height:28px;background:var(--paper);border:2px solid var(--ink);border-radius:0;transition:background .15s}
+.switch .knob::after{content:"";position:absolute;top:2px;inset-inline-start:2px;width:20px;height:20px;background:var(--ink);transition:inset-inline-start .15s}
+.switch input:checked+.knob{background:var(--frz)}
+.switch input:checked+.knob::after{inset-inline-start:22px}
+.switch input:focus-visible+.knob{outline:2px solid var(--frz);outline-offset:2px}
+.switch .swtxt{display:flex;flex-direction:column;line-height:1.35}
+.switch .swsub{font-size:12px;color:var(--mut)}
+.switch.on .swtxt b{color:var(--frz)}
 .nm{flex:1 1 auto;min-width:0;display:flex;flex-direction:column}
 .nm b{font-weight:800;font-size:14px}
 .nm .sub{font-size:11px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-family:var(--mono)}
@@ -871,7 +900,8 @@ def _user_row(u, online=False):
     else:
         st = "off" if dis else "ok"
         fill = "<span class=fil style='width:100%;opacity:.3'></span>"
-    if online: st += " on"              # live now -> pulsing halo in the square's own colour
+    if u["frozen"]: st = "frz"          # manual freeze -> icy square, overrides quota colour
+    if online and not u["frozen"]: st += " on"   # live now -> pulsing halo in the square's own colour
     return ("<a class=u href='/a/user?token=%s'><span class='st %s'></span>"
             "<span class=nm><b>%s</b><span class=sub><span class=n>%s / %s</span></span></span>"
             "<span class=meter><span class=trk>%s</span></span>"
@@ -910,8 +940,21 @@ def render_user(token, csrf):
         return _page("یافت نشد", _top("<a href='/a/'>← داشبورد</a>", csrf) + "<div class=card>لینکی با این شناسه پیدا نشد.</div>")
     today_u = daily_series(1, token=token)[-1][1]
     chart = svg_bars(daily_series(30, token=token))
-    dis = bool(u["disabled_ts"]); st = "dng" if dis else "ok"; stlabel = "غیرفعال" if dis else "فعال"
+    dis = bool(u["disabled_ts"]); frz = bool(u["frozen"])
+    st = "frz" if frz else ("dng" if dis else "ok")
+    stlabel = "فریز موقت" if frz else ("غیرفعال" if dis else "فعال")
     tk = "<input type=hidden name=token value='%s'>" % token
+    frz_card = (
+        "<div class=card><form method=post action='/a/freeze' id=frzf style='margin:0'>%s"
+        "<input type=hidden name=csrf value='%s'>"
+        "<label class='switch%s'>"
+        "<input type=checkbox name=on onchange=\"document.getElementById('frzf').submit()\"%s>"
+        "<span class=knob></span>"
+        "<span class=swtxt><b>فریز موقت</b><span class=swsub>%s</span></span></label>"
+        "</form></div>") % (
+        tk, csrf, (" on" if frz else ""), (" checked" if frz else ""),
+        ("اتصال قطع است — برای فعال‌سازیِ دوباره تیک را بردار" if frz
+         else "با زدنِ تیک، این کانفیگ فوراً قطع و تا برداشتنِ تیک غیرفعال می‌ماند"))
     forms = (
         _form("/a/addvol", [tk, "<input type=number name=gb placeholder='حجم (گیگ)'>"], csrf, "افزودن حجم") +
         _form("/a/addtime", [tk, "<input type=number name=days placeholder='مدت (روز)'>"], csrf, "افزودن زمان") +
@@ -930,7 +973,7 @@ def render_user(token, csrf):
         human_expiry(u["expiry_ts"]), chart)
     link = "<div class=card><h2>لینک اشتراک</h2><code>%s</code></div>" % sub_url(token)
     actions = "<div class=card><h2>مدیریت</h2><div class=grid>%s</div><div style='margin-top:10px'>%s</div></div>" % (forms, dele)
-    return _page("کاربر", _top("<a href='/a/'>← داشبورد</a>", csrf) + hero + link + actions)
+    return _page("کاربر", _top("<a href='/a/'>← داشبورد</a>", csrf) + hero + frz_card + link + actions)
 
 def render_new(csrf):
     f = _form("/a/new", ["<input type=number name=gb placeholder='حجم (گیگ) — ۰ = نامحدود'>",
@@ -1019,6 +1062,11 @@ def route_admin_post(method, path, query, csrf, body, now, sid):
         field = form.get("field")
         if field in ("limit_bytes", "expiry_ts"): set_unlimited(token, field)
         maybe_reenable(token); return _redirect("/a/user?token=" + token)
+    if path == "/a/freeze":
+        if token:
+            if form.get("on"): freeze_user(token)     # checkbox ticked -> cut now
+            else:              unfreeze_user(token)    # ticked off -> bring back live
+        return _redirect("/a/user?token=" + token)
     if path == "/a/delete":
         if form.get("confirm") == "yes" and token: delete_user(token)
         return _redirect("/a/")
