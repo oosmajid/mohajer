@@ -840,7 +840,9 @@ code{font-family:var(--mono);background:var(--paper);border:2px solid var(--ink)
 def _page(title, inner):
     return ("<!doctype html><html lang=fa dir=rtl><head><meta charset=utf-8>"
             "<meta name=viewport content='width=device-width,initial-scale=1'>"
-            "<meta name=color-scheme content='light dark'><title>%s</title>"
+            "<meta name=color-scheme content='light dark'>"
+            "<link rel=icon href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect x='3' y='3' width='26' height='26' fill='%%23FFDD2D' stroke='%%23111' stroke-width='4'/></svg>\">"
+            "<title>%s</title>"
             "<script>(function(){try{var t=localStorage.getItem('mj-theme')||((window.matchMedia&&matchMedia('(prefers-color-scheme:dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>"
             "<style>%s</style></head><body><div class=wrap>%s</div><div id=tt class=tt></div>"
             "<script>function toggleTheme(){var h=document.documentElement,d=h.getAttribute('data-theme')==='dark'?'light':'dark';h.setAttribute('data-theme',d);try{localStorage.setItem('mj-theme',d);}catch(e){}_syncTheme();}"
