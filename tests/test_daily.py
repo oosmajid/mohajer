@@ -72,12 +72,14 @@ class TestEnforcerHook(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False); self.tmp.close()
         self._orig = bot.DB_PATH; bot.DB_PATH = self.tmp.name; bot.init_db()
+        self._xua = bot.xr_usage_all   # restore in tearDown so we don't leak the stub to other tests
         c = bot.db()
         c.execute("INSERT INTO users(token,uuid,email,label,limit_bytes,expiry_ts,created_ts,base_bytes,last_raw,used_bytes) "
                   "VALUES('bb','u','u_bb','B',0,0,0,0,0,0)")
         c.commit(); c.close()
 
     def tearDown(self):
+        bot.xr_usage_all = self._xua
         bot.DB_PATH = self._orig; os.unlink(self.tmp.name)
 
     def test_refresh_all_usage_writes_daily(self):

@@ -197,13 +197,20 @@ def force_disconnect(online_tags):
             print("kick err", e, flush=True)
 
 def xr_usage(token):
+    # returns bytes, or None if the stats read FAILED. Never return 0 on failure:
+    # a failed read must not be mistaken for "counter reset to 0" (see refresh_usage).
     try:
         r = subprocess.run([XRAY_BIN, "api", "statsquery", "--server=%s" % XRAY_API, "-pattern", "user>>>u_%s" % token],
                            capture_output=True, text=True, timeout=15)
-        d = json.loads(r.stdout or "{}")
-        return sum(int(s.get("value", 0)) for s in (d.get("stat") or []))
     except Exception:
-        return 0
+        return None
+    if r.returncode != 0:
+        return None
+    try:
+        d = json.loads(r.stdout or "{}")
+    except Exception:
+        return None
+    return sum(int(s.get("value", 0)) for s in (d.get("stat") or []))
 
 def xray_pid():
     try:
@@ -388,34 +395,49 @@ def unfreeze_user(token):
 def refresh_usage(token):
     c = db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone()
     if not u: c.close(); return
-    raw = xr_usage(token); base = u["base_bytes"]; last = u["last_raw"]
+    raw = xr_usage(token)
+    if raw is None: c.close(); return   # read failed -> leave counters untouched
+    base = u["base_bytes"]; last = u["last_raw"]
     if raw < last: base += last
     used = base + raw
     c.execute("UPDATE users SET base_bytes=?,last_raw=?,used_bytes=? WHERE token=?", (base, raw, used, token))
     c.commit(); c.close()
 
 def xr_usage_all():
-    # ONE statsquery for all users -> {token: bytes} (avoids N forks per poll)
+    # ONE statsquery for all users -> {token: bytes}, or None if the read FAILED.
+    # None is CRITICAL: a failed/empty read must NOT be treated as "everyone reset to 0",
+    # because that false reset double-counts every user's traffic (the 2026-07 usage-spike bug).
     try:
         r = subprocess.run([XRAY_BIN, "api", "statsquery", "--server=%s" % XRAY_API, "-pattern", "user>>>u_"],
                            capture_output=True, text=True, timeout=20)
-        d = json.loads(r.stdout or "{}"); tot = {}
-        for s in (d.get("stat") or []):
-            nm = s.get("name", "")
-            if not nm.startswith("user>>>u_"): continue
-            tk = nm[len("user>>>u_"):].split(".", 1)[0].split(">>>", 1)[0]
-            tot[tk] = tot.get(tk, 0) + int(s.get("value", 0))
-        return tot
     except Exception:
-        return {}
+        return None
+    if r.returncode != 0:
+        return None
+    try:
+        d = json.loads(r.stdout or "{}")
+    except Exception:
+        return None
+    tot = {}
+    for s in (d.get("stat") or []):
+        nm = s.get("name", "")
+        if not nm.startswith("user>>>u_"): continue
+        tk = nm[len("user>>>u_"):].split(".", 1)[0].split(">>>", 1)[0]
+        tot[tk] = tot.get(tk, 0) + int(s.get("value", 0))
+    return tot
 
 def refresh_all_usage():
-    raws = xr_usage_all(); c = db(); today = day_key()
-    for u in c.execute("SELECT token,base_bytes,last_raw FROM users").fetchall():
-        raw = raws.get(u["token"], 0); base = u["base_bytes"]
-        if raw < u["last_raw"]: base += u["last_raw"]
-        used = base + raw
-        c.execute("UPDATE users SET base_bytes=?,last_raw=?,used_bytes=? WHERE token=?", (base, raw, used, u["token"]))
+    raws = xr_usage_all()
+    if raws is None: return   # stats read failed -> skip this poll; never guess 0 (would false-reset everyone)
+    c = db(); today = day_key()
+    for u in c.execute("SELECT token,base_bytes,last_raw,used_bytes FROM users").fetchall():
+        if u["token"] in raws:
+            raw = raws[u["token"]]; base = u["base_bytes"]
+            if raw < u["last_raw"]: base += u["last_raw"]   # genuine reset: a REAL reading below last_raw
+            used = base + raw
+            c.execute("UPDATE users SET base_bytes=?,last_raw=?,used_bytes=? WHERE token=?", (base, raw, used, u["token"]))
+        else:
+            used = u["used_bytes"]   # no counter reported for this user this poll -> keep prior used, don't touch
         record_daily(c, u["token"], used, today)
     prune_daily(c)
     c.commit(); c.close()
