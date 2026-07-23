@@ -396,21 +396,50 @@ def parse_outbound_link(link, tag):
 
     raise ValueError("پروتکل پشتیبانی نمی‌شود: %s" % (scheme or "؟"))
 
+def ob_xtag(tag):
+    # every outbound/rule we own carries this prefix inside xray's config, so on the next
+    # apply we can tell ours from anything the operator added by hand and clean up exactly
+    # what we created (a deleted outbound must not leave a dangling rule behind).
+    return "mj-" + tag
+
+def ob_owned(tag):
+    return tag.startswith("mj-") or tag in ("direct", "block")
+
+def ob_catchall_index(obs):
+    """Index of the outbound that takes ALL traffic (the first one with no domains), or None.
+       Empty domain list = "send everything here"; later empty ones are unreachable."""
+    for i, o in enumerate(obs):
+        if not [d for d in (o.get("domains") or []) if d]:
+            return i
+    return None
+
 def build_xray_sections(obs):
-    """-> (outbounds, routing rules, loopback test inbounds). First outbound = default (direct)."""
-    outs = [{"tag": "direct", "protocol": "freedom", "settings": {}}]
+    """-> (outbounds, routing rules, loopback test inbounds).
+
+    xray sends anything no rule matched to the FIRST outbound, so:
+      * no catch-all  -> `direct` is first: only the listed domains leave via an outbound.
+      * a catch-all   -> that outbound is first: EVERYTHING leaves through it, and the
+                         other outbounds still win for their own domains (rules beat default).
+    """
+    direct = {"tag": "direct", "protocol": "freedom", "settings": {}}
+    parsed = [parse_outbound_link(o["link"], ob_xtag(o["tag"])) for o in obs]
+    catch = ob_catchall_index(obs)
+    outs = ([parsed[catch]] if catch is not None else []) + [direct] + \
+           [ob for i, ob in enumerate(parsed) if i != catch]
     rules, tests = [], []
     for i, o in enumerate(obs):
-        outs.append(parse_outbound_link(o["link"], o["tag"]))
         itag = "mjtest-%s" % o["tag"]
         tests.append({"tag": itag, "listen": "127.0.0.1", "port": ob_test_port(i),
                       "protocol": "socks", "settings": {"auth": "noauth", "udp": False}})
         # test-inbound rules FIRST so a test always exits via its own outbound
-        rules.append({"type": "field", "inboundTag": [itag], "outboundTag": o["tag"]})
+        rules.append({"type": "field", "inboundTag": [itag], "outboundTag": ob_xtag(o["tag"])})
+    if catch is not None:
+        # never push LAN/loopback (incl. our own tunnel plumbing) through the upstream
+        rules.append({"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"})
     for o in obs:
         doms = [d for d in (o.get("domains") or []) if d]
         if doms:
-            rules.append({"type": "field", "domain": doms, "outboundTag": o["tag"]})
+            rules.append({"type": "field", "domain": doms, "outboundTag": ob_xtag(o["tag"])})
     outs.append({"tag": "block", "protocol": "blackhole", "settings": {}})
     return outs, rules, tests
 
@@ -429,7 +458,18 @@ def apply_xray_outbounds(obs=None):
     # keep every real inbound (endpoints + api); replace only our own test inbounds
     cfg["inbounds"] = [ib for ib in (cfg.get("inbounds") or [])
                        if not str(ib.get("tag", "")).startswith("mjtest-")] + tests
-    cfg["outbounds"] = outs
+    # keep outbounds we don't manage (e.g. a hand-added "blocked"); drop every previous mj-* one
+    foreign = [ob for ob in (cfg.get("outbounds") or []) if not ob_owned(str(ob.get("tag", "")))]
+    cfg["outbounds"] = outs[:-1] + foreign + outs[-1:]        # ...keep `block` last
+    # keep foreign routing rules — above all, `inboundTag:[api] -> outboundTag:api`,
+    # without which the gRPC API stops working and the bot can no longer manage users.
+    api_tag = str((cfg.get("api") or {}).get("tag") or "")
+    alive = {str(ob.get("tag", "")) for ob in cfg["outbounds"]} | ({api_tag} if api_tag else set())
+    keep = [r for r in ((cfg.get("routing") or {}).get("rules") or [])
+            if not ob_owned(str(r.get("outboundTag", "")))                     # drop our old rules
+            and not any(str(t).startswith("mjtest-") for t in (r.get("inboundTag") or []))
+            and str(r.get("outboundTag", "")) in alive]                        # drop dangling ones
+    rules = keep + rules
     if rules:
         cfg["routing"] = {"domainStrategy": "IPIfNonMatch", "rules": rules}
     else:
@@ -1077,6 +1117,16 @@ form.row{margin:0 0 8px}
 .eptag{display:block;font-size:11px;color:var(--mut);font-family:var(--mono);margin-top:2px}
 .hint{font-size:12px;color:var(--mut);font-weight:700;margin:0 0 6px}
 code{font-family:var(--mono);background:var(--paper);border:2px solid var(--ink);padding:6px 8px;word-break:break-all;font-size:12px;color:var(--ink);display:block}
+.obmsg{padding:12px 14px;font-size:13px}
+.obmsg.good{border-color:var(--ok);box-shadow:5px 5px 0 var(--ok)}
+.obmsg.bad{border-color:var(--dng);box-shadow:5px 5px 0 var(--dng)}
+.pill.oball{background:var(--frz);color:#111;margin:4px 0 2px}
+.pill.obwarn{background:var(--warn);color:#111;margin:4px 0 2px}
+.obres{margin-top:10px;padding:9px 11px;border:2px dashed var(--ink);background:var(--paper);font-family:var(--mono);font-size:12px;word-break:break-word;unicode-bidi:plaintext}
+.spin{display:inline-block;width:11px;height:11px;margin-inline-end:7px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;animation:sp .7s linear infinite;vertical-align:-1px}
+@keyframes sp{to{transform:rotate(360deg)}}
+button[disabled]{opacity:.65;cursor:progress}
+.warnpulse{background:var(--warn)!important}
 :focus-visible{outline:3px solid var(--ink);outline-offset:2px}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 """
@@ -1257,57 +1307,110 @@ def render_config(csrf):
         rows, html.escape("\n".join(ips)), csrf)
     return _page("پیکربندی", _top("<a href='/a/'>← داشبورد</a>", csrf) + "<div class=card>%s</div>" % body)
 
+OB_JS = """
+var OB={csrf:''};
+function obToast(m,ok){var t=document.getElementById('obmsg');if(!t)return;
+ t.innerHTML='<b>'+m.replace(/[<>&]/g,'')+'</b>';t.className='card obmsg '+(ok?'good':'bad');t.style.display='block';
+ clearTimeout(OB.tm);OB.tm=setTimeout(function(){t.style.display='none';},9000);}
+function obBusy(b,on,txt){if(!b)return;if(on){b.dataset.o=b.innerHTML;b.innerHTML='<span class=spin></span>'+(txt||'صبر کنید…');b.disabled=true;}
+ else{if(b.dataset.o)b.innerHTML=b.dataset.o;b.disabled=false;}}
+function obForm(){return document.getElementById('obform');}
+function obData(f){var u=new URLSearchParams(new FormData(f)),o=obForm();
+ if(o&&o!==f)new URLSearchParams(new FormData(o)).forEach(function(v,k){if(k!=='csrf')u.append(k,v);});
+ u.set('csrf',OB.csrf);u.set('ajax','1');return u;}
+function obPost(url,body,btn,txt,done){obBusy(btn,true,txt);
+ fetch(url,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8'},body:body})
+ .then(function(r){return r.json();})
+ .then(function(j){obBusy(btn,false);
+  if(j.list!=null){document.getElementById('oblist').innerHTML=j.list;obRecalc();obDirty(false);}
+  if(j.msg)obToast(j.msg,j.ok);if(done)done(j);})
+ .catch(function(e){obBusy(btn,false);obToast('ارتباط با پنل قطع شد: '+e,false);});}
+function obRecalc(){var first=null,n=document.querySelectorAll('#oblist textarea[data-tag]').length;
+ var w=document.getElementById('obsavewrap');if(w)w.style.display=n?'block':'none';
+ document.querySelectorAll('#oblist textarea[data-tag]').forEach(function(t){
+  var b=document.getElementById('all-'+t.dataset.tag);if(!b)return;
+  if(t.value.trim()){b.style.display='none';return;}
+  b.style.display='inline-flex';
+  if(first===null){first=t.dataset.tag;b.className='pill oball';b.textContent='🌐 همهٔ ترافیک از این خروجی رد می‌شود';}
+  else{b.className='pill obwarn';b.textContent='⚠️ بی‌اثر: خروجیِ بالاتر همهٔ ترافیک را گرفته';}});}
+function obDirty(on){var s=document.getElementById('obsavebtn');if(!s)return;
+ s.classList.toggle('warnpulse',!!on);
+ s.textContent=on?'💾 ذخیره و اعمال (تغییرِ ذخیره‌نشده)':'💾 ذخیره و اعمال روی xray';}
+document.addEventListener('input',function(e){var t=e.target;
+ if(t&&t.matches&&t.matches('textarea[data-tag]')){obRecalc();obDirty(true);}});
+document.addEventListener('submit',function(e){var f=e.target;if(!f||!f.dataset||!f.dataset.act)return;
+ e.preventDefault();var a=f.dataset.act,btn=f.querySelector('button'),tag=(f.elements.tag||{}).value||'';
+ if(a==='del'&&!confirm('خروجی «'+tag+'» حذف و از xray برداشته شود؟'))return;
+ if(a==='test'){var box=document.getElementById('res-'+tag);if(box){box.style.display='block';box.textContent='در حال تست… (تا ۳۰ ثانیه)';}
+  obPost('/a/obtest',obData(f),btn,'تست…',function(j){if(box)box.textContent=j.result||j.msg||'';});return;}
+ obPost({add:'/a/obadd',del:'/a/obdel',save:'/a/obsave'}[a],obData(f),btn,
+        a==='save'?'اعمال روی xray…':'…',function(j){if(a==='add'&&j.ok)f.reset();
+                                                     if(a==='save'&&j.ok)obDirty(false);});});
+"""
+
+def _ob_card(i, o, csrf):
+    try:
+        kind = parse_outbound_link(o["link"], o["tag"])["protocol"]
+    except ValueError as e:
+        kind = "⚠️ " + str(e)
+    res = meta_get("ob_test_" + o["tag"], "")
+    tag = html.escape(o["tag"])
+    return (
+        "<div class=card>"
+        "<div class=row style='justify-content:space-between;align-items:center'>"
+        "<b>%s</b><span class=eptag>%s · تست: 127.0.0.1:%d</span></div>"
+        "<p class=hint dir=ltr style='word-break:break-all;text-align:left'>%s</p>"
+        "<span class='pill oball' id='all-%s' style='display:none'></span>"
+        "<label class=hint style='margin-top:8px'>دامنه‌هایی که از این خروجی بروند "
+        "(هر خط یکی) — <b>خالی بگذارید تا همهٔ ترافیک از اینجا برود</b>:</label>"
+        "<textarea name='dom_%s' data-tag='%s' rows=4 form=obform "
+        "placeholder='خالی = همهٔ ترافیک&#10;یا مثلاً:&#10;geosite:google&#10;claude.ai'>%s</textarea>"
+        "<div class=obres id='res-%s'%s>%s</div>"
+        "<div class=row style='margin-top:10px'>"
+        "<form data-act=test method=post action='/a/obtest' style='margin:0'>"
+        "<input type=hidden name=csrf value='%s'><input type=hidden name=tag value='%s'>"
+        "<button type=submit class='btn ghost'>🔎 تست این خروجی</button></form>"
+        "<form data-act=del method=post action='/a/obdel' style='margin:0'>"
+        "<input type=hidden name=csrf value='%s'><input type=hidden name=tag value='%s'>"
+        "<button type=submit class='btn ghost'>حذف</button></form></div></div>"
+    ) % (tag, html.escape(kind), ob_test_port(i), html.escape(o["link"]), tag,
+         tag, tag, html.escape("\n".join(o.get("domains") or [])),
+         tag, ("" if res else " style='display:none'"), html.escape(res),
+         csrf, tag, csrf, tag)
+
+def render_ob_list(csrf):
+    """Just the cards — re-rendered on its own and swapped in without a page reload."""
+    obs = get_outbounds()
+    if not obs:
+        return ("<div class=card><p class=hint style='margin:0'>هنوز خروجی‌ای تعریف نشده — "
+                "همهٔ ترافیک مستقیم از IP همین سرور می‌رود.</p></div>")
+    return "".join(_ob_card(i, o, csrf) for i, o in enumerate(obs))
+
 def render_outbounds(csrf, msg=""):
     obs = get_outbounds()
-    banner = ("<div class=card style='border-color:var(--ok)'><b>%s</b></div>" % html.escape(msg)) if msg else ""
-    rows = ""
-    for i, o in enumerate(obs):
-        try:
-            kind = parse_outbound_link(o["link"], o["tag"])["protocol"]
-        except ValueError as e:
-            kind = "⚠️ " + str(e)
-        res = meta_get("ob_test_" + o["tag"], "")
-        rows += (
-            "<div class=card>"
-            "<div class=row style='justify-content:space-between;align-items:center'>"
-            "<b>%s</b><span class=eptag>%s · تست: 127.0.0.1:%d</span></div>"
-            "<p class=hint style='word-break:break-all'>%s</p>"
-            "<label class=hint>دامنه‌هایی که از این خروجی بروند (هر خط یکی):</label>"
-            "<textarea name='dom_%s' rows=4 form=obform placeholder='geosite:google&#10;gemini.google.com&#10;notebooklm.google.com'>%s</textarea>"
-            "%s"
-            "<div class=row style='margin-top:10px'>"
-            "<form method=post action='/a/obtest' style='margin:0'>"
-            "<input type=hidden name=csrf value='%s'><input type=hidden name=tag value='%s'>"
-            "<button class='btn ghost'>🔎 تست این خروجی</button></form>"
-            "<form method=post action='/a/obdel' style='margin:0' onsubmit=\"return confirm('حذف شود؟')\">"
-            "<input type=hidden name=csrf value='%s'><input type=hidden name=tag value='%s'>"
-            "<button class='btn ghost'>حذف</button></form></div></div>"
-        ) % (html.escape(o["tag"]), html.escape(kind), ob_test_port(i), html.escape(o["link"]),
-             html.escape(o["tag"]), html.escape("\n".join(o.get("domains") or [])),
-             ("<p class=hint style='margin-top:8px'><b>%s</b></p>" % html.escape(res)) if res else "",
-             csrf, html.escape(o["tag"]), csrf, html.escape(o["tag"]))
-
     add = ("<div class=card><h2>افزودن خروجی</h2>"
            "<p class=hint>لینک را همان‌طور که هست بچسبانید: "
            "<code>vless://</code> · <code>trojan://</code> · <code>ss://</code> · "
            "<code>socks://user:pass@host:port</code> · <code>http://…</code></p>"
-           "<form method=post action='/a/obadd' class=grid>"
+           "<form data-act=add method=post action='/a/obadd' class=grid>"
            "<input name=tag placeholder='یک نام کوتاه، مثلاً clean-ai' maxlength=24 required>"
            "<textarea name=link rows=3 placeholder='vless://…  یا  socks://user:pass@1.2.3.4:1080' required></textarea>"
            "<input type=hidden name=csrf value='%s'>"
-           "<button class=btn style='margin-top:10px'>افزودن</button></form></div>") % csrf
+           "<button type=submit class=btn style='margin-top:10px'>افزودن</button></form></div>") % csrf
 
-    save = ("<form method=post action='/a/obsave' id=obform>"
+    save = ("<div id=obsavewrap%s>"
+            "<form data-act=save method=post action='/a/obsave' id=obform>"
             "<input type=hidden name=csrf value='%s'>"
-            "<button class=btn style='width:100%%'>💾 ذخیره و اعمال روی xray</button></form>"
-            "<p class=hint>اعمال، کانفیگ را با <code>xray -test</code> اعتبارسنجی می‌کند؛ اگر خراب باشد "
-            "چیزی تغییر نمی‌کند. بعد از اعمال، xray ری‌استارت می‌شود و کاربران خودکار resync می‌شوند "
-            "(لینک کسی عوض نمی‌شود).</p>") % csrf
+            "<button type=submit id=obsavebtn class=btn style='width:100%%'>💾 ذخیره و اعمال روی xray</button></form>"
+            "<p class=hint style='margin-top:8px'>اعمال، کانفیگ را با <code>xray -test</code> اعتبارسنجی می‌کند؛ "
+            "اگر خراب باشد چیزی تغییر نمی‌کند. بعد xray ری‌استارت می‌شود و کاربران خودکار resync می‌شوند "
+            "(لینک کسی عوض نمی‌شود).</p></div>") % (("" if obs else " style='display:none'"), csrf)
 
-    body = (banner + add +
-            ("<h2 style='margin:18px 0 8px'>خروجی‌ها (%d)</h2>" % len(obs)) +
-            (rows or "<div class=card><p class=hint>هنوز خروجی‌ای تعریف نشده. همه‌چیز مستقیم از IP همین سرور می‌رود.</p></div>") +
-            (save if obs else ""))
+    body = ("<div id=obmsg class='card obmsg'%s>%s</div>" % (
+                ("" if msg else " style='display:none'"), ("<b>%s</b>" % html.escape(msg)) if msg else "") +
+            add + "<h2 style='margin:18px 0 8px'>خروجی‌ها</h2>" +
+            "<div id=oblist>%s</div>" % render_ob_list(csrf) + save +
+            "<script>%s\nOB.csrf=%s;obRecalc();</script>" % (OB_JS, json.dumps(csrf)))
     return _page("خروجی‌ها", _top("<a href='/a/'>← داشبورد</a>", csrf) + body)
 
 def route_admin(method, path, query, cookie_header, body, now=None):
@@ -1386,38 +1489,55 @@ def route_admin_post(method, path, query, csrf, body, now, sid):
         if ips: set_ips(ips)
         regenerate_all_subs()
         return _redirect("/a/config")
+    # --- outbounds: answer JSON to the panel's fetch(), plain redirects without JS ---
+    def _ob_reply(ok, msg, relist=True, **extra):
+        if form.get("ajax") != "1":
+            return _redirect("/a/outbounds?msg=" + urllib.parse.quote(msg))
+        d = {"ok": bool(ok), "msg": msg}
+        d.update(extra)
+        if relist: d["list"] = render_ob_list(csrf)
+        return 200, {"Content-Type": "application/json; charset=utf-8"}, \
+               json.dumps(d, ensure_ascii=False).encode("utf-8")
+
+    def _ob_keep_domains(obs):
+        # the domain boxes ride along with every action, so nothing typed is ever lost
+        for o in obs:
+            if ("dom_" + o["tag"]) in form:
+                o["domains"] = parse_domains(form.get("dom_" + o["tag"], ""))
+        return obs
+
     if path == "/a/obadd":
         tag = re.sub(r"[^A-Za-z0-9_-]", "", (form.get("tag") or "").strip())[:24]
         link = (form.get("link") or "").strip()
-        obs = get_outbounds()
+        obs = _ob_keep_domains(get_outbounds())
         if not tag or not link:
-            return _redirect("/a/outbounds?msg=" + urllib.parse.quote("نام و لینک لازم است"))
+            return _ob_reply(False, "نام و لینک لازم است")
         if tag in ("direct", "block") or any(o["tag"] == tag for o in obs):
-            return _redirect("/a/outbounds?msg=" + urllib.parse.quote("این نام قبلاً استفاده شده"))
+            return _ob_reply(False, "این نام قبلاً استفاده شده")
         try:
             parse_outbound_link(link, tag)          # validate before storing
         except ValueError as e:
-            return _redirect("/a/outbounds?msg=" + urllib.parse.quote("لینک نامعتبر: %s" % e))
+            return _ob_reply(False, "لینک نامعتبر: %s" % e)
         obs.append({"tag": tag, "link": link, "domains": []})
         set_outbounds(obs)
-        return _redirect("/a/outbounds?msg=" + urllib.parse.quote("اضافه شد؛ دامنه‌ها را بنویسید و «ذخیره و اعمال» بزنید"))
+        return _ob_reply(True, "«%s» اضافه شد. خالی بماند = همهٔ ترافیک از آن می‌رود. "
+                               "برای فعال شدن «ذخیره و اعمال» را بزنید." % tag)
     if path == "/a/obdel":
         tag = (form.get("tag") or "").strip()
-        set_outbounds([o for o in get_outbounds() if o["tag"] != tag])
+        set_outbounds([o for o in _ob_keep_domains(get_outbounds()) if o["tag"] != tag])
         meta_set("ob_test_" + tag, "")
         ok, msg = apply_xray_outbounds()
-        return _redirect("/a/outbounds?msg=" + urllib.parse.quote(("حذف شد. " + msg) if ok else msg))
+        return _ob_reply(ok, ("حذف شد. " + msg) if ok else msg)
     if path == "/a/obsave":
-        obs = get_outbounds()
-        for o in obs:
-            o["domains"] = parse_domains(form.get("dom_" + o["tag"], ""))
+        obs = _ob_keep_domains(get_outbounds())
         set_outbounds(obs)
         ok, msg = apply_xray_outbounds(obs)
-        return _redirect("/a/outbounds?msg=" + urllib.parse.quote(msg))
+        return _ob_reply(ok, msg, relist=False)
     if path == "/a/obtest":
         tag = (form.get("tag") or "").strip()
-        meta_set("ob_test_" + tag, test_outbound(tag))
-        return _redirect("/a/outbounds")
+        res = test_outbound(tag)
+        meta_set("ob_test_" + tag, res)
+        return _ob_reply(True, "تست «%s» انجام شد" % tag, relist=False, result=res)
     return 404, {"Content-Type": "text/plain"}, b"not found"
 
 class AdminHandler(BaseHTTPRequestHandler):

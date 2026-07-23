@@ -104,6 +104,23 @@ ssh -p 49531 -o "ProxyCommand=nc -x 127.0.0.1:10808 -X 5 %h %p" root@23.94.29.30
   the legacy output. `count` is UNCAPPED; when it exceeds an endpoint's port-slots the
   extra configs cycle over ports × clean IPs (`write_sub` honors this). Saving
   regenerates every sub. `get_recipe()`/`set_recipe()` live next to `get_ips()`.
+- **Outbounds / clean egress (`/a/outbounds`, `meta.outbounds`):** paste a
+  `vless/trojan/ss/socks/http` link → it becomes an xray outbound tagged **`mj-<name>`**.
+  Per outbound you list domains; **an empty list makes it the catch-all** (it is written
+  as xray's FIRST outbound, which is where unmatched traffic goes) and only the first
+  empty one wins. `apply_xray_outbounds()` rewrites **only** `outbounds`/`routing` plus
+  our `mjtest-*` inbounds; it keeps every real inbound and every routing rule it doesn't
+  own — **critically `inboundTag:[api] → outboundTag:api`, without which the gRPC API
+  dies and the bot can no longer manage users.** Ownership is decided purely by the
+  `mj-`/`mjtest-` prefixes, so deleting an outbound removes exactly its own rules. The
+  new config is validated with `xray -test` and never written if invalid (timestamped
+  `.bak` kept). Each outbound also gets a **loopback-only** SOCKS inbound on
+  `OB_TEST_PORT_BASE+i` (10810+) that the panel's 🔎 test dials through — that is how we
+  test egress **without spawning a second xray** (see the golden rule above).
+  `XRAY_CONF` **must** point at the config the Mohajer xray unit actually runs; on cdn2
+  that is `/opt/mohajer/xray.json`, NOT the default (which belongs to another stack).
+  The page is AJAX: every action posts `ajax=1` and gets JSON back (`ok/msg/list`), so
+  nothing reloads; the same routes still answer with redirects when JS is off.
 - **Light/dark theme:** both the admin panel (`ADMIN_CSS`/`_page`) and the subscriber
   page (`subserver.py` `PAGE`) ship an icon-only toggle (🌙/☀️) at the top. Themes are
   driven by `data-theme` on `<html>`; an early head script sets it from `localStorage`

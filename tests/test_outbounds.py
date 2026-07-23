@@ -79,20 +79,20 @@ class BuildSectionsTests(unittest.TestCase):
         self.assertEqual(outs[0]["tag"], "direct")          # first = default route
         self.assertEqual(outs[0]["protocol"], "freedom")
         self.assertEqual(outs[-1]["tag"], "block")
-        self.assertIn("clean", [o["tag"] for o in outs])
+        self.assertIn("mj-clean", [o["tag"] for o in outs])
 
     def test_test_inbound_is_loopback_only_and_routed_to_its_outbound(self):
         outs, rules, tests = bot.build_xray_sections(self.OB)
         self.assertEqual(len(tests), 1)
         self.assertEqual(tests[0]["listen"], "127.0.0.1")   # never exposed publicly
         self.assertEqual(tests[0]["port"], bot.ob_test_port(0))
-        self.assertEqual(rules[0], {"type": "field", "inboundTag": ["mjtest-clean"], "outboundTag": "clean"})
+        self.assertEqual(rules[0], {"type": "field", "inboundTag": ["mjtest-clean"], "outboundTag": "mj-clean"})
 
     def test_domain_rule_present(self):
         outs, rules, tests = bot.build_xray_sections(self.OB)
         dom = [r for r in rules if "domain" in r]
         self.assertEqual(dom[0]["domain"], ["geosite:google", "claude.ai"])
-        self.assertEqual(dom[0]["outboundTag"], "clean")
+        self.assertEqual(dom[0]["outboundTag"], "mj-clean")
 
     def test_no_outbounds_means_no_rules(self):
         outs, rules, tests = bot.build_xray_sections([])
@@ -101,8 +101,43 @@ class BuildSectionsTests(unittest.TestCase):
         self.assertEqual([o["tag"] for o in outs], ["direct", "block"])
 
 
-class ApplyConfigTests(unittest.TestCase):
-    """apply_xray_outbounds must preserve real inbounds/api/policy and never write a broken config."""
+class CatchAllTests(unittest.TestCase):
+    """No domains listed = send EVERYTHING through that outbound."""
+    ALL = {"tag": "clean", "link": "socks://1.2.3.4:1080", "domains": []}
+    SOME = {"tag": "ai", "link": "socks://5.6.7.8:1080", "domains": ["claude.ai"]}
+
+    def test_empty_domains_makes_it_the_default_outbound(self):
+        outs, rules, tests = bot.build_xray_sections([self.ALL])
+        self.assertEqual(outs[0]["tag"], "mj-clean")        # first outbound = xray's default route
+        self.assertIn("direct", [o["tag"] for o in outs])
+        self.assertTrue(any(r.get("ip") == ["geoip:private"] and r["outboundTag"] == "direct" for r in rules))
+
+    def test_domain_rules_still_beat_the_catch_all(self):
+        outs, rules, _ = bot.build_xray_sections([self.ALL, self.SOME])
+        self.assertEqual(outs[0]["tag"], "mj-clean")
+        dom = [r for r in rules if "domain" in r]
+        self.assertEqual((dom[0]["domain"], dom[0]["outboundTag"]), (["claude.ai"], "mj-ai"))
+        # a routing rule is evaluated before the default, so claude.ai leaves via "ai"
+        self.assertLess(rules.index(dom[0]), len(rules))
+
+    def test_first_empty_one_wins(self):
+        second = {"tag": "other", "link": "socks://9.9.9.9:1080", "domains": []}
+        outs, _, _ = bot.build_xray_sections([self.ALL, second])
+        self.assertEqual(outs[0]["tag"], "mj-clean")
+        self.assertEqual(bot.ob_catchall_index([self.ALL, second]), 0)
+
+    def test_all_domains_listed_keeps_direct_default(self):
+        outs, _, _ = bot.build_xray_sections([self.SOME])
+        self.assertEqual(outs[0]["tag"], "direct")
+        self.assertIsNone(bot.ob_catchall_index([self.SOME]))
+
+    def test_test_port_still_follows_list_order(self):
+        _, _, tests = bot.build_xray_sections([self.ALL, self.SOME])
+        self.assertEqual([t["port"] for t in tests], [bot.ob_test_port(0), bot.ob_test_port(1)])
+
+
+class ApplyBase(unittest.TestCase):
+    """Writes BASE to a temp file and points bot.XRAY_CONF at it; xray calls are stubbed."""
     BASE = {
         "log": {"loglevel": "warning"},
         "api": {"tag": "api", "services": ["StatsService"]},
@@ -133,6 +168,10 @@ class ApplyConfigTests(unittest.TestCase):
             r = R(); r.returncode = (test_rc if "-test" in cmd else 0); r.stdout = ""; r.stderr = "bad config"
             return r
         bot.subprocess.run = run
+
+
+class ApplyConfigTests(ApplyBase):
+    """apply_xray_outbounds must preserve real inbounds/api/policy and never write a broken config."""
 
     def test_apply_preserves_real_inbounds_and_api(self):
         self._stub_run()
@@ -170,6 +209,52 @@ class ApplyConfigTests(unittest.TestCase):
         cfg = json.load(open(self.tmp.name))
         self.assertNotIn("routing", cfg)
         self.assertEqual([i["tag"] for i in cfg["inbounds"]], ["vless-ws", "api"])  # test inbound cleaned up
+
+
+class PreserveExistingRoutingTests(ApplyBase):
+    """The shipped xray config routes the api inbound to the api service. Losing that rule
+       kills the gRPC API, and with it the bot's ability to add/remove users."""
+    BASE = dict(ApplyBase.BASE,
+                routing={"rules": [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"},
+                                   {"type": "field", "domain": ["ads.example"], "outboundTag": "blocked"}]},
+                outbounds=[{"tag": "direct", "protocol": "freedom"},
+                           {"tag": "blocked", "protocol": "blackhole"}])
+
+    def _apply(self, obs):
+        self._stub_run()
+        ok, msg = bot.apply_xray_outbounds(obs)
+        self.assertTrue(ok, msg)
+        return json.load(open(self.tmp.name))
+
+    def test_api_rule_and_foreign_outbound_survive(self):
+        cfg = self._apply([{"tag": "clean", "link": "socks://1.2.3.4:1080", "domains": ["claude.ai"]}])
+        self.assertEqual(cfg["routing"]["rules"][0], {"type": "field", "inboundTag": ["api"], "outboundTag": "api"})
+        self.assertIn("blocked", [o["tag"] for o in cfg["outbounds"]])
+        self.assertTrue(any(r.get("domain") == ["ads.example"] for r in cfg["routing"]["rules"]))
+        self.assertEqual(cfg["outbounds"][-1]["tag"], "block")
+
+    def test_api_rule_survives_removing_every_outbound(self):
+        self._apply([{"tag": "clean", "link": "socks://1.2.3.4:1080", "domains": ["claude.ai"]}])
+        cfg = self._apply([])
+        self.assertTrue(any(r.get("outboundTag") == "api" for r in cfg["routing"]["rules"]))
+
+    def test_stale_rules_for_deleted_outbounds_are_dropped(self):
+        self._apply([{"tag": "clean", "link": "socks://1.2.3.4:1080", "domains": ["claude.ai"]}])
+        cfg = self._apply([])          # "clean" is gone; its domain rule must go with it
+        self.assertFalse(any(r.get("outboundTag") == "mj-clean" for r in cfg["routing"]["rules"]))
+        self.assertNotIn("mj-clean", [o["tag"] for o in cfg["outbounds"]])
+
+    def test_our_rules_are_not_duplicated_on_reapply(self):
+        obs = [{"tag": "clean", "link": "socks://1.2.3.4:1080", "domains": ["claude.ai"]}]
+        self._apply(obs)
+        cfg = self._apply(obs)
+        self.assertEqual(len([r for r in cfg["routing"]["rules"] if r.get("domain") == ["claude.ai"]]), 1)
+        self.assertEqual(len([r for r in cfg["routing"]["rules"] if r.get("inboundTag") == ["mjtest-clean"]]), 1)
+        self.assertEqual(len([o for o in cfg["outbounds"] if o["tag"] == "mj-clean"]), 1)
+
+    def test_catch_all_outbound_is_first_in_written_config(self):
+        cfg = self._apply([{"tag": "clean", "link": "socks://1.2.3.4:1080", "domains": []}])
+        self.assertEqual(cfg["outbounds"][0]["tag"], "mj-clean")
 
 
 if __name__ == "__main__":
