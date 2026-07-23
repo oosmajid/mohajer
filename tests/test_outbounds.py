@@ -151,11 +151,12 @@ class ApplyBase(unittest.TestCase):
         self.tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
         json.dump(self.BASE, self.tmp); self.tmp.close()
         self._conf, self._run = bot.XRAY_CONF, bot.subprocess.run
+        self._wait, bot.OB_BIND_WAIT = bot.OB_BIND_WAIT, 0   # nothing to wait for; xray is stubbed
         bot.XRAY_CONF = self.tmp.name
 
     def tearDown(self):
         bot.subprocess.run = self._run
-        bot.XRAY_CONF = self._conf
+        bot.XRAY_CONF, bot.OB_BIND_WAIT = self._conf, self._wait
         for p in (self.tmp.name, self.tmp.name + ".mjnew.json"):
             if os.path.exists(p): os.unlink(p)
         d, base = os.path.dirname(self.tmp.name), os.path.basename(self.tmp.name)

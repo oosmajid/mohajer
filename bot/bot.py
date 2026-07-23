@@ -292,6 +292,7 @@ def set_recipe(recipe):
 XRAY_CONF         = ENV.get("XRAY_CONF", "/usr/local/etc/xray/config.json")
 OB_TEST_PORT_BASE = int(ENV.get("OB_TEST_PORT_BASE", "10810"))
 OB_TEST_SITES     = ["gemini.google.com", "notebooklm.google.com", "claude.ai"]
+OB_BIND_WAIT      = 8      # seconds to wait for xray to bind the test ports after a restart
 
 def get_outbounds():
     # [{"tag","link","domains":[...]}]; tag = xray outboundTag, domains route to it
@@ -495,6 +496,14 @@ def apply_xray_outbounds(obs=None):
         subprocess.run(["systemctl", "restart", XRAY_SERVICE], capture_output=True, text=True, timeout=30)
     except Exception as e:
         return False, "کانفیگ نوشته شد ولی ری‌استارت xray ناموفق بود: %s" % e
+    # xray binds its ports a moment AFTER systemd reports the restart done; without this
+    # wait, pressing 🔎 right after «اعمال» hits a closed port and looks like a failure.
+    deadline = time.time() + OB_BIND_WAIT
+    while obs and time.time() < deadline:
+        try:
+            socket.create_connection(("127.0.0.1", ob_test_port(0)), timeout=0.5).close(); break
+        except OSError:
+            time.sleep(0.3)
     return True, "اعمال شد (%d خروجی). کاربران خودکار resync می‌شوند." % len(obs)
 
 def _socks5_get(port, host, path="/", timeout=12):
@@ -513,7 +522,13 @@ def _socks5_get(port, host, path="/", timeout=12):
         elif atyp == 3: s.recv(s.recv(1)[0] + 2)
         elif atyp == 4: s.recv(18)
         w = ssl.create_default_context().wrap_socket(s, server_hostname=host)
-        w.sendall(("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\n"
+        # look like a browser: a bare GET gets 403'd by bot filters even from a clean IP,
+        # which would make a perfectly good outbound look blocked
+        w.sendall(("GET %s HTTP/1.1\r\nHost: %s\r\n"
+                   "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/126.0 Safari/537.36\r\n"
+                   "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n"
+                   "Accept-Language: en-US,en;q=0.9\r\n"
                    "Connection: close\r\n\r\n" % (path, host)).encode())
         buf = b""
         while len(buf) < 4096:
