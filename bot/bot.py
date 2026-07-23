@@ -3,7 +3,7 @@
 # VLESS/VMess/Trojan over WebSocket (TLS + no-TLS, fronted by Cloudflare) + VLESS-XHTTP.
 # Per-user quota + expiry are enforced live via `xray api adu/rmu/statsquery` (no xray restart).
 # All config comes from bot.env (see config/bot.env.example). Single-file, runs under systemd.
-import os, re, sys, json, time, html, base64, sqlite3, secrets, threading, subprocess
+import os, re, sys, json, time, html, base64, socket, sqlite3, secrets, threading, subprocess
 import uuid as uuidlib
 import urllib.request, urllib.parse, ssl
 import http.cookies
@@ -283,6 +283,228 @@ def get_recipe():
 
 def set_recipe(recipe):
     meta_set("config_recipe", json.dumps(recipe))
+
+# ---------------- outbounds (clean-egress routing) ----------------
+# Route chosen domains out through a CLEAN upstream instead of this VPS's (often flagged)
+# datacenter IP, so AI sites (Gemini/NotebookLM/Claude) work. Everything else stays direct.
+# Each outbound also gets a loopback-only SOCKS inbound so the panel can TEST it live
+# (never spawn a second xray on the box — see AGENTS.md).
+XRAY_CONF         = ENV.get("XRAY_CONF", "/usr/local/etc/xray/config.json")
+OB_TEST_PORT_BASE = int(ENV.get("OB_TEST_PORT_BASE", "10810"))
+OB_TEST_SITES     = ["gemini.google.com", "notebooklm.google.com", "claude.ai"]
+
+def get_outbounds():
+    # [{"tag","link","domains":[...]}]; tag = xray outboundTag, domains route to it
+    try:
+        v = json.loads(meta_get("outbounds") or "[]")
+    except Exception:
+        return []
+    out = []
+    for o in v if isinstance(v, list) else []:
+        if isinstance(o, dict) and o.get("tag") and o.get("link"):
+            out.append({"tag": str(o["tag"]), "link": str(o["link"]),
+                        "domains": [str(d) for d in (o.get("domains") or [])]})
+    return out
+
+def set_outbounds(obs):
+    meta_set("outbounds", json.dumps(obs))
+
+def ob_test_port(i):
+    return OB_TEST_PORT_BASE + i
+
+def parse_domains(text):
+    # one per line / comma separated; keeps xray prefixes (domain: / geosite: / regexp:)
+    toks = [t.strip() for t in re.split(r"[\s,]+", (text or "").strip()) if t.strip()]
+    return [t for t in toks if not t.startswith("#")]
+
+def _q1(qs, *names, **kw):
+    for n in names:
+        if qs.get(n):
+            return qs[n][0]
+    return kw.get("default", "")
+
+def parse_outbound_link(link, tag):
+    """vless:// trojan:// ss:// socks:// http:// -> an xray outbound dict. Raises ValueError."""
+    link = (link or "").strip()
+    u = urllib.parse.urlparse(link)
+    scheme = (u.scheme or "").lower()
+    host, port = u.hostname, u.port
+    qs = urllib.parse.parse_qs(u.query or "")
+
+    if scheme in ("socks", "socks5", "http", "https"):
+        if not host or not port: raise ValueError("آدرس یا پورت ناقص است")
+        srv = {"address": host, "port": int(port)}
+        if u.username:
+            srv["users"] = [{"user": urllib.parse.unquote(u.username),
+                             "pass": urllib.parse.unquote(u.password or "")}]
+        return {"tag": tag, "protocol": ("socks" if scheme.startswith("socks") else "http"),
+                "settings": {"servers": [srv]}}
+
+    if scheme == "ss":
+        method = password = None
+        if host and port and u.username:
+            raw = u.username
+            try:
+                dec = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8")
+                method, password = dec.split(":", 1)
+            except Exception:
+                raise ValueError("ss:// نامعتبر (بخش رمز)")
+        else:
+            raw = link[len("ss://"):].split("#", 1)[0]
+            try:
+                dec = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8")
+                head, hp = dec.rsplit("@", 1)
+                method, password = head.split(":", 1)
+                host, port = hp.rsplit(":", 1); port = int(port)
+            except Exception:
+                raise ValueError("ss:// نامعتبر")
+        if not host or not port: raise ValueError("آدرس یا پورت ناقص است")
+        return {"tag": tag, "protocol": "shadowsocks",
+                "settings": {"servers": [{"address": host, "port": int(port),
+                                          "method": method, "password": password}]}}
+
+    if scheme in ("vless", "trojan"):
+        if not host or not port: raise ValueError("آدرس یا پورت ناقص است")
+        cred = urllib.parse.unquote(u.username or "")
+        if not cred: raise ValueError("uuid/رمز در لینک نیست")
+        net = _q1(qs, "type", default="tcp") or "tcp"
+        sec = _q1(qs, "security", default="none")
+        sni = _q1(qs, "sni", "peer") or _q1(qs, "host") or host
+        stream = {"network": net, "security": ("tls" if sec in ("tls", "reality") else "none")}
+        if stream["security"] == "tls":
+            t = {"serverName": sni}
+            if _q1(qs, "allowInsecure") in ("1", "true"): t["allowInsecure"] = True
+            fp = _q1(qs, "fp")
+            if fp: t["fingerprint"] = fp
+            stream["tlsSettings"] = t
+        if net == "ws":
+            stream["wsSettings"] = {"path": _q1(qs, "path", default="/") or "/",
+                                    "headers": {"Host": _q1(qs, "host") or sni}}
+        elif net == "grpc":
+            stream["grpcSettings"] = {"serviceName": _q1(qs, "serviceName")}
+        if scheme == "vless":
+            usr = {"id": cred, "encryption": _q1(qs, "encryption", default="none") or "none"}
+            flow = _q1(qs, "flow")
+            if flow: usr["flow"] = flow
+            ob = {"tag": tag, "protocol": "vless",
+                  "settings": {"vnext": [{"address": host, "port": int(port), "users": [usr]}]}}
+        else:
+            ob = {"tag": tag, "protocol": "trojan",
+                  "settings": {"servers": [{"address": host, "port": int(port), "password": cred}]}}
+        ob["streamSettings"] = stream
+        return ob
+
+    raise ValueError("پروتکل پشتیبانی نمی‌شود: %s" % (scheme or "؟"))
+
+def build_xray_sections(obs):
+    """-> (outbounds, routing rules, loopback test inbounds). First outbound = default (direct)."""
+    outs = [{"tag": "direct", "protocol": "freedom", "settings": {}}]
+    rules, tests = [], []
+    for i, o in enumerate(obs):
+        outs.append(parse_outbound_link(o["link"], o["tag"]))
+        itag = "mjtest-%s" % o["tag"]
+        tests.append({"tag": itag, "listen": "127.0.0.1", "port": ob_test_port(i),
+                      "protocol": "socks", "settings": {"auth": "noauth", "udp": False}})
+        # test-inbound rules FIRST so a test always exits via its own outbound
+        rules.append({"type": "field", "inboundTag": [itag], "outboundTag": o["tag"]})
+    for o in obs:
+        doms = [d for d in (o.get("domains") or []) if d]
+        if doms:
+            rules.append({"type": "field", "domain": doms, "outboundTag": o["tag"]})
+    outs.append({"tag": "block", "protocol": "blackhole", "settings": {}})
+    return outs, rules, tests
+
+def apply_xray_outbounds(obs=None):
+    """Rewrite ONLY outbounds/routing (+ our mjtest-* loopback inbounds) in xray's config.
+       Validates with `xray -test` and refuses to write a broken config. -> (ok, message)."""
+    obs = get_outbounds() if obs is None else obs
+    try:
+        cfg = json.loads(open(XRAY_CONF, encoding="utf-8").read())
+    except Exception as e:
+        return False, "خواندن کانفیگ xray ناموفق بود: %s" % e
+    try:
+        outs, rules, tests = build_xray_sections(obs)
+    except ValueError as e:
+        return False, str(e)
+    # keep every real inbound (endpoints + api); replace only our own test inbounds
+    cfg["inbounds"] = [ib for ib in (cfg.get("inbounds") or [])
+                       if not str(ib.get("tag", "")).startswith("mjtest-")] + tests
+    cfg["outbounds"] = outs
+    if rules:
+        cfg["routing"] = {"domainStrategy": "IPIfNonMatch", "rules": rules}
+    else:
+        cfg.pop("routing", None)
+    tmp = XRAY_CONF + ".mjnew"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(cfg, indent=2, ensure_ascii=False))
+        r = subprocess.run([XRAY_BIN, "-test", "-c", tmp], capture_output=True, text=True, timeout=25)
+        if r.returncode != 0:
+            os.unlink(tmp)
+            return False, "کانفیگ نامعتبر است، چیزی تغییر نکرد: %s" % ((r.stderr or r.stdout or "").strip()[-250:])
+        with open(XRAY_CONF + ".bak." + time.strftime("%Y%m%d%H%M%S"), "w", encoding="utf-8") as b:
+            b.write(open(XRAY_CONF, encoding="utf-8").read())
+        os.replace(tmp, XRAY_CONF)
+    except Exception as e:
+        try: os.unlink(tmp)
+        except Exception: pass
+        return False, "نوشتن کانفیگ ناموفق بود: %s" % e
+    try:
+        subprocess.run(["systemctl", "restart", XRAY_SERVICE], capture_output=True, text=True, timeout=30)
+    except Exception as e:
+        return False, "کانفیگ نوشته شد ولی ری‌استارت xray ناموفق بود: %s" % e
+    return True, "اعمال شد (%d خروجی). کاربران خودکار resync می‌شوند." % len(obs)
+
+def _socks5_get(port, host, path="/", timeout=12):
+    """SOCKS5 -> TLS -> minimal HTTPS GET through a loopback test inbound. -> (status, body_head)."""
+    s = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    try:
+        s.settimeout(timeout)
+        s.sendall(b"\x05\x01\x00")
+        if s.recv(2)[:2] != b"\x05\x00": raise OSError("دست‌دادن SOCKS ناموفق")
+        hb = host.encode()
+        s.sendall(b"\x05\x01\x00\x03" + bytes([len(hb)]) + hb + (443).to_bytes(2, "big"))
+        rep = s.recv(4)
+        if len(rep) < 2 or rep[1] != 0: raise OSError("خروجی وصل نشد")
+        atyp = rep[3] if len(rep) > 3 else 1
+        if   atyp == 1: s.recv(6)
+        elif atyp == 3: s.recv(s.recv(1)[0] + 2)
+        elif atyp == 4: s.recv(18)
+        w = ssl.create_default_context().wrap_socket(s, server_hostname=host)
+        w.sendall(("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\n"
+                   "Connection: close\r\n\r\n" % (path, host)).encode())
+        buf = b""
+        while len(buf) < 4096:
+            try: chunk = w.recv(4096)
+            except Exception: break
+            if not chunk: break
+            buf += chunk
+        parts = buf.split(b"\r\n", 1)[0].decode("latin-1", "ignore").split()
+        code = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+        body = buf.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in buf else b""
+        return code, body[:300].decode("utf-8", "ignore")
+    finally:
+        try: s.close()
+        except Exception: pass
+
+def test_outbound(tag):
+    obs = get_outbounds()
+    idx = next((i for i, o in enumerate(obs) if o["tag"] == tag), None)
+    if idx is None: return "خروجی پیدا نشد"
+    port = ob_test_port(idx)
+    try:
+        code, body = _socks5_get(port, "api.ipify.org", "/?format=json")
+        ip = body.strip()[:60] if code == 200 else "نامشخص (HTTP %s)" % code
+    except Exception as e:
+        return "❌ به خروجی وصل نشد: %s — اول «ذخیره و اعمال» را بزنید." % e
+    marks = []
+    for hostname in OB_TEST_SITES:
+        try:
+            code, _ = _socks5_get(port, hostname, "/")
+            marks.append("%s %s" % (hostname, "✅" if code in (200, 301, 302) else "⛔️%d" % code))
+        except Exception:
+            marks.append("%s ❌" % hostname)
+    return "IP خروجی: %s · %s" % (ip, " · ".join(marks))
 
 def write_sub(token, secret, label):
     ips = get_ips() or DEFAULT_IPS; recipe = get_recipe(); links = []; gi = 0
@@ -951,6 +1173,7 @@ def render_dashboard(csrf):
     users = ("<div class=card><div class=row style='justify-content:space-between;margin-bottom:8px'>"
              "<h2 style='margin:0'>لینک‌ها</h2><span class=row>"
              "<a class='btn ghost' href='/a/config'>⚙ پیکربندی</a>"
+             "<a class='btn ghost' href='/a/outbounds'>🌍 خروجی‌ها</a>"
              "<a class=btn href='/a/new'>+ لینک جدید</a></span></div>%s</div>") % rows
     return _page("پنل", _top("", csrf) + hero + users)
 
@@ -1034,6 +1257,59 @@ def render_config(csrf):
         rows, html.escape("\n".join(ips)), csrf)
     return _page("پیکربندی", _top("<a href='/a/'>← داشبورد</a>", csrf) + "<div class=card>%s</div>" % body)
 
+def render_outbounds(csrf, msg=""):
+    obs = get_outbounds()
+    banner = ("<div class=card style='border-color:var(--ok)'><b>%s</b></div>" % html.escape(msg)) if msg else ""
+    rows = ""
+    for i, o in enumerate(obs):
+        try:
+            kind = parse_outbound_link(o["link"], o["tag"])["protocol"]
+        except ValueError as e:
+            kind = "⚠️ " + str(e)
+        res = meta_get("ob_test_" + o["tag"], "")
+        rows += (
+            "<div class=card>"
+            "<div class=row style='justify-content:space-between;align-items:center'>"
+            "<b>%s</b><span class=eptag>%s · تست: 127.0.0.1:%d</span></div>"
+            "<p class=hint style='word-break:break-all'>%s</p>"
+            "<label class=hint>دامنه‌هایی که از این خروجی بروند (هر خط یکی):</label>"
+            "<textarea name='dom_%s' rows=4 form=obform placeholder='geosite:google&#10;gemini.google.com&#10;notebooklm.google.com'>%s</textarea>"
+            "%s"
+            "<div class=row style='margin-top:10px'>"
+            "<form method=post action='/a/obtest' style='margin:0'>"
+            "<input type=hidden name=csrf value='%s'><input type=hidden name=tag value='%s'>"
+            "<button class='btn ghost'>🔎 تست این خروجی</button></form>"
+            "<form method=post action='/a/obdel' style='margin:0' onsubmit=\"return confirm('حذف شود؟')\">"
+            "<input type=hidden name=csrf value='%s'><input type=hidden name=tag value='%s'>"
+            "<button class='btn ghost'>حذف</button></form></div></div>"
+        ) % (html.escape(o["tag"]), html.escape(kind), ob_test_port(i), html.escape(o["link"]),
+             html.escape(o["tag"]), html.escape("\n".join(o.get("domains") or [])),
+             ("<p class=hint style='margin-top:8px'><b>%s</b></p>" % html.escape(res)) if res else "",
+             csrf, html.escape(o["tag"]), csrf, html.escape(o["tag"]))
+
+    add = ("<div class=card><h2>افزودن خروجی</h2>"
+           "<p class=hint>لینک را همان‌طور که هست بچسبانید: "
+           "<code>vless://</code> · <code>trojan://</code> · <code>ss://</code> · "
+           "<code>socks://user:pass@host:port</code> · <code>http://…</code></p>"
+           "<form method=post action='/a/obadd' class=grid>"
+           "<input name=tag placeholder='یک نام کوتاه، مثلاً clean-ai' maxlength=24 required>"
+           "<textarea name=link rows=3 placeholder='vless://…  یا  socks://user:pass@1.2.3.4:1080' required></textarea>"
+           "<input type=hidden name=csrf value='%s'>"
+           "<button class=btn style='margin-top:10px'>افزودن</button></form></div>") % csrf
+
+    save = ("<form method=post action='/a/obsave' id=obform>"
+            "<input type=hidden name=csrf value='%s'>"
+            "<button class=btn style='width:100%%'>💾 ذخیره و اعمال روی xray</button></form>"
+            "<p class=hint>اعمال، کانفیگ را با <code>xray -test</code> اعتبارسنجی می‌کند؛ اگر خراب باشد "
+            "چیزی تغییر نمی‌کند. بعد از اعمال، xray ری‌استارت می‌شود و کاربران خودکار resync می‌شوند "
+            "(لینک کسی عوض نمی‌شود).</p>") % csrf
+
+    body = (banner + add +
+            ("<h2 style='margin:18px 0 8px'>خروجی‌ها (%d)</h2>" % len(obs)) +
+            (rows or "<div class=card><p class=hint>هنوز خروجی‌ای تعریف نشده. همه‌چیز مستقیم از IP همین سرور می‌رود.</p></div>") +
+            (save if obs else ""))
+    return _page("خروجی‌ها", _top("<a href='/a/'>← داشبورد</a>", csrf) + body)
+
 def route_admin(method, path, query, cookie_header, body, now=None):
     now = now or int(time.time())
     if path.startswith("/a/login/"):
@@ -1050,6 +1326,7 @@ def route_admin(method, path, query, cookie_header, body, now=None):
         if path == "/a/user":          return _html(render_user(query.get("token", [""])[0], csrf))
         if path == "/a/new":           return _html(render_new(csrf))
         if path == "/a/config":        return _html(render_config(csrf))
+        if path == "/a/outbounds":     return _html(render_outbounds(csrf, query.get("msg", [""])[0]))
         if path == "/a/del":           return _html(render_delconfirm(query.get("token", [""])[0], csrf))
         return 404, {"Content-Type": "text/plain"}, b"not found"
     return route_admin_post(method, path, query, csrf, body, now, cookie_sid(cookie_header))
@@ -1109,6 +1386,38 @@ def route_admin_post(method, path, query, csrf, body, now, sid):
         if ips: set_ips(ips)
         regenerate_all_subs()
         return _redirect("/a/config")
+    if path == "/a/obadd":
+        tag = re.sub(r"[^A-Za-z0-9_-]", "", (form.get("tag") or "").strip())[:24]
+        link = (form.get("link") or "").strip()
+        obs = get_outbounds()
+        if not tag or not link:
+            return _redirect("/a/outbounds?msg=" + urllib.parse.quote("نام و لینک لازم است"))
+        if tag in ("direct", "block") or any(o["tag"] == tag for o in obs):
+            return _redirect("/a/outbounds?msg=" + urllib.parse.quote("این نام قبلاً استفاده شده"))
+        try:
+            parse_outbound_link(link, tag)          # validate before storing
+        except ValueError as e:
+            return _redirect("/a/outbounds?msg=" + urllib.parse.quote("لینک نامعتبر: %s" % e))
+        obs.append({"tag": tag, "link": link, "domains": []})
+        set_outbounds(obs)
+        return _redirect("/a/outbounds?msg=" + urllib.parse.quote("اضافه شد؛ دامنه‌ها را بنویسید و «ذخیره و اعمال» بزنید"))
+    if path == "/a/obdel":
+        tag = (form.get("tag") or "").strip()
+        set_outbounds([o for o in get_outbounds() if o["tag"] != tag])
+        meta_set("ob_test_" + tag, "")
+        ok, msg = apply_xray_outbounds()
+        return _redirect("/a/outbounds?msg=" + urllib.parse.quote(("حذف شد. " + msg) if ok else msg))
+    if path == "/a/obsave":
+        obs = get_outbounds()
+        for o in obs:
+            o["domains"] = parse_domains(form.get("dom_" + o["tag"], ""))
+        set_outbounds(obs)
+        ok, msg = apply_xray_outbounds(obs)
+        return _redirect("/a/outbounds?msg=" + urllib.parse.quote(msg))
+    if path == "/a/obtest":
+        tag = (form.get("tag") or "").strip()
+        meta_set("ob_test_" + tag, test_outbound(tag))
+        return _redirect("/a/outbounds")
     return 404, {"Content-Type": "text/plain"}, b"not found"
 
 class AdminHandler(BaseHTTPRequestHandler):
