@@ -474,7 +474,9 @@ def apply_xray_outbounds(obs=None):
         cfg["routing"] = {"domainStrategy": "IPIfNonMatch", "rules": rules}
     else:
         cfg.pop("routing", None)
-    tmp = XRAY_CONF + ".mjnew"
+    # the suffix MUST stay .json: xray picks the config format from the file extension and
+    # rejects anything else with "failed to get format of <file>", which made every apply fail.
+    tmp = XRAY_CONF + ".mjnew.json"
     try:
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(json.dumps(cfg, indent=2, ensure_ascii=False))

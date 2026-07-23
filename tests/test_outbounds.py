@@ -156,14 +156,16 @@ class ApplyBase(unittest.TestCase):
     def tearDown(self):
         bot.subprocess.run = self._run
         bot.XRAY_CONF = self._conf
-        for p in (self.tmp.name, self.tmp.name + ".mjnew"):
+        for p in (self.tmp.name, self.tmp.name + ".mjnew.json"):
             if os.path.exists(p): os.unlink(p)
         d, base = os.path.dirname(self.tmp.name), os.path.basename(self.tmp.name)
         for f in os.listdir(d):
             if f.startswith(base + ".bak."): os.unlink(os.path.join(d, f))
 
     def _stub_run(self, test_rc=0):
+        self.cmds = []
         def run(cmd, *a, **k):
+            self.cmds.append(list(cmd))
             class R: pass
             r = R(); r.returncode = (test_rc if "-test" in cmd else 0); r.stdout = ""; r.stderr = "bad config"
             return r
@@ -185,6 +187,15 @@ class ApplyConfigTests(ApplyBase):
         self.assertEqual(cfg["policy"]["levels"]["0"]["statsUserOnline"], True)  # policy preserved
         self.assertEqual(cfg["routing"]["rules"][-1]["domain"], ["claude.ai"])
 
+    def test_validated_file_keeps_a_json_extension(self):
+        # xray picks the config format from the file EXTENSION; a temp named ".mjnew"
+        # made `xray -test` fail with "failed to get format of ...", so every apply died.
+        self._stub_run()
+        bot.apply_xray_outbounds([{"tag": "clean", "link": "socks://1.2.3.4:1080", "domains": []}])
+        tested = [c for c in self.cmds if "-test" in c]
+        self.assertTrue(tested, "xray -test was never run")
+        self.assertTrue(tested[0][-1].endswith(".json"), tested[0])
+
     def test_invalid_config_is_never_written(self):
         self._stub_run(test_rc=1)               # xray -test fails
         before = open(self.tmp.name).read()
@@ -192,7 +203,7 @@ class ApplyConfigTests(ApplyBase):
         self.assertFalse(ok)
         self.assertIn("نامعتبر", msg)
         self.assertEqual(open(self.tmp.name).read(), before)   # untouched
-        self.assertFalse(os.path.exists(self.tmp.name + ".mjnew"))
+        self.assertFalse(os.path.exists(self.tmp.name + ".mjnew.json"))
 
     def test_bad_link_rejected_before_touching_config(self):
         self._stub_run()
