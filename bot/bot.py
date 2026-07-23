@@ -966,13 +966,50 @@ def enforcer():
 
 # ================= ADMIN PANEL (web) =================
 LOGIN_TTL = 600      # one-time login link lifetime (s)
-SESS_TTL  = 86400    # session cookie lifetime (s)
+SESS_TTL  = int(ENV.get("SESS_DAYS", "30")) * 86400   # stay logged in this long
 _login_tokens = {}   # token -> expires_ts
-_sessions = {}       # sid -> {"exp": ts, "csrf": str}
+_sessions = {}       # sid -> {"exp": ts, "csrf": str}; mirror of the meta rows below
+
+# Sessions are ALSO stored in `meta` as sess_<sid>, because the panel used to log the
+# admin out on every bot restart (deploy, reboot, crash) — an in-RAM dict can't outlive
+# the process, so a "30 day" cookie meant nothing.
+def _sess_key(sid): return "sess_" + sid
+
+def _sess_put(sid, rec):
+    _sessions[sid] = rec
+    try:                       # best effort: a DB hiccup must not break logging in
+        meta_set(_sess_key(sid), json.dumps(rec))
+    except Exception:
+        pass
+
+def _sess_get(sid):
+    s = _sessions.get(sid)
+    if s: return s
+    try:
+        raw = meta_get(_sess_key(sid))          # survives a bot restart
+        if not raw: return None
+        s = json.loads(raw)
+        if not isinstance(s, dict) or "csrf" not in s: return None
+    except Exception:
+        return None
+    _sessions[sid] = s
+    return s
+
+def _sess_drop(sid):
+    _sessions.pop(sid, None)
+    try:
+        c = db(); c.execute("DELETE FROM meta WHERE k=?", (_sess_key(sid),)); c.commit(); c.close()
+    except Exception:
+        pass
 
 def _prune_auth(now):
     for k in [k for k, v in _login_tokens.items() if v <= now]: _login_tokens.pop(k, None)
     for k in [k for k, s in _sessions.items() if s["exp"] <= now]: _sessions.pop(k, None)
+    try:
+        c = db(); c.execute("DELETE FROM meta WHERE k LIKE 'sess_%' AND CAST(json_extract(v,'$.exp') AS INTEGER) <= ?",
+                            (now,)); c.commit(); c.close()
+    except Exception:
+        pass          # json_extract needs sqlite >= 3.9; expiry is enforced below regardless
 
 def mint_login(now=None):
     now = now or int(time.time()); _prune_auth(now)
@@ -986,14 +1023,14 @@ def consume_login(tok, now=None):
 def new_session(now=None):
     now = now or int(time.time())
     sid = secrets.token_urlsafe(24); csrf = secrets.token_urlsafe(16)
-    _sessions[sid] = {"exp": now + SESS_TTL, "csrf": csrf}
+    _sess_put(sid, {"exp": now + SESS_TTL, "csrf": csrf})
     return sid, csrf
 
 def session_csrf(sid, now=None):
     now = now or int(time.time())
-    s = _sessions.get(sid) if sid else None
-    if not s or s["exp"] <= now:
-        if sid: _sessions.pop(sid, None)
+    s = _sess_get(sid) if sid else None
+    if not s or s.get("exp", 0) <= now:
+        if sid: _sess_drop(sid)
         return None
     return s["csrf"]
 
@@ -1442,7 +1479,7 @@ def route_admin_post(method, path, query, csrf, body, now, sid):
     if form.get("csrf") != csrf:
         return 403, {"Content-Type": "text/plain"}, b"forbidden"
     if path == "/a/logout":
-        _sessions.pop(sid, None)
+        _sess_drop(sid)          # manual logout is the only thing that ends a session
         ck = "mj_sess=; HttpOnly; Secure; SameSite=Strict; Path=/a; Max-Age=0"
         return 200, {"Content-Type": "text/html; charset=utf-8", "Set-Cookie": ck}, render_loggedout().encode("utf-8")
     token = form.get("token", "")

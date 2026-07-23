@@ -7,6 +7,11 @@ import bot  # noqa: E402
 class TestAuth(unittest.TestCase):
     def setUp(self):
         bot._login_tokens.clear(); bot._sessions.clear()
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False); self.tmp.close()
+        self._db = bot.DB_PATH; bot.DB_PATH = self.tmp.name; bot.init_db()
+
+    def tearDown(self):
+        bot.DB_PATH = self._db; os.unlink(self.tmp.name)
 
     def test_login_token_single_use(self):
         tok = bot.mint_login(now=1000)
@@ -22,6 +27,26 @@ class TestAuth(unittest.TestCase):
         self.assertEqual(bot.session_csrf(sid, now=1001), csrf)
         self.assertIsNone(bot.session_csrf(sid, now=1000 + bot.SESS_TTL + 1))
         self.assertIsNone(bot.session_csrf("bogus", now=1001))
+
+    def test_session_lasts_a_month(self):
+        self.assertGreaterEqual(bot.SESS_TTL, 30 * 86400)
+
+    def test_session_survives_a_bot_restart(self):
+        # the panel used to log the admin out on every deploy: sessions lived in RAM only
+        sid, csrf = bot.new_session(now=1000)
+        bot._sessions.clear()                                   # <- simulates the restart
+        self.assertEqual(bot.session_csrf(sid, now=1000 + 29 * 86400), csrf)
+
+    def test_manual_logout_kills_the_persisted_session_too(self):
+        sid, csrf = bot.new_session(now=1000)
+        bot._sess_drop(sid)
+        bot._sessions.clear()
+        self.assertIsNone(bot.session_csrf(sid, now=1001))
+
+    def test_expired_session_is_not_resurrected_from_disk(self):
+        sid, _ = bot.new_session(now=1000)
+        bot._sessions.clear()
+        self.assertIsNone(bot.session_csrf(sid, now=1000 + bot.SESS_TTL + 1))
 
     def test_cookie_sid(self):
         self.assertEqual(bot.cookie_sid("mj_sess=abc; other=1"), "abc")
