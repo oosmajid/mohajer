@@ -197,6 +197,13 @@ class ApplyConfigTests(ApplyBase):
         self.assertTrue(tested, "xray -test was never run")
         self.assertTrue(tested[0][-1].endswith(".json"), tested[0])
 
+    def test_domain_strategy_does_not_force_dns_on_every_connection(self):
+        # IPIfNonMatch resolves the destination for every connection that matches no rule,
+        # which taxes ALL traffic (latency) for zero benefit to our domain-only rules.
+        self._stub_run()
+        bot.apply_xray_outbounds([{"tag": "clean", "link": "socks://1.2.3.4:1080", "domains": ["claude.ai"]}])
+        self.assertEqual(json.load(open(self.tmp.name))["routing"]["domainStrategy"], "AsIs")
+
     def test_invalid_config_is_never_written(self):
         self._stub_run(test_rc=1)               # xray -test fails
         before = open(self.tmp.name).read()

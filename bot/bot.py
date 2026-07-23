@@ -472,7 +472,10 @@ def apply_xray_outbounds(obs=None):
             and str(r.get("outboundTag", "")) in alive]                        # drop dangling ones
     rules = keep + rules
     if rules:
-        cfg["routing"] = {"domainStrategy": "IPIfNonMatch", "rules": rules}
+        # AsIs, NOT IPIfNonMatch: our rules match on the requested domain (and geoip:private
+        # sees a literal IP), so resolution buys nothing — but IPIfNonMatch makes xray do a
+        # DNS lookup for EVERY connection that matches no rule, adding latency to all traffic.
+        cfg["routing"] = {"domainStrategy": "AsIs", "rules": rules}
     else:
         cfg.pop("routing", None)
     # the suffix MUST stay .json: xray picks the config format from the file extension and
