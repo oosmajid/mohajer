@@ -629,7 +629,11 @@ def delete_user(token):
     if u:
         tags = online_tags_of(token)     # capture BEFORE rmu (rmu clears the online stat)
         xr_remove_user(token); del_sub(token)
-        c.execute("DELETE FROM users WHERE token=?", (token,)); c.commit()
+        c.execute("DELETE FROM users WHERE token=?", (token,))
+        # also drop the user's daily rows — otherwise their traffic lingers in the
+        # panel's "last 30 days" total (which sums usage_daily) while "total" (which
+        # sums the users table) no longer counts them, so 30d > total. See panel_usage_summary.
+        c.execute("DELETE FROM usage_daily WHERE token=?", (token,)); c.commit()
         force_disconnect(tags)           # cut the live session now (no-op if it was offline)
     c.close()
 
@@ -736,10 +740,16 @@ def prune_daily(c, keep_days=30):
     c.execute("DELETE FROM usage_daily WHERE day < ?", (cutoff,))
 
 def panel_usage_summary():
+    # "total" sums the users table, so the daily aggregates must also count ONLY tokens
+    # that still exist — otherwise a deleted user's daily rows (which outlive the user
+    # until they age out) push "last 30 days" above "total". The token filter self-heals
+    # any orphan rows already on disk; delete_user prevents new ones.
     c = db(); day = day_key(); cutoff30 = day_key(time.time() - 30 * 86400)
     total = c.execute("SELECT COALESCE(SUM(used_bytes),0) v FROM users").fetchone()["v"]
-    today = c.execute("SELECT COALESCE(SUM(max(end_used-start_used,0)),0) v FROM usage_daily WHERE day=?", (day,)).fetchone()["v"]
-    last30 = c.execute("SELECT COALESCE(SUM(max(end_used-start_used,0)),0) v FROM usage_daily WHERE day>=?", (cutoff30,)).fetchone()["v"]
+    today = c.execute("SELECT COALESCE(SUM(max(end_used-start_used,0)),0) v FROM usage_daily "
+                      "WHERE day=? AND token IN (SELECT token FROM users)", (day,)).fetchone()["v"]
+    last30 = c.execute("SELECT COALESCE(SUM(max(end_used-start_used,0)),0) v FROM usage_daily "
+                       "WHERE day>=? AND token IN (SELECT token FROM users)", (cutoff30,)).fetchone()["v"]
     c.close(); return int(total), int(today), int(last30)
 
 def resync_all():

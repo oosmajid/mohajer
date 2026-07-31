@@ -45,6 +45,33 @@ class TestDailyRecord(unittest.TestCase):
         self.assertEqual(today, 400)            # 500 - 100
         self.assertEqual(last30, 400)
 
+    def test_deleted_user_daily_rows_do_not_inflate_last30(self):
+        # regression: "last 30 days" summed usage_daily incl. deleted users, while "total"
+        # summed the users table, so 30d could exceed total. Both must ignore gone tokens.
+        day = bot.day_key()
+        c = bot.db()
+        bot.record_daily(c, "aa", 0, day); bot.record_daily(c, "aa", 200, day)
+        c.execute("UPDATE users SET used_bytes=200 WHERE token='aa'")
+        # a user that was deleted but whose daily rows linger
+        c.execute("INSERT INTO usage_daily(token,day,start_used,end_used) VALUES('gone',?,0,9999)", (day,))
+        c.commit(); c.close()
+        total, today, last30 = bot.panel_usage_summary()
+        self.assertEqual(total, 200)
+        self.assertEqual(last30, 200)          # NOT 200 + 9999
+        self.assertLessEqual(last30, total)    # the invariant the panel must never break
+        self.assertLessEqual(today, total)
+
+    def test_delete_user_removes_daily_rows(self):
+        day = bot.day_key()
+        c = bot.db()
+        c.execute("INSERT INTO usage_daily(token,day,start_used,end_used) VALUES('aa',?,0,500)", (day,))
+        c.commit(); c.close()
+        bot.delete_user("aa")                  # xr/ sub side-effects are no-ops in tests
+        c = bot.db()
+        left = c.execute("SELECT COUNT(*) n FROM usage_daily WHERE token='aa'").fetchone()["n"]
+        c.close()
+        self.assertEqual(left, 0)
+
     def test_end_used_never_decreases(self):
         day = bot.day_key()
         c = bot.db()
