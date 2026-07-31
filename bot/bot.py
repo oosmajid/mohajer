@@ -71,6 +71,14 @@ def init_db():
         c.execute("ALTER TABLE users ADD COLUMN disabled_ts INTEGER DEFAULT 0")
     if "frozen" not in cols:       # manual admin freeze (independent of quota/expiry disable)
         c.execute("ALTER TABLE users ADD COLUMN frozen INTEGER DEFAULT 0")
+    # retired_bytes = lifetime traffic of already-deleted users, so deleting a user never
+    # drops the dashboard's "total". Backfill ONCE from any daily rows left by past deletes
+    # (their last recorded end_used ≈ their lifetime at deletion) so the count stays honest.
+    if c.execute("SELECT v FROM meta WHERE k='retired_bytes'").fetchone() is None:
+        orphan = c.execute(
+            "SELECT COALESCE(SUM(mx),0) s FROM (SELECT MAX(end_used) mx FROM usage_daily "
+            "WHERE token NOT IN (SELECT token FROM users) GROUP BY token)").fetchone()["s"]
+        c.execute("INSERT INTO meta(k,v) VALUES('retired_bytes',?)", (str(int(orphan or 0)),))
     c.commit(); c.close()
 
 def meta_get(k, d=None):
@@ -629,11 +637,13 @@ def delete_user(token):
     if u:
         tags = online_tags_of(token)     # capture BEFORE rmu (rmu clears the online stat)
         xr_remove_user(token); del_sub(token)
-        c.execute("DELETE FROM users WHERE token=?", (token,))
-        # also drop the user's daily rows — otherwise their traffic lingers in the
-        # panel's "last 30 days" total (which sums usage_daily) while "total" (which
-        # sums the users table) no longer counts them, so 30d > total. See panel_usage_summary.
-        c.execute("DELETE FROM usage_daily WHERE token=?", (token,)); c.commit()
+        # deleting a user must NOT drop the dashboard totals. Bank this user's lifetime
+        # traffic into retired_bytes (keeps "total" stable), and LEAVE their usage_daily
+        # rows so they keep counting toward "last 30 days" until they age out naturally.
+        retired = int(meta_get("retired_bytes", "0") or 0) + int(u["used_bytes"] or 0)
+        c.execute("INSERT INTO meta(k,v) VALUES('retired_bytes',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                  (str(retired),))
+        c.execute("DELETE FROM users WHERE token=?", (token,)); c.commit()
         force_disconnect(tags)           # cut the live session now (no-op if it was offline)
     c.close()
 
@@ -740,16 +750,16 @@ def prune_daily(c, keep_days=30):
     c.execute("DELETE FROM usage_daily WHERE day < ?", (cutoff,))
 
 def panel_usage_summary():
-    # "total" sums the users table, so the daily aggregates must also count ONLY tokens
-    # that still exist — otherwise a deleted user's daily rows (which outlive the user
-    # until they age out) push "last 30 days" above "total". The token filter self-heals
-    # any orphan rows already on disk; delete_user prevents new ones.
+    # "total" = live users' lifetime + retired (deleted users') lifetime, so a delete never
+    # lowers it. today/last30 count EVERY daily row (incl. deleted users, until they age out),
+    # so a delete doesn't lower those either. retired_bytes >= each deleted user's 30-day
+    # delta, so the "30d <= total" invariant still holds.
     c = db(); day = day_key(); cutoff30 = day_key(time.time() - 30 * 86400)
-    total = c.execute("SELECT COALESCE(SUM(used_bytes),0) v FROM users").fetchone()["v"]
-    today = c.execute("SELECT COALESCE(SUM(max(end_used-start_used,0)),0) v FROM usage_daily "
-                      "WHERE day=? AND token IN (SELECT token FROM users)", (day,)).fetchone()["v"]
-    last30 = c.execute("SELECT COALESCE(SUM(max(end_used-start_used,0)),0) v FROM usage_daily "
-                       "WHERE day>=? AND token IN (SELECT token FROM users)", (cutoff30,)).fetchone()["v"]
+    live = c.execute("SELECT COALESCE(SUM(used_bytes),0) v FROM users").fetchone()["v"]
+    r = c.execute("SELECT v FROM meta WHERE k='retired_bytes'").fetchone()
+    total = int(live) + (int(r["v"]) if r and str(r["v"]).lstrip("-").isdigit() else 0)
+    today = c.execute("SELECT COALESCE(SUM(max(end_used-start_used,0)),0) v FROM usage_daily WHERE day=?", (day,)).fetchone()["v"]
+    last30 = c.execute("SELECT COALESCE(SUM(max(end_used-start_used,0)),0) v FROM usage_daily WHERE day>=?", (cutoff30,)).fetchone()["v"]
     c.close(); return int(total), int(today), int(last30)
 
 def resync_all():
