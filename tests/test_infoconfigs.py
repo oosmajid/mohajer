@@ -1,4 +1,4 @@
-import os, sys, base64, json, unittest
+import os, sys, base64, json, sqlite3, tempfile, unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "sub"))
 import subserver as s  # noqa: E402
 
@@ -78,6 +78,26 @@ class TestBuildResponse(unittest.TestCase):
         code, ctype, body, extra = s.build_response("sub-u-aa", b64, self._info(), "Mozilla/5.0", False)
         self.assertIn("text/html", ctype)
         self.assertIn("باقیمانده", body.decode("utf-8"))  # info-config status name in the page
+
+    def test_terabytes_show_three_decimal_places_on_site(self):
+        self.assertEqual(s.fmt_bytes(1177.6 * 1024 ** 3), "1.150 TB")
+
+
+class TestUserInfo(unittest.TestCase):
+    def test_subscriber_sees_usage_since_reset_not_lifetime(self):
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False); tmp.close()
+        old = s.DB_PATH; s.DB_PATH = tmp.name
+        try:
+            c = sqlite3.connect(tmp.name)
+            c.execute("CREATE TABLE users(token TEXT,used_bytes INTEGER,usage_reset_bytes INTEGER,"
+                      "limit_bytes INTEGER,expiry_ts INTEGER,created_ts INTEGER,label TEXT,disabled_ts INTEGER)")
+            c.execute("INSERT INTO users VALUES('aa',175,150,1000,0,0,'A',0)")
+            c.commit(); c.close()
+            info = s.user_info("sub-u-aa")
+            self.assertEqual(info["used_bytes"], 25)
+            self.assertEqual(info["lifetime_used_bytes"], 175)
+        finally:
+            s.DB_PATH = old; os.unlink(tmp.name)
 
 
 if __name__ == "__main__":

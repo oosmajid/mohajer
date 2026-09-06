@@ -10,7 +10,7 @@ Production server: `ssh -p 49531 root@23.94.29.30` (512MB RAM). Live unit names 
 | Tail bot logs | `journalctl -u dpbot -f` |
 | Restart bot | `systemctl restart dpbot` (safe; users unaffected) |
 | Restart xray | `systemctl restart xray` (users auto-resync on next poll) |
-| List links | bot → 📋 لیست لینک‌ها, or `sqlite3 /opt/dpbot/dpbot.db "SELECT label,used_bytes,limit_bytes,expiry_ts FROM users"` |
+| List links | bot → 📋 لیست لینک‌ها, or `sqlite3 /opt/dpbot/dpbot.db "SELECT label,used_bytes,max(used_bytes-usage_reset_bytes,0) AS current_used,limit_bytes,expiry_ts FROM users"` |
 | Change clean IPs | bot → 🌐 آی‌پی‌های تمیز → ✏️ ویرایش (live, no restart) |
 | Find fast IPs | run `scripts/cf-clean-ip-scan.sh cdn.delplayer.ir` from a client network |
 | Memory check | `free -m` (watch for low "available") |

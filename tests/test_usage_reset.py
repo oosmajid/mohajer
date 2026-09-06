@@ -1,4 +1,4 @@
-import os, sys, json, time, tempfile, unittest
+import os, sys, json, time, sqlite3, tempfile, unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bot"))
 os.environ.setdefault("DPBOT_ENV", "/nonexistent-dpbot-env")
 import bot  # noqa: E402
@@ -49,6 +49,38 @@ class UsageBase(unittest.TestCase):
 
 
 class UsageResetTests(UsageBase):
+    def test_migration_adds_manual_reset_baseline(self):
+        c = bot.db(); cols = [r[1] for r in c.execute("PRAGMA table_info(users)").fetchall()]; c.close()
+        self.assertIn("usage_reset_bytes", cols)
+
+    def test_manual_reset_zeroes_current_usage_but_keeps_lifetime_total(self):
+        self._mk("a", base=0, last=150, used=150)
+        bot.subprocess.run = fake_stat({"a": 150})
+
+        self.assertTrue(bot.reset_usage("a"))
+        c = bot.db(); u = c.execute("SELECT * FROM users WHERE token='a'").fetchone(); c.close()
+        self.assertEqual(bot.current_usage(u), 0)
+        self.assertEqual(u["used_bytes"], 150)
+        self.assertEqual(bot.panel_usage_summary()[0], 150)
+
+        bot.subprocess.run = fake_stat({"a": 175})
+        bot.refresh_usage("a")
+        c = bot.db(); u = c.execute("SELECT * FROM users WHERE token='a'").fetchone(); c.close()
+        self.assertEqual(bot.current_usage(u), 25)
+        self.assertEqual(u["used_bytes"], 175)
+
+        self.assertTrue(bot.reset_usage("a"))
+        c = bot.db(); u = c.execute("SELECT * FROM users WHERE token='a'").fetchone(); c.close()
+        self.assertEqual(bot.current_usage(u), 0)
+        self.assertEqual(bot.panel_usage_summary()[0], 175)
+
+    def test_quota_is_checked_against_usage_since_manual_reset(self):
+        self._mk("a", base=0, last=150, used=150)
+        c = bot.db()
+        c.execute("UPDATE users SET limit_bytes=100,usage_reset_bytes=150 WHERE token='a'")
+        c.commit(); u = c.execute("SELECT * FROM users WHERE token='a'").fetchone(); c.close()
+        self.assertIsNone(bot.exhaust_reason(u))
+
     def test_failed_read_leaves_usage_untouched(self):
         # steady state: real counter 5000, base 1000, used 6000
         self._mk("a", base=1000, last=5000, used=6000)
@@ -98,6 +130,25 @@ class UsageResetTests(UsageBase):
         bot.subprocess.run = fail_exc
         bot.refresh_usage("a")
         self.assertEqual(self._row("a"), (6000, 1000, 5000))
+
+
+class ManualResetMigrationTests(unittest.TestCase):
+    def test_existing_users_table_is_migrated_without_changing_usage(self):
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False); tmp.close()
+        old = bot.DB_PATH; bot.DB_PATH = tmp.name
+        try:
+            c = sqlite3.connect(tmp.name)
+            c.execute("CREATE TABLE users(token TEXT PRIMARY KEY,uuid TEXT,email TEXT UNIQUE,label TEXT,"
+                      "limit_bytes INTEGER,expiry_ts INTEGER,created_ts INTEGER,base_bytes INTEGER DEFAULT 0,"
+                      "last_raw INTEGER DEFAULT 0,used_bytes INTEGER DEFAULT 0,disabled_ts INTEGER DEFAULT 0,"
+                      "frozen INTEGER DEFAULT 0)")
+            c.execute("INSERT INTO users(token,used_bytes) VALUES('old',150)")
+            c.commit(); c.close()
+            bot.init_db()
+            c = bot.db(); u = c.execute("SELECT used_bytes,usage_reset_bytes FROM users WHERE token='old'").fetchone(); c.close()
+            self.assertEqual((u["used_bytes"], u["usage_reset_bytes"]), (150, 0))
+        finally:
+            bot.DB_PATH = old; os.unlink(tmp.name)
 
 
 if __name__ == "__main__":

@@ -131,7 +131,7 @@ ssh -p 49531 -o "ProxyCommand=nc -x 127.0.0.1:10808 -X 5 %h %p" root@23.94.29.30
   themeable surface — use `var(--ink)`.
 - **Edit bot logic:** it's one file, stdlib only. After editing, copy to the server
   path (see table) and `systemctl restart dpbot` (live) / `mohajer-bot` (fresh).
-- **Inspect state:** `sqlite3 <db> "SELECT label,used_bytes,limit_bytes,expiry_ts FROM users"`.
+- **Inspect state:** `sqlite3 <db> "SELECT label,used_bytes,max(used_bytes-usage_reset_bytes,0) AS current_used,limit_bytes,expiry_ts FROM users"`.
 
 ## 6. Verifying a change without breaking prod
 
@@ -155,7 +155,8 @@ users(
   created_ts  INTEGER,
   base_bytes  INTEGER,      -- carried-over usage across xray counter resets
   last_raw    INTEGER,      -- last raw counter value seen (reset detection)
-  used_bytes  INTEGER       -- base + last_raw (what UIs show)
+  used_bytes  INTEGER,      -- lifetime traffic: base + last_raw
+  usage_reset_bytes INTEGER -- lifetime baseline; UIs/quota use max(used_bytes-this, 0)
 )
 meta(k TEXT PRIMARY KEY, v TEXT)   -- clean_ips, config_recipe, xray_pid, admin_id (bootstrap)
 ```

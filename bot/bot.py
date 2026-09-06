@@ -61,6 +61,7 @@ def init_db():
         token TEXT PRIMARY KEY, uuid TEXT, email TEXT UNIQUE, label TEXT,
         limit_bytes INTEGER, expiry_ts INTEGER, created_ts INTEGER,
         base_bytes INTEGER DEFAULT 0, last_raw INTEGER DEFAULT 0, used_bytes INTEGER DEFAULT 0,
+        usage_reset_bytes INTEGER DEFAULT 0,
         disabled_ts INTEGER DEFAULT 0, frozen INTEGER DEFAULT 0)""")
     c.execute("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)")
     c.execute("""CREATE TABLE IF NOT EXISTS usage_daily(
@@ -71,6 +72,8 @@ def init_db():
         c.execute("ALTER TABLE users ADD COLUMN disabled_ts INTEGER DEFAULT 0")
     if "frozen" not in cols:       # manual admin freeze (independent of quota/expiry disable)
         c.execute("ALTER TABLE users ADD COLUMN frozen INTEGER DEFAULT 0")
+    if "usage_reset_bytes" not in cols:  # lifetime usage at the last admin-visible reset
+        c.execute("ALTER TABLE users ADD COLUMN usage_reset_bytes INTEGER DEFAULT 0")
     # retired_bytes = lifetime traffic of already-deleted users, so deleting a user never
     # drops the dashboard's "total". Backfill ONCE from any daily rows left by past deletes
     # (their last recorded end_used ≈ their lifetime at deletion) so the count stays honest.
@@ -599,11 +602,16 @@ def fmt_bytes(b):
     b = float(b)
     if b <= 0: return "0"
     for u in ["B", "KB", "MB", "GB", "TB"]:
-        if b < 1024: return "%.1f %s" % (b, u)
+        if b < 1024: return (("%.3f" if u == "TB" else "%.1f") + " %s") % (b, u)
         b /= 1024
     return "%.1f PB" % b
 
 def human_limit(lb): return "نامحدود" if lb <= 0 else fmt_bytes(lb)
+
+def current_usage(u):
+    """Usage since the latest manual reset; used_bytes itself remains lifetime traffic."""
+    reset = u["usage_reset_bytes"] if "usage_reset_bytes" in u.keys() else 0
+    return max(0, int(u["used_bytes"] or 0) - int(reset or 0))
 
 def human_expiry(ts):
     if ts <= 0: return "نامحدود"
@@ -649,7 +657,7 @@ def delete_user(token):
 
 def exhaust_reason(u, now=None):
     now = now or int(time.time())
-    if (u["limit_bytes"] or 0) > 0 and u["used_bytes"] >= u["limit_bytes"]: return "حجم تمام شد"
+    if (u["limit_bytes"] or 0) > 0 and current_usage(u) >= u["limit_bytes"]: return "حجم تمام شد"
     if (u["expiry_ts"] or 0) > 0 and now >= u["expiry_ts"]: return "زمان تمام شد"
     return None
 
@@ -669,7 +677,7 @@ def reenable_user(token):
 def maybe_reenable(token):
     # after an extend: if it was disabled but now has quota/time again, bring it back live immediately
     c = db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone(); c.close()
-    if u and u["disabled_ts"] and not exhaust_reason(u):
+    if u and u["disabled_ts"] and not u["frozen"] and not exhaust_reason(u):
         reenable_user(token); return True
     return False
 
@@ -698,6 +706,29 @@ def refresh_usage(token):
     used = base + raw
     c.execute("UPDATE users SET base_bytes=?,last_raw=?,used_bytes=? WHERE token=?", (base, raw, used, token))
     c.commit(); c.close()
+
+def reset_usage(token):
+    # Capture the freshest available lifetime counter, then atomically move only the
+    # display/quota baseline. Historical totals and daily rows remain untouched.
+    # The bulk reader distinguishes a missing user stat from a real zero, avoiding
+    # the transient-empty-response double-counting trap handled by refresh_all_usage.
+    refresh_all_usage()
+    c = db()
+    cur = c.execute("UPDATE users SET usage_reset_bytes=used_bytes WHERE token=?", (token,))
+    changed = cur.rowcount > 0
+    c.commit(); c.close()
+    if changed:
+        maybe_reenable(token)
+    return changed
+
+def rename_user(token, name):
+    name = (name or "").strip()[:40]
+    if not name:
+        return False
+    c = db(); cur = c.execute("UPDATE users SET label=? WHERE token=?", (name, token))
+    changed = cur.rowcount > 0
+    c.commit(); c.close()
+    return changed
 
 def xr_usage_all():
     # ONE statsquery for all users -> {token: bytes}, or None if the read FAILED.
@@ -802,7 +833,7 @@ def dur_kb():
 
 def list_kb():
     c = db(); rows = c.execute("SELECT * FROM users ORDER BY created_ts DESC").fetchall(); c.close()
-    kb = [[{"text": "%s %s · %s/%s · %s" % (("⏸" if u["disabled_ts"] else "🔗"), u["label"], fmt_bytes(u["used_bytes"]), human_limit(u["limit_bytes"]), human_expiry(u["expiry_ts"])),
+    kb = [[{"text": "%s %s · %s/%s · %s" % (("⏸" if u["disabled_ts"] else "🔗"), u["label"], fmt_bytes(current_usage(u)), human_limit(u["limit_bytes"]), human_expiry(u["expiry_ts"])),
             "callback_data": "u:%s" % u["token"]}] for u in rows]
     kb.append([{"text": "بازگشت", "callback_data": "menu"}]); return kb
 
@@ -820,11 +851,12 @@ def detail_text(u):
         left_h = max(0, (dts + GRACE_SECONDS - int(time.time())) // 3600)
         status = "⏸ <b>غیرفعال شد</b> (%s) — تا ~%d ساعت دیگر قابل تمدید است، وگرنه خودکار حذف می‌شود.\n\n" % (exhaust_reason(u) or "اتمام", left_h)
     return ("%s🔗 <b>%s</b>\n\n📦 مصرف: %s از %s\n⏳ %s\n🆔 <code>u_%s</code>\n\n🔗 <code>%s</code>"
-            % (status, html.escape(u["label"]), fmt_bytes(u["used_bytes"]), human_limit(u["limit_bytes"]),
+            % (status, html.escape(u["label"]), fmt_bytes(current_usage(u)), human_limit(u["limit_bytes"]),
                human_expiry(u["expiry_ts"]), u["token"], sub_url(u["token"])))
 
 def detail_kb(token):
     return [[{"text": "➕ حجم", "callback_data": "av:%s" % token}, {"text": "➕ زمان", "callback_data": "at:%s" % token}],
+            [{"text": "✏️ ویرایش نام", "callback_data": "rn:%s" % token}, {"text": "♻️ ریست مصرف", "callback_data": "rstq:%s" % token}],
             [{"text": "🔄 بروزرسانی مصرف", "callback_data": "u:%s" % token}],
             [{"text": "🗑 حذف لینک", "callback_data": "del:%s" % token}],
             [{"text": "بازگشت به لیست", "callback_data": "list"}]]
@@ -911,6 +943,23 @@ def route_cb(chat, mid, data, cbid):
         token = data[3:]; answer(cbid); edit(chat, mid, "📦 چقدر حجم اضافه شود؟", addvol_kb(token)); return
     if data.startswith("at:"):
         token = data[3:]; answer(cbid); edit(chat, mid, "⏳ چقدر زمان اضافه شود؟", addtime_kb(token)); return
+    if data.startswith("rn:"):
+        token = data[3:]; pending[chat] = {"stage": "rename", "token": token}; answer(cbid)
+        edit(chat, mid, "🏷 نام جدید لینک را بفرست:", [[{"text": "بازگشت", "callback_data": "u:%s" % token}]])
+        return
+    if data.startswith("rstq:"):
+        token = data[5:]; answer(cbid)
+        edit(chat, mid, "♻️ مصرف نمایشی این لینک صفر شود؟\nآمار مصرف کل حذف نمی‌شود.",
+             [[{"text": "بله، ریست کن", "callback_data": "rst:%s" % token}],
+              [{"text": "انصراف", "callback_data": "u:%s" % token}]])
+        return
+    if data.startswith("rst:"):
+        token = data[4:]
+        answer(cbid, "در حال ریست…")
+        if not reset_usage(token):
+            edit(chat, mid, "📋 لینک پیدا نشد.", list_kb()); return
+        c = db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone(); c.close()
+        edit(chat, mid, detail_text(u), detail_kb(token)); return
     if data == "list":
         answer(cbid); c = db(); n = c.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]; c.close()
         if n:
@@ -921,7 +970,7 @@ def route_cb(chat, mid, data, cbid):
             head = "هنوز لینکی نساخته‌ای. با ➕ شروع کن."
         edit(chat, mid, head, list_kb()); return
     if data.startswith("u:"):
-        token = data[2:]; refresh_usage(token)
+        token = data[2:]; pending.pop(chat, None); refresh_usage(token)
         c = db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone(); c.close()
         if not u: answer(cbid, "یافت نشد"); edit(chat, mid, "📋 لینک‌ها:", list_kb()); return
         answer(cbid); edit(chat, mid, detail_text(u), detail_kb(token)); return
@@ -956,6 +1005,15 @@ def handle_update(up):
         c = db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone(); c.close()
         if u: send(chat, "✅ بروز شد.\n\n" + detail_text(u), detail_kb(token))
         return
+    if st and st.get("stage") == "rename":
+        token = st["token"]
+        if not text.strip():
+            send(chat, "نام نمی‌تواند خالی باشد؛ یک نام بفرست:"); return
+        changed = rename_user(token, text); pending.pop(chat, None)
+        c = db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone(); c.close()
+        if changed and u: send(chat, "✅ نام لینک تغییر کرد.\n\n" + detail_text(u), detail_kb(token))
+        else: send(chat, "❌ لینک پیدا نشد.", main_menu_kb())
+        return
     if st and st.get("stage") == "vol_custom":
         try: gb = float(text.replace(",", "."))
         except Exception: send(chat, "یک عدد بفرست (GB):"); return
@@ -985,7 +1043,7 @@ def enforcer():
             if pid and pid != "0" and pid != last_pid:
                 resync_all(); last_pid = pid; meta_set("xray_pid", pid)
             refresh_all_usage()
-            c = db(); rows = c.execute("SELECT token,uuid,used_bytes,limit_bytes,expiry_ts,label,disabled_ts,frozen FROM users").fetchall(); c.close()
+            c = db(); rows = c.execute("SELECT token,uuid,used_bytes,usage_reset_bytes,limit_bytes,expiry_ts,label,disabled_ts,frozen FROM users").fetchall(); c.close()
             now = int(time.time())
             for cur in rows:
                 if cur["frozen"]: continue   # manually frozen -> ignore all auto disable/grace/reenable
@@ -1097,13 +1155,14 @@ def daily_series(days=7, token=None, now=None):
 
 def users_overview():
     c = db(); today = day_key()
-    rows = c.execute("SELECT token,label,used_bytes,limit_bytes,expiry_ts,disabled_ts,frozen,created_ts FROM users ORDER BY created_ts DESC").fetchall()
+    rows = c.execute("SELECT token,label,used_bytes,usage_reset_bytes,limit_bytes,expiry_ts,disabled_ts,frozen,created_ts FROM users ORDER BY created_ts DESC").fetchall()
     daily = {r["token"]: int(r["v"] or 0) for r in
              c.execute("SELECT token, max(end_used-start_used,0) v FROM usage_daily WHERE day=?", (today,)).fetchall()}
     c.close()
     out = []
     for r in rows:
-        d = dict(r); d["today"] = daily.get(r["token"], 0); out.append(d)
+        d = dict(r); d["current_used_bytes"] = current_usage(d)
+        d["today"] = daily.get(r["token"], 0); out.append(d)
     return out
 
 ADMIN_CSS = """
@@ -1265,7 +1324,7 @@ def render_loggedout():
                  "<p style='color:var(--mut);margin:6px 0 0'>برای ورودِ دوباره، در ربات دستور <code>/admin</code> را بزن.</p></div>")
 
 def _user_row(u, online=False):
-    lim = u["limit_bytes"] or 0; used = u["used_bytes"] or 0; dis = u["disabled_ts"]
+    lim = u["limit_bytes"] or 0; used = u["current_used_bytes"]; dis = u["disabled_ts"]
     if lim > 0:
         pct = min(100, int(used * 100 / lim))
         st = "dng" if dis else ("warn" if pct >= 90 else "ok")
@@ -1335,6 +1394,7 @@ def render_user(token, csrf):
         _form("/a/rename", [tk, "<input type=text name=name placeholder='نام تازه'>"], csrf, "تغییر نام") +
         _form("/a/unlimit", [tk, "<input type=hidden name=field value=limit_bytes>"], csrf, "حجم نامحدود", "btn ghost") +
         _form("/a/unlimit", [tk, "<input type=hidden name=field value=expiry_ts>"], csrf, "زمان نامحدود", "btn ghost"))
+    reset = "<a class='btn ghost' href='/a/reset?token=%s'>♻️ ریست مصرف</a>" % token
     dele = "<a class='btn danger' href='/a/del?token=%s'>حذف لینک</a>" % token
     hero = ("<div class='card hero'><div class=eyebrow><span class='st %s' style='display:inline-block;margin-inline-start:6px;vertical-align:middle'></span>%s</div>"
             "<div class=title>%s</div>"
@@ -1343,10 +1403,10 @@ def render_user(token, csrf):
             "<div class=metric><div class=k>انقضا</div><div class=v>%s</div></div></div>"
             "<div class=chart><div class=eyebrow>۳۰ روز اخیر</div>%s</div></div>") % (
         st, stlabel, html.escape(u["label"]),
-        fmt_bytes(u["used_bytes"]), human_limit(u["limit_bytes"]), fmt_bytes(today_u),
+        fmt_bytes(current_usage(u)), human_limit(u["limit_bytes"]), fmt_bytes(today_u),
         human_expiry(u["expiry_ts"]), chart)
     link = "<div class=card><h2>لینک اشتراک</h2><code>%s</code></div>" % sub_url(token)
-    actions = "<div class=card><h2>مدیریت</h2><div class=grid>%s</div><div style='margin-top:10px'>%s</div></div>" % (forms, dele)
+    actions = "<div class=card><h2>مدیریت</h2><div class=grid>%s</div><div class=row style='margin-top:10px'>%s%s</div></div>" % (forms, reset, dele)
     return _page("کاربر", _top("<a href='/a/'>← داشبورد</a>", csrf) + hero + frz_card + link + actions)
 
 def render_new(csrf):
@@ -1363,6 +1423,18 @@ def render_delconfirm(token, csrf):
                  "<div class=card><h2>حذف لینک</h2><p style='color:var(--mut);margin:0 0 12px'>"
                  "این کار برگشت‌ناپذیر است؛ لینک و کانفیگ‌های این مشتری حذف می‌شوند.</p>"
                  "<div class=row>%s<a class='btn ghost' href='/a/user?token=%s'>انصراف</a></div></div>" % (f, token))
+
+def render_resetconfirm(token, csrf):
+    c = db(); u = c.execute("SELECT label FROM users WHERE token=?", (token,)).fetchone(); c.close()
+    if not u:
+        return _page("یافت نشد", _top("<a href='/a/'>← داشبورد</a>", csrf) + "<div class=card>لینک پیدا نشد.</div>")
+    f = _form("/a/reset", ["<input type=hidden name=token value='%s'>" % token,
+                           "<input type=hidden name=confirm value=yes>"], csrf, "بله، ریست کن")
+    return _page("ریست مصرف", _top("<a href='/a/user?token=%s'>← بازگشت</a>" % token, csrf) +
+                 "<div class=card><h2>ریست مصرف «%s»</h2><p style='color:var(--mut);margin:0 0 12px'>"
+                 "مصرف دورهٔ جاری صفر می‌شود؛ آمار مصرف کل حذف نخواهد شد.</p>"
+                 "<div class=row>%s<a class='btn ghost' href='/a/user?token=%s'>انصراف</a></div></div>" %
+                 (html.escape(u["label"]), f, token))
 
 def render_config(csrf):
     recipe = get_recipe(); ips = get_ips(); rows = ""
@@ -1507,6 +1579,7 @@ def route_admin(method, path, query, cookie_header, body, now=None):
         if path == "/a/new":           return _html(render_new(csrf))
         if path == "/a/config":        return _html(render_config(csrf))
         if path == "/a/outbounds":     return _html(render_outbounds(csrf, query.get("msg", [""])[0]))
+        if path == "/a/reset":         return _html(render_resetconfirm(query.get("token", [""])[0], csrf))
         if path == "/a/del":           return _html(render_delconfirm(query.get("token", [""])[0], csrf))
         return 404, {"Content-Type": "text/plain"}, b"not found"
     return route_admin_post(method, path, query, csrf, body, now, cookie_sid(cookie_header))
@@ -1535,9 +1608,10 @@ def route_admin_post(method, path, query, csrf, body, now, sid):
         if days: extend_time(token, days)
         maybe_reenable(token); return _redirect("/a/user?token=" + token)
     if path == "/a/rename":
-        name = (form.get("name") or "").strip()[:40]
-        if name:
-            c = db(); c.execute("UPDATE users SET label=? WHERE token=?", (name, token)); c.commit(); c.close()
+        rename_user(token, form.get("name"))
+        return _redirect("/a/user?token=" + token)
+    if path == "/a/reset":
+        if form.get("confirm") == "yes" and token: reset_usage(token)
         return _redirect("/a/user?token=" + token)
     if path == "/a/unlimit":
         field = form.get("field")

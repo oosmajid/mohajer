@@ -81,6 +81,9 @@ class TestStats(unittest.TestCase):
         self.assertEqual(ov[0]["today"], 200)
         self.assertEqual(ov[0]["used_bytes"], 300)
 
+    def test_terabytes_show_three_decimal_places_on_admin_site(self):
+        self.assertEqual(bot.fmt_bytes(1177.6 * bot.GB), "1.150 TB")
+
 
 class TestRouteGet(TestStats):  # reuse the seeded DB from TestStats.setUp
     def _session_cookie(self):
@@ -112,8 +115,18 @@ class TestRouteGet(TestStats):  # reuse the seeded DB from TestStats.setUp
         cookie, csrf = self._session_cookie()
         st, hdr, body = bot.route_admin("GET", "/a/user", {"token": ["t1"]}, cookie, b"", now=1001)
         self.assertEqual(st, 200)
-        self.assertIn("One", body.decode("utf-8"))
-        self.assertIn(csrf, body.decode("utf-8"))         # forms carry the csrf token
+        page = body.decode("utf-8")
+        self.assertIn("One", page)
+        self.assertIn(csrf, page)         # forms carry the csrf token
+        self.assertIn("/a/reset?token=t1", page)
+
+    def test_reset_confirmation_page_explains_history_is_kept(self):
+        cookie, csrf = self._session_cookie()
+        st, _, body = bot.route_admin("GET", "/a/reset", {"token": ["t1"]}, cookie, b"", now=1001)
+        page = body.decode("utf-8")
+        self.assertEqual(st, 200)
+        self.assertIn("آمار مصرف کل حذف نخواهد شد", page)
+        self.assertIn("confirm", page)
 
     def test_dashboard_has_logout(self):
         cookie, csrf = self._session_cookie()
@@ -142,6 +155,19 @@ class TestRoutePost(TestStats):
         self.assertEqual(st, 302)
         c = bot.db(); lim = c.execute("SELECT limit_bytes FROM users WHERE token='t1'").fetchone()["limit_bytes"]; c.close()
         self.assertEqual(lim, 1000 + 5 * bot.GB)
+
+    def test_reset_usage_route_sets_baseline_without_erasing_lifetime(self):
+        st, hdr, _ = self._post("/a/reset", {"token": "t1", "confirm": "yes", "csrf": self.csrf})
+        self.assertEqual(st, 302)
+        c = bot.db(); u = c.execute("SELECT used_bytes,usage_reset_bytes FROM users WHERE token='t1'").fetchone(); c.close()
+        self.assertEqual(u["used_bytes"], 300)
+        self.assertEqual(u["usage_reset_bytes"], 300)
+
+    def test_rename_helper_used_by_admin_route(self):
+        st, hdr, _ = self._post("/a/rename", {"token": "t1", "name": "  New Name  ", "csrf": self.csrf})
+        self.assertEqual(st, 302)
+        c = bot.db(); label = c.execute("SELECT label FROM users WHERE token='t1'").fetchone()["label"]; c.close()
+        self.assertEqual(label, "New Name")
 
     def test_csrf_mismatch_rejected(self):
         st, hdr, _ = self._post("/a/addvol", {"token": "t1", "gb": "5", "csrf": "WRONG"})

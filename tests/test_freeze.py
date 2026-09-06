@@ -70,6 +70,17 @@ class FreezeTests(FreezeBase):
         bot.unfreeze_user("t1")
         self.assertNotIn("t1", self.added)
 
+    def test_renewal_does_not_reenable_a_manually_frozen_link(self):
+        self._mk(frozen=1, disabled=123456)
+        self.assertFalse(bot.maybe_reenable("t1"))
+        self.assertNotIn("t1", self.added)
+
+    def test_usage_reset_can_reenable_a_quota_disabled_link(self):
+        self._mk(limit=100, used=150, disabled=123456)
+        c = bot.db(); c.execute("UPDATE users SET usage_reset_bytes=used_bytes WHERE token='t1'"); c.commit(); c.close()
+        self.assertTrue(bot.maybe_reenable("t1"))
+        self.assertIn("t1", self.added)
+
     def test_resync_all_skips_frozen(self):
         self._mk(token="a", frozen=1)
         self._mk(token="b", frozen=0)

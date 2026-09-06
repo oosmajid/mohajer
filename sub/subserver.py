@@ -26,9 +26,21 @@ def user_info(name):
         c = sqlite3.connect(DB_PATH, timeout=5)
         c.execute("PRAGMA busy_timeout=5000")
         c.row_factory = sqlite3.Row
-        r = c.execute("SELECT used_bytes,limit_bytes,expiry_ts,created_ts,label,disabled_ts FROM users WHERE token=?", (token,)).fetchone()
+        try:
+            r = c.execute("SELECT used_bytes,usage_reset_bytes,limit_bytes,expiry_ts,created_ts,label,disabled_ts "
+                          "FROM users WHERE token=?", (token,)).fetchone()
+        except sqlite3.OperationalError:
+            # Safe during rolling upgrades if the read-only subserver restarts just
+            # before the bot has added the new baseline column.
+            r = c.execute("SELECT used_bytes,0 AS usage_reset_bytes,limit_bytes,expiry_ts,created_ts,label,disabled_ts "
+                          "FROM users WHERE token=?", (token,)).fetchone()
         c.close()
-        return dict(r) if r else None
+        if not r:
+            return None
+        info = dict(r)
+        info["lifetime_used_bytes"] = int(info["used_bytes"] or 0)
+        info["used_bytes"] = max(0, info["lifetime_used_bytes"] - int(info["usage_reset_bytes"] or 0))
+        return info
     except Exception:
         return None
 
@@ -36,7 +48,9 @@ def fmt_bytes(b):
     b = float(b)
     if b <= 0: return "0"
     for u in ["B", "KB", "MB", "GB", "TB"]:
-        if b < 1024: return ("%.0f %s" if u in ("B", "KB") else "%.2f %s") % (b, u)
+        if b < 1024:
+            fmt = "%.0f %s" if u in ("B", "KB") else ("%.3f %s" if u == "TB" else "%.2f %s")
+            return fmt % (b, u)
         b /= 1024
     return "%.2f PB" % b
 

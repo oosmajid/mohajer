@@ -71,6 +71,11 @@ all stats whose name starts with `user>>>u_<token>` → `raw`. If `raw < last_ra
 (xray restarted, counters zeroed), it folds `last_raw` into `base_bytes`. Reported
 `used_bytes = base_bytes + raw`.
 
+A manual usage reset never changes that lifetime value. It stores the current
+`used_bytes` in `usage_reset_bytes`; subscriber/admin displays and quota enforcement
+use `max(used_bytes - usage_reset_bytes, 0)`. Dashboard totals and daily history
+continue to use the lifetime counters.
+
 ### Live clean-IP swap
 `set_ips()` writes `meta.clean_ips`; `regenerate_all_subs()` rewrites every sub file
 with the new IPs. The xray side is untouched (configs only differ by host IP), so no
