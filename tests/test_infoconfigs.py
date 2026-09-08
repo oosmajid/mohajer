@@ -1,4 +1,5 @@
 import os, sys, base64, json, sqlite3, tempfile, unittest
+from unittest import mock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "sub"))
 import subserver as s  # noqa: E402
 
@@ -81,6 +82,21 @@ class TestBuildResponse(unittest.TestCase):
 
     def test_terabytes_show_three_decimal_places_on_site(self):
         self.assertEqual(s.fmt_bytes(1177.6 * 1024 ** 3), "1.150 TB")
+
+    def test_unlimited_plan_shows_used_volume_and_elapsed_time(self):
+        created = 1_700_000_000
+        info = self._info(
+            used_bytes=12.5 * 1024 ** 3,
+            limit_bytes=0,
+            expiry_ts=0,
+            created_ts=created,
+        )
+        with mock.patch.object(s.time, "time", return_value=created + 3 * 86400 + 5 * 3600):
+            stats = s.bars_html(info)
+        self.assertIn("حجم مصرفی (نامحدود)", stats)
+        self.assertIn("12.50 GB", stats)
+        self.assertIn("زمان مصرف‌شده (نامحدود)", stats)
+        self.assertIn("3 روز و 5 ساعت", stats)
 
 
 class TestUserInfo(unittest.TestCase):

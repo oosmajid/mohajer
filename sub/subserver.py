@@ -61,6 +61,12 @@ def human_left(ts):
     if d >= 1: return "%d روز و %d ساعت" % (d, h)
     return "%d ساعت" % h
 
+def human_elapsed(created_ts):
+    elapsed = max(0, int(time.time()) - int(created_ts or 0)) if created_ts else 0
+    d = elapsed // 86400; h = (elapsed % 86400) // 3600
+    if d >= 1: return "%d روز و %d ساعت" % (d, h)
+    return "%d ساعت" % h
+
 def bars_html(info):
     if not info: return ""
     out = ['<div class="stats">']
@@ -73,8 +79,9 @@ def bars_html(info):
         out.append('<div class="stat"><div class="lbl"><span>📦 حجم مصرفی</span><span class="v">%s</span></div>'
                    '<div class="track"><div class="fill" style="width:%.1f%%;background:%s"></div></div></div>' % (val, pct, col))
     else:
-        out.append('<div class="stat"><div class="lbl"><span>📦 حجم</span><span>نامحدود</span></div>'
-                   '<div class="track"><div class="fill" style="width:100%;background:var(--ink)"></div></div></div>')
+        out.append('<div class="stat"><div class="lbl"><span>📦 حجم مصرفی (نامحدود)</span><span class="v">%s</span></div>'
+                   '<div class="track"><div class="fill" style="width:100%%;background:var(--ink)"></div></div></div>'
+                   % fmt_bytes(used))
     # time
     exp, cr = info["expiry_ts"], info["created_ts"] or 0
     if exp and exp > 0:
@@ -85,8 +92,9 @@ def bars_html(info):
         out.append('<div class="stat"><div class="lbl"><span>⏳ زمان باقی‌مانده</span><span>%s</span></div>'
                    '<div class="track"><div class="fill" style="width:%.1f%%;background:%s"></div></div></div>' % (html.escape(left), pct, col))
     else:
-        out.append('<div class="stat"><div class="lbl"><span>⏳ زمان</span><span>نامحدود</span></div>'
-                   '<div class="track"><div class="fill" style="width:100%;background:var(--ink)"></div></div></div>')
+        out.append('<div class="stat"><div class="lbl"><span>⏳ زمان مصرف‌شده (نامحدود)</span><span>%s</span></div>'
+                   '<div class="track"><div class="fill" style="width:100%%;background:var(--ink)"></div></div></div>'
+                   % html.escape(human_elapsed(cr)))
     out.append("</div>")
     return "".join(out)
 
