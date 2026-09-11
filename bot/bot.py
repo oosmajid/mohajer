@@ -303,6 +303,8 @@ def set_recipe(recipe):
 XRAY_CONF         = ENV.get("XRAY_CONF", "/usr/local/etc/xray/config.json")
 OB_TEST_PORT_BASE = int(ENV.get("OB_TEST_PORT_BASE", "10810"))
 OB_TEST_SITES     = ["gemini.google.com", "notebooklm.google.com", "claude.ai"]
+OB_TEST_TIMEOUT   = int(ENV.get("OB_TEST_TIMEOUT", "12"))
+OB_TEST_XHTTP_TIMEOUT = int(ENV.get("OB_TEST_XHTTP_TIMEOUT", "40"))
 OB_BIND_WAIT      = 8      # seconds to wait for xray to bind the test ports after a restart
 
 def get_outbounds():
@@ -602,15 +604,21 @@ def test_outbound(tag):
     idx = next((i for i, o in enumerate(obs) if o["tag"] == tag), None)
     if idx is None: return "خروجی پیدا نشد"
     port = ob_test_port(idx)
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(obs[idx].get("link", "")).query)
+    warmup_timeout = OB_TEST_XHTTP_TIMEOUT if _q1(query, "type").lower() == "xhttp" else OB_TEST_TIMEOUT
     try:
-        code, body = _socks5_get(port, "api.ipify.org", "/?format=json")
+        code, body = _socks5_get(port, "api.ipify.org", "/?format=json", timeout=warmup_timeout)
         ip = body.strip()[:60] if code == 200 else "نامشخص (HTTP %s)" % code
+    except ConnectionRefusedError as e:
+        return "❌ ورودی تست فعال نیست: %s — اول «ذخیره و اعمال» را بزنید." % e
+    except TimeoutError as e:
+        return "❌ مهلت اتصال خروجی تمام شد: %s" % e
     except Exception as e:
-        return "❌ به خروجی وصل نشد: %s — اول «ذخیره و اعمال» را بزنید." % e
+        return "❌ به خروجی وصل نشد: %s" % e
     marks = []
     for hostname in OB_TEST_SITES:
         try:
-            code, _ = _socks5_get(port, hostname, "/")
+            code, _ = _socks5_get(port, hostname, "/", timeout=OB_TEST_TIMEOUT)
             marks.append("%s %s" % (hostname, "✅" if code in (200, 301, 302) else "⛔️%d" % code))
         except Exception:
             marks.append("%s ❌" % hostname)

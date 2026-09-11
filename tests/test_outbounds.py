@@ -1,4 +1,5 @@
 import os, sys, json, base64, tempfile, unittest, urllib.parse
+from unittest import mock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bot"))
 os.environ.setdefault("DPBOT_ENV", "/nonexistent-dpbot-env")
 import bot  # noqa: E402
@@ -120,6 +121,25 @@ class ParseLinkTests(unittest.TestCase):
         for bad in ("ftp://1.2.3.4:21", "vless://@1.2.3.4:443", "vless://uuid@:443", "notalink"):
             with self.assertRaises(ValueError):
                 bot.parse_outbound_link(bad, "x")
+
+
+class OutboundProbeTests(unittest.TestCase):
+    @mock.patch.object(bot, "_socks5_get")
+    @mock.patch.object(bot, "get_outbounds")
+    def test_xhttp_gets_longer_first_connection_timeout(self, get_outbounds, socks_get):
+        get_outbounds.return_value = [{
+            "tag": "slow-xhttp",
+            "link": "vless://uuid@1.2.3.4:443?type=xhttp&security=tls",
+            "domains": ["geosite:google"],
+        }]
+        socks_get.side_effect = [(200, '{"ip":"1.2.3.4"}')] + [(200, "")] * len(bot.OB_TEST_SITES)
+
+        result = bot.test_outbound("slow-xhttp")
+
+        self.assertIn("1.2.3.4", result)
+        self.assertEqual(socks_get.call_args_list[0].kwargs["timeout"], bot.OB_TEST_XHTTP_TIMEOUT)
+        for call in socks_get.call_args_list[1:]:
+            self.assertEqual(call.kwargs["timeout"], bot.OB_TEST_TIMEOUT)
 
 
 class DomainParseTests(unittest.TestCase):
