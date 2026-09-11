@@ -303,8 +303,6 @@ def set_recipe(recipe):
 XRAY_CONF         = ENV.get("XRAY_CONF", "/usr/local/etc/xray/config.json")
 OB_TEST_PORT_BASE = int(ENV.get("OB_TEST_PORT_BASE", "10810"))
 OB_TEST_SITES     = ["gemini.google.com", "notebooklm.google.com", "claude.ai"]
-OB_TEST_TIMEOUT   = int(ENV.get("OB_TEST_TIMEOUT", "12"))
-OB_TEST_XHTTP_TIMEOUT = int(ENV.get("OB_TEST_XHTTP_TIMEOUT", "40"))
 OB_BIND_WAIT      = 8      # seconds to wait for xray to bind the test ports after a restart
 
 def get_outbounds():
@@ -336,18 +334,6 @@ def _q1(qs, *names, **kw):
         if qs.get(n):
             return qs[n][0]
     return kw.get("default", "")
-
-def _qjson_object(qs, name):
-    raw = _q1(qs, name)
-    if not raw:
-        return None
-    try:
-        value = json.loads(raw)
-    except (TypeError, ValueError):
-        raise ValueError("پارامتر %s باید JSON معتبر باشد" % name)
-    if not isinstance(value, dict):
-        raise ValueError("پارامتر %s باید یک JSON object باشد" % name)
-    return value
 
 def parse_outbound_link(link, tag):
     """vless:// trojan:// ss:// socks:// http:// -> an xray outbound dict. Raises ValueError."""
@@ -393,48 +379,21 @@ def parse_outbound_link(link, tag):
         if not host or not port: raise ValueError("آدرس یا پورت ناقص است")
         cred = urllib.parse.unquote(u.username or "")
         if not cred: raise ValueError("uuid/رمز در لینک نیست")
-        net = (_q1(qs, "type", default="tcp") or "tcp").lower()
-        sec = (_q1(qs, "security", default="none") or "none").lower()
+        net = _q1(qs, "type", default="tcp") or "tcp"
+        sec = _q1(qs, "security", default="none")
         sni = _q1(qs, "sni", "peer") or _q1(qs, "host") or host
-        stream = {"network": net, "security": (sec if sec in ("tls", "reality") else "none")}
-        if sec == "tls":
+        stream = {"network": net, "security": ("tls" if sec in ("tls", "reality") else "none")}
+        if stream["security"] == "tls":
             t = {"serverName": sni}
             if _q1(qs, "allowInsecure") in ("1", "true"): t["allowInsecure"] = True
             fp = _q1(qs, "fp")
             if fp: t["fingerprint"] = fp
-            alpn = [v.strip() for v in _q1(qs, "alpn").split(",") if v.strip()]
-            if alpn: t["alpn"] = alpn
             stream["tlsSettings"] = t
-        elif sec == "reality":
-            public_key = _q1(qs, "pbk", "publicKey", "password")
-            if not public_key:
-                raise ValueError("کلید عمومی REALITY در لینک نیست (pbk)")
-            r = {
-                "serverName": sni,
-                "fingerprint": _q1(qs, "fp") or "chrome",
-                "password": public_key,
-            }
-            short_id = _q1(qs, "sid", "shortId")
-            spider_x = _q1(qs, "spx", "spiderX")
-            if short_id: r["shortId"] = short_id
-            if spider_x: r["spiderX"] = spider_x
-            stream["realitySettings"] = r
         if net == "ws":
             stream["wsSettings"] = {"path": _q1(qs, "path", default="/") or "/",
                                     "headers": {"Host": _q1(qs, "host") or sni}}
         elif net == "grpc":
             stream["grpcSettings"] = {"serviceName": _q1(qs, "serviceName")}
-        elif net == "xhttp":
-            xhttp = {"path": _q1(qs, "path", default="/") or "/"}
-            xhttp_host = _q1(qs, "host")
-            xhttp_mode = _q1(qs, "mode")
-            xhttp_extra = _qjson_object(qs, "extra")
-            if xhttp_host: xhttp["host"] = xhttp_host
-            if xhttp_mode: xhttp["mode"] = xhttp_mode
-            if xhttp_extra is not None: xhttp["extra"] = xhttp_extra
-            stream["xhttpSettings"] = xhttp
-        finalmask = _qjson_object(qs, "fm")
-        if finalmask is not None: stream["finalmask"] = finalmask
         if scheme == "vless":
             usr = {"id": cred, "encryption": _q1(qs, "encryption", default="none") or "none"}
             flow = _q1(qs, "flow")
@@ -604,21 +563,15 @@ def test_outbound(tag):
     idx = next((i for i, o in enumerate(obs) if o["tag"] == tag), None)
     if idx is None: return "خروجی پیدا نشد"
     port = ob_test_port(idx)
-    query = urllib.parse.parse_qs(urllib.parse.urlparse(obs[idx].get("link", "")).query)
-    warmup_timeout = OB_TEST_XHTTP_TIMEOUT if _q1(query, "type").lower() == "xhttp" else OB_TEST_TIMEOUT
     try:
-        code, body = _socks5_get(port, "api.ipify.org", "/?format=json", timeout=warmup_timeout)
+        code, body = _socks5_get(port, "api.ipify.org", "/?format=json")
         ip = body.strip()[:60] if code == 200 else "نامشخص (HTTP %s)" % code
-    except ConnectionRefusedError as e:
-        return "❌ ورودی تست فعال نیست: %s — اول «ذخیره و اعمال» را بزنید." % e
-    except TimeoutError as e:
-        return "❌ مهلت اتصال خروجی تمام شد: %s" % e
     except Exception as e:
-        return "❌ به خروجی وصل نشد: %s" % e
+        return "❌ به خروجی وصل نشد: %s — اول «ذخیره و اعمال» را بزنید." % e
     marks = []
     for hostname in OB_TEST_SITES:
         try:
-            code, _ = _socks5_get(port, hostname, "/", timeout=OB_TEST_TIMEOUT)
+            code, _ = _socks5_get(port, hostname, "/")
             marks.append("%s %s" % (hostname, "✅" if code in (200, 301, 302) else "⛔️%d" % code))
         except Exception:
             marks.append("%s ❌" % hostname)
