@@ -1,4 +1,4 @@
-import os, sys, json, base64, tempfile, unittest
+import os, sys, json, base64, tempfile, unittest, urllib.parse
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bot"))
 os.environ.setdefault("DPBOT_ENV", "/nonexistent-dpbot-env")
 import bot  # noqa: E402
@@ -20,6 +20,67 @@ class ParseLinkTests(unittest.TestCase):
         self.assertEqual(st["tlsSettings"]["serverName"], "a.example.com")
         self.assertEqual(st["wsSettings"]["path"], "/xyz")
         self.assertEqual(st["wsSettings"]["headers"]["Host"], "a.example.com")
+
+    def test_vless_xhttp_tls_preserves_share_link_settings(self):
+        extra = {"xmux": {"maxConcurrency": "16-32"}, "noGRPCHeader": True}
+        finalmask = {"tcp": [{"type": "fragment", "settings": {"packets": "tlshello"}}]}
+        query = urllib.parse.urlencode({
+            "encryption": "none",
+            "type": "xhttp",
+            "path": "/api/pattern-to-decode",
+            "host": "origin.example.com",
+            "mode": "auto",
+            "extra": json.dumps(extra),
+            "security": "tls",
+            "sni": "cert.example.com",
+            "fp": "chrome",
+            "alpn": "h3,h2,http/1.1",
+            "fm": json.dumps(finalmask),
+        })
+        ob = bot.parse_outbound_link(
+            "vless://11111111-2222-3333-4444-555555555555@1.2.3.4:443?%s" % query,
+            "xhttp",
+        )
+        st = ob["streamSettings"]
+        self.assertEqual((st["network"], st["security"]), ("xhttp", "tls"))
+        self.assertEqual(st["xhttpSettings"], {
+            "path": "/api/pattern-to-decode",
+            "host": "origin.example.com",
+            "mode": "auto",
+            "extra": extra,
+        })
+        self.assertEqual(st["tlsSettings"]["serverName"], "cert.example.com")
+        self.assertEqual(st["tlsSettings"]["fingerprint"], "chrome")
+        self.assertEqual(st["tlsSettings"]["alpn"], ["h3", "h2", "http/1.1"])
+        self.assertEqual(st["finalmask"], finalmask)
+
+    def test_vless_reality_uses_reality_settings(self):
+        ob = bot.parse_outbound_link(
+            "vless://11111111-2222-3333-4444-555555555555@1.2.3.4:443"
+            "?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality"
+            "&sni=play.google.com&fp=chrome&pbk=public-key&sid=8f2798f9&spx=%2Ffoo",
+            "reality",
+        )
+        user = ob["settings"]["vnext"][0]["users"][0]
+        st = ob["streamSettings"]
+        self.assertEqual(user["flow"], "xtls-rprx-vision")
+        self.assertEqual((st["network"], st["security"]), ("tcp", "reality"))
+        self.assertNotIn("tlsSettings", st)
+        self.assertEqual(st["realitySettings"], {
+            "serverName": "play.google.com",
+            "fingerprint": "chrome",
+            "password": "public-key",
+            "shortId": "8f2798f9",
+            "spiderX": "/foo",
+        })
+
+    def test_xhttp_rejects_invalid_extra_json(self):
+        with self.assertRaisesRegex(ValueError, "extra"):
+            bot.parse_outbound_link(
+                "vless://11111111-2222-3333-4444-555555555555@1.2.3.4:443"
+                "?type=xhttp&security=tls&extra=%7Bbroken",
+                "bad-xhttp",
+            )
 
     def test_trojan(self):
         ob = bot.parse_outbound_link("trojan://secretpw@5.6.7.8:8443?security=tls&sni=b.example.com#x", "t1")

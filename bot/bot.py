@@ -335,6 +335,18 @@ def _q1(qs, *names, **kw):
             return qs[n][0]
     return kw.get("default", "")
 
+def _qjson_object(qs, name):
+    raw = _q1(qs, name)
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        raise ValueError("پارامتر %s باید JSON معتبر باشد" % name)
+    if not isinstance(value, dict):
+        raise ValueError("پارامتر %s باید یک JSON object باشد" % name)
+    return value
+
 def parse_outbound_link(link, tag):
     """vless:// trojan:// ss:// socks:// http:// -> an xray outbound dict. Raises ValueError."""
     link = (link or "").strip()
@@ -379,21 +391,48 @@ def parse_outbound_link(link, tag):
         if not host or not port: raise ValueError("آدرس یا پورت ناقص است")
         cred = urllib.parse.unquote(u.username or "")
         if not cred: raise ValueError("uuid/رمز در لینک نیست")
-        net = _q1(qs, "type", default="tcp") or "tcp"
-        sec = _q1(qs, "security", default="none")
+        net = (_q1(qs, "type", default="tcp") or "tcp").lower()
+        sec = (_q1(qs, "security", default="none") or "none").lower()
         sni = _q1(qs, "sni", "peer") or _q1(qs, "host") or host
-        stream = {"network": net, "security": ("tls" if sec in ("tls", "reality") else "none")}
-        if stream["security"] == "tls":
+        stream = {"network": net, "security": (sec if sec in ("tls", "reality") else "none")}
+        if sec == "tls":
             t = {"serverName": sni}
             if _q1(qs, "allowInsecure") in ("1", "true"): t["allowInsecure"] = True
             fp = _q1(qs, "fp")
             if fp: t["fingerprint"] = fp
+            alpn = [v.strip() for v in _q1(qs, "alpn").split(",") if v.strip()]
+            if alpn: t["alpn"] = alpn
             stream["tlsSettings"] = t
+        elif sec == "reality":
+            public_key = _q1(qs, "pbk", "publicKey", "password")
+            if not public_key:
+                raise ValueError("کلید عمومی REALITY در لینک نیست (pbk)")
+            r = {
+                "serverName": sni,
+                "fingerprint": _q1(qs, "fp") or "chrome",
+                "password": public_key,
+            }
+            short_id = _q1(qs, "sid", "shortId")
+            spider_x = _q1(qs, "spx", "spiderX")
+            if short_id: r["shortId"] = short_id
+            if spider_x: r["spiderX"] = spider_x
+            stream["realitySettings"] = r
         if net == "ws":
             stream["wsSettings"] = {"path": _q1(qs, "path", default="/") or "/",
                                     "headers": {"Host": _q1(qs, "host") or sni}}
         elif net == "grpc":
             stream["grpcSettings"] = {"serviceName": _q1(qs, "serviceName")}
+        elif net == "xhttp":
+            xhttp = {"path": _q1(qs, "path", default="/") or "/"}
+            xhttp_host = _q1(qs, "host")
+            xhttp_mode = _q1(qs, "mode")
+            xhttp_extra = _qjson_object(qs, "extra")
+            if xhttp_host: xhttp["host"] = xhttp_host
+            if xhttp_mode: xhttp["mode"] = xhttp_mode
+            if xhttp_extra is not None: xhttp["extra"] = xhttp_extra
+            stream["xhttpSettings"] = xhttp
+        finalmask = _qjson_object(qs, "fm")
+        if finalmask is not None: stream["finalmask"] = finalmask
         if scheme == "vless":
             usr = {"id": cred, "encryption": _q1(qs, "encryption", default="none") or "none"}
             flow = _q1(qs, "flow")
