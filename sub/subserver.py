@@ -13,6 +13,19 @@ DB_PATH = os.environ.get("DB", "/opt/dpbot/dpbot.db")
 HOST = os.environ.get("SUB_HOST", "127.0.0.1")
 PORT = int(os.environ.get("SUB_PORT", "8090"))
 SAFE = re.compile(r"^sub-[A-Za-z0-9_.-]+$")
+# Vendored QR encoder (qrcode-generator 2.0.4, MIT, Kazuhiko Arase), served at /sub-qr.js:
+# the Cloudflare tunnel only forwards /sub-* here, and a CDN <script> may be blocked in Iran.
+QR_JS_NAME = "sub-qr.js"
+QR_JS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qrcode.js")
+# Happ download links. GitHub's releases/latest/download/<asset> always resolves to the
+# newest release; iOS ships only through the App Store.
+HAPP_APPS = [
+    ("اندروید", "https://github.com/Happ-proxy/happ-android/releases/latest/download/Happ.apk"),
+    ("iOS", "https://apps.apple.com/us/app/happ-proxy-utility/id6504287215"),
+    ("ویندوز", "https://github.com/Happ-proxy/happ-desktop/releases/latest/download/setup-Happ.x64.exe"),
+    ("مک", "https://github.com/Happ-proxy/happ-desktop/releases/latest/download/Happ.macOS.universal.dmg"),
+]
+HAPP_ADD = "happ://add/"   # Happ deep link: happ://add/<subscription url>
 GB = 1024 ** 3
 
 def user_info(name):
@@ -203,9 +216,26 @@ button.sec{background:var(--card)}
 .copy.ok{background:var(--ok);color:#04231e}
 .foot{color:var(--mut);font-size:12px;font-weight:700;text-align:center;margin-top:18px}
 #buf{position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;border:0;padding:0}
+.quick{background:var(--card);border:3px solid var(--ink);box-shadow:5px 5px 0 var(--ink);padding:14px;margin:0 0 16px}
+.quick h2{font-size:15px;font-weight:800;margin:0 0 10px}
+.btn{display:block;text-align:center;text-decoration:none;font-weight:800;font-size:14px;border:3px solid var(--ink);padding:12px 10px;background:var(--accent);color:#111111;box-shadow:3px 3px 0 var(--ink)}
+.btn:active{transform:translate(3px,3px);box-shadow:0 0 0 var(--ink)}
+.apps{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:10px}
+.apps a{display:block;text-align:center;text-decoration:none;font-weight:800;font-size:12.5px;color:var(--ink);background:var(--card);border:2px solid var(--ink);box-shadow:2px 2px 0 var(--ink);padding:9px 4px}
+.qr{display:flex;justify-content:center;margin-top:12px}
+.qr svg{width:210px;height:210px;background:#fff;border:3px solid var(--ink);padding:6px}
+.hint2{font-size:12px;color:var(--mut);font-weight:700;margin:8px 2px 0;text-align:center}
 </style></head><body><div class="wrap">
 <div class="phead"><h1>📋 کانفیگ‌ها</h1><button id="themebtn" type="button" class="tbtn" onclick="toggleTheme()" aria-label="تغییر تم" title="تغییر تم">🌙</button></div>
 %STATS%
+<div class="quick">
+<h2>⚡ اتصال سریع با Happ</h2>
+<a class="btn" id="happadd" href="#">➕ افزودن خودکار به Happ</a>
+<div class="apps">%APPS%</div>
+<p class="hint2">اول اپ Happ را نصب کن، بعد «افزودن خودکار» را بزن.</p>
+<div class="qr" id="qr"></div>
+<p class="hint2">یا این QR را با Happ / v2rayNG روی دستگاه دیگر اسکن کن.</p>
+</div>
 <p class="sub">%COUNT% کانفیگ — تکی کپی کن یا «کپی همه».</p>
 <div class="bar">
 <button onclick="copyAll(this)">📑 کپی همه</button>
@@ -215,8 +245,12 @@ button.sec{background:var(--card)}
 <p class="foot">برای اتصال خودکار، «لینک ساب» را در اپ به‌عنوان Subscription اضافه کن.</p>
 </div>
 <textarea id="buf" readonly></textarea>
+<script src="/sub-qr.js"></script>
 <script>
 var CFG=%CONFIGS%;
+var SUBURL=location.origin+location.pathname;
+(function(){var a=document.getElementById('happadd');if(a)a.href='%HAPPADD%'+SUBURL;
+try{var q=qrcode(0,'M');q.addData(SUBURL);q.make();document.getElementById('qr').innerHTML=q.createSvgTag({cellSize:5,margin:2,scalable:true});}catch(e){}})();
 function flash(b){if(!b)return;var o=b.textContent;b.textContent='✓ شد';b.classList.add('ok');setTimeout(function(){b.textContent=o;b.classList.remove('ok')},1100);}
 function fb(t,b){var x=document.getElementById('buf');x.value=t;x.focus();x.setSelectionRange(0,t.length);try{document.execCommand('copy')}catch(e){}window.getSelection&&window.getSelection().removeAllRanges();flash(b);}
 function cp(t,b){if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(t).then(function(){flash(b)},function(){fb(t,b)});}else{fb(t,b);}}
@@ -252,6 +286,9 @@ def build_response(name, b64, info, ua, wants_raw):
     page = (PAGE.replace("%STATS%", bars_html(info))
                 .replace("%ROWS%", rows)
                 .replace("%COUNT%", str(len(links)))
+                .replace("%APPS%", "".join('<a href="%s" target="_blank" rel="noopener">%s</a>' % (html.escape(u), html.escape(n))
+                                           for n, u in HAPP_APPS))
+                .replace("%HAPPADD%", HAPP_ADD)
                 .replace("%CONFIGS%", json.dumps(links).replace("</", "<\\/")))
     return 200, "text/html; charset=utf-8", page.encode("utf-8"), {}
 
@@ -266,6 +303,10 @@ class H(BaseHTTPRequestHandler):
 
     def do_GET(self):
         u = urllib.parse.urlparse(self.path); name = u.path.lstrip("/")
+        if name == QR_JS_NAME:
+            try: body = open(QR_JS_PATH, "rb").read()
+            except Exception: self._send(404, "text/plain", b"not found"); return
+            self._send(200, "application/javascript; charset=utf-8", body, {"Cache-Control": "public, max-age=604800"}); return
         if not SAFE.match(name): self._send(404, "text/plain", b"not found"); return
         fp = os.path.join(ROOT, name)
         if not os.path.isfile(fp): self._send(404, "text/plain", b"not found"); return

@@ -33,6 +33,26 @@ DB_PATH     = ENV.get("DB", "/opt/dpbot/dpbot.db")
 POLL        = int(ENV.get("POLL_SECONDS", "30"))
 ADMIN_PORT  = int(ENV.get("ADMIN_PORT", "8091"))
 ENDPOINTS   = json.loads(ENV.get("ENDPOINTS", "[]"))
+# Optional direct (non-Cloudflare) VLESS-REALITY endpoint, one per server. JSON with:
+#   port  = inbound port xray listens on (0.0.0.0) on this box
+#   addr / ext_port = the public IP:port clients dial (differs from port behind NAT)
+#   pbk / priv / sid / sni / fp / flow = REALITY keys + camouflage target
+# The inbound itself must already exist in xray (added once by the provisioning step).
+# It shows up in /a/config like any endpoint; its default count is 0 = no REALITY links.
+def _reality_endpoint(raw):
+    try:
+        r = json.loads(raw) if raw else None
+    except Exception:
+        return None
+    if not isinstance(r, dict) or not all(r.get(k) for k in ("port", "addr", "pbk", "priv", "sni")):
+        return None
+    return {"tag": r.get("tag", "vless-reality"), "proto": "vless", "net": "tcp", "port": int(r["port"]),
+            "label": "REALITY", "reality": {"addr": r["addr"], "port": int(r.get("ext_port") or r["port"]),
+            "pbk": r["pbk"], "priv": r["priv"], "sni": r["sni"], "sid": r.get("sid", ""),
+            "fp": r.get("fp", "chrome"), "flow": r.get("flow", "xtls-rprx-vision")}}
+_REALITY_EP = _reality_endpoint(ENV.get("REALITY", ""))
+if _REALITY_EP and not any(ep.get("tag") == _REALITY_EP["tag"] for ep in ENDPOINTS):
+    ENDPOINTS.append(_REALITY_EP)
 # Xray "finalmask" fragment added to TLS vless/trojan links as the `fm=` share-link
 # param (read by v2rayNG/v2rayN). Splitting the first 1-3 writes hides the SNI from DPI
 # that filters our domain; tlshello-only fragmenting does NOT get past it. vmess links
@@ -262,9 +282,9 @@ def _ws_link(ep, secret, ip, port, sec):
         return "vmess://" + base64.b64encode(json.dumps(j).encode()).decode()
     return ""
 
-def _reality_link(ep, secret):
+def _reality_link(ep, secret, n=0):
     r = ep["reality"]
-    nm = urllib.parse.quote("REALITY · مستقیم")
+    nm = urllib.parse.quote("REALITY · مستقیم" + (" %d" % (n + 1) if n else ""))
     flow = ("&flow=%s" % r["flow"]) if r.get("flow") else ""
     return ("vless://%s@%s:%s?encryption=none&security=reality&pbk=%s&sni=%s&fp=%s&sid=%s&type=tcp%s#%s"
             % (secret, r["addr"], r["port"], r["pbk"], r["sni"], r["fp"], r["sid"], flow, nm))
@@ -591,6 +611,10 @@ def write_sub(token, secret, label):
     ips = get_ips() or DEFAULT_IPS; recipe = get_recipe(); links = []; gi = 0
     for ep in ENDPOINTS:
         r = recipe.get(ep["tag"], {"enabled": True, "count": len(_ep_slots(ep))})
+        if "reality" in ep:      # direct link: no ports/clean IPs to cycle, just `count` copies
+            if r.get("enabled"):
+                links += [_reality_link(ep, secret, k) for k in range(int(r.get("count", 0)))]
+            continue
         slots = _ep_slots(ep)
         if not r.get("enabled") or not slots:
             continue
@@ -831,8 +855,11 @@ def _grid(items, cb):
     if r: rows.append(r)
     return rows
 
+TEST_LINK = (500 / 1024, 1, "Test")   # one-tap trial link: 500MB, 1 day
+
 def vol_kb():
-    rows = _grid(VOLS, "vol")
+    rows = [[{"text": "🧪 کانفیگ تست (۵۰۰ مگ · ۱ روز)", "callback_data": "testlink"}]]
+    rows += _grid(VOLS, "vol")
     rows.append([{"text": "♾ نامحدود", "callback_data": "vol:0"}, {"text": "✏️ دلخواه", "callback_data": "vol:custom"}])
     rows.append([{"text": "بازگشت", "callback_data": "menu"}]); return rows
 
@@ -849,9 +876,7 @@ def list_kb():
 
 def result_text(token):
     c = db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone(); c.close()
-    return ("✅ <b>لینک ساخته شد</b>\n\n🏷 نام: <code>%s</code>\n📦 حجم: %s\n⏳ مدت: %s\n"
-            "🧩 شامل: VLESS/VMess/Trojan (با و بدون TLS) + VLESS-XHTTP\n\n🔗 لینک ساب:\n<code>%s</code>\n\n"
-            "(در مرورگر باز کنی، صفحه‌ی کپی + نوار حجم/زمان می‌آید)"
+    return ("✅ <b>لینک «%s» ساخته شد</b>\n📦 %s · ⏳ %s\n\n🔗 <code>%s</code>"
             % (html.escape(u["label"]), human_limit(u["limit_bytes"]), human_expiry(u["expiry_ts"]), sub_url(token)))
 
 def detail_text(u):
@@ -930,6 +955,12 @@ def route_cb(chat, mid, data, cbid):
             st["stage"] = "dur_custom"; pending[chat] = st; answer(cbid); edit(chat, mid, "تعداد <b>روز</b> را بفرست (مثلاً 45):"); return
         st["dur_days"] = int(d); st["stage"] = "name"; pending[chat] = st; answer(cbid)
         edit(chat, mid, "🏷 یک نام برای این لینک بفرست (مثلاً اسم مشتری):", [[{"text": "⏭ بدون نام", "callback_data": "noname"}]])
+        return
+    if data == "testlink":
+        pending.pop(chat, None); answer(cbid, "در حال ساخت…")
+        token = create_user(*TEST_LINK)
+        if token: edit(chat, mid, result_text(token), [[{"text": "بازگشت به منو", "callback_data": "menu"}]])
+        else:     edit(chat, mid, "❌ خطا در ساخت کاربر.", main_menu_kb())
         return
     if data == "noname":
         st = pending.get(chat, {}); pending.pop(chat, None); answer(cbid, "در حال ساخت…")
@@ -1452,10 +1483,11 @@ def render_config(csrf):
         tag = ep["tag"]; r = recipe.get(tag, {"enabled": True, "count": 0}); nports = len(_ep_slots(ep))
         rows += ("<div class=eprow>"
                  "<label class=eplabel><input type=checkbox name='en_%s'%s>"
-                 "<span><b>%s</b><span class=eptag>%s · %d پورت</span></span></label>"
+                 "<span><b>%s</b><span class=eptag>%s · %s</span></span></label>"
                  "<input type=number name='cnt_%s' value='%d' min=0 aria-label='تعداد %s'>"
                  "</div>") % (tag, (" checked" if r["enabled"] else ""), html.escape(ep.get("label", tag)),
-                              html.escape(tag), nports, tag, r["count"], html.escape(tag))
+                              html.escape(tag), ("مستقیم روی IP سرور، بدون کلادفلر" if "reality" in ep else "%d پورت" % nports),
+                              tag, r["count"], html.escape(tag))
     body = ("<form method=post action='/a/config' class=grid>"
             "<h2>نوع و تعداد کانفیگ‌ها</h2>"
             "<p class=hint>تعداد سقفی ندارد؛ بیشتر از تعداد پورت، روی آی‌پی‌های تمیز پخش می‌شود.</p>%s"

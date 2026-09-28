@@ -67,9 +67,14 @@ ssh -p 49531 -o "ProxyCommand=nc -x 127.0.0.1:10808 -X 5 %h %p" root@23.94.29.30
 
 ## 4. Golden rules / constraints (do NOT relearn these the hard way)
 
-- **xray-core only — no REALITY.** REALITY was tried and fully removed: it does its
-  own TLS forgery and CANNOT traverse Cloudflare, and field-tested broken on the
-  target ISP. Don't re-add it. Remnant strings, if any, are dead.
+- **REALITY is optional and OFF by default.** It cannot traverse Cloudflare, so it is a
+  *direct* link to the server IP (exposes that IP). A box gets it only when `REALITY=`
+  (JSON: `port`, `addr`, `ext_port`, `pbk`, `priv`, `sid`, `sni`) is set in `bot.env`
+  AND the matching `vless-reality` inbound (listen `0.0.0.0`) exists in xray — add it
+  to the running xray with `xray api adi` (no restart) and to `config.json` so it
+  survives restarts, then run `resync_all()` so existing users get added to it. It then
+  appears in `/a/config` with count **0**; the admin chooses how many links to emit.
+  NAT boxes (cdn, cdn4, cdn5) can only use a port the provider forwards.
 - **Never leave stray `xray run -config /tmp/...` test processes on the server.**
   On a 512MB box they cause OOM, which kills `sshd`'s ability to fork → the banner
   timeout above. A past outage was exactly this. Always `kill` test procs in a
@@ -121,6 +126,13 @@ ssh -p 49531 -o "ProxyCommand=nc -x 127.0.0.1:10808 -X 5 %h %p" root@23.94.29.30
   that is `/opt/mohajer/xray.json`, NOT the default (which belongs to another stack).
   The page is AJAX: every action posts `ajax=1` and gets JSON back (`ok/msg/list`), so
   nothing reloads; the same routes still answer with redirects when JS is off.
+- **Subscriber page extras:** `subserver.py` shows a quick-connect card: a Happ deep-link
+  button (`happ://add/<sub url>`), Happ downloads (`HAPP_APPS`, GitHub
+  `releases/latest/download/...` so they never go stale; iOS = App Store) and a QR of the
+  sub URL. The QR encoder is vendored (`sub/qrcode.js`, qrcode-generator 2.0.4, MIT) and
+  served at `/sub-qr.js` — keep it next to `subserver.py` when deploying (the tunnel only
+  routes `/sub-*` to the sub server; a CDN script tag may be blocked in Iran).
+- **Bot "new link" menu** starts with a one-tap test link (`TEST_LINK`: 500MB, 1 day, "Test").
 - **Light/dark theme:** both the admin panel (`ADMIN_CSS`/`_page`) and the subscriber
   page (`subserver.py` `PAGE`) ship an icon-only toggle (🌙/☀️) at the top. Themes are
   driven by `data-theme` on `<html>`; an early head script sets it from `localStorage`
