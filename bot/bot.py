@@ -33,6 +33,13 @@ DB_PATH     = ENV.get("DB", "/opt/dpbot/dpbot.db")
 POLL        = int(ENV.get("POLL_SECONDS", "30"))
 ADMIN_PORT  = int(ENV.get("ADMIN_PORT", "8091"))
 ENDPOINTS   = json.loads(ENV.get("ENDPOINTS", "[]"))
+# Xray "finalmask" fragment added to TLS vless/trojan links as the `fm=` share-link
+# param (read by v2rayNG/v2rayN). Splitting the first 1-3 writes hides the SNI from DPI
+# that filters our domain; tlshello-only fragmenting does NOT get past it. vmess links
+# can't carry it and noTLS doesn't benefit. Empty string disables it.
+FRAGMENT_FM = ENV.get("FRAGMENT_FM", json.dumps(
+    {"tcp": [{"type": "fragment", "settings": {"packets": "1-3", "length": "100-200", "delay": "10-20"}}]},
+    separators=(",", ":")))
 DEFAULT_IPS = [x.strip() for x in ENV.get("IPS", "104.16.96.1,104.21.96.1,104.19.96.1").split(",") if x.strip()]
 GB = 1024 ** 3
 IRAN_OFFSET = 3 * 3600 + 30 * 60  # UTC+03:30; Iran has no DST since 2022
@@ -240,6 +247,9 @@ def _ws_link(ep, secret, ip, port, sec):
     base = ep["label"] if tls_on else (ep["label"].replace("-WS", "").replace("-XHTTP", "") + "-noTLS")
     nm = urllib.parse.quote("%s · %s" % (base, ip))
     sni = ("&sni=%s" % H) if tls_on else ""
+    if tls_on and FRAGMENT_FM:
+        alpn = "http/1.1" if net == "ws" else "h2,http/1.1"  # CF only upgrades WebSocket over HTTP/1.1
+        sni += "&fp=chrome&alpn=%s&fm=%s" % (urllib.parse.quote(alpn, safe=""), urllib.parse.quote(FRAGMENT_FM, safe=""))
     secp = "tls" if tls_on else "none"
     if proto == "vless":
         extra = "&mode=auto" if net == "xhttp" else ""
