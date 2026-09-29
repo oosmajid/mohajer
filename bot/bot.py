@@ -2077,7 +2077,7 @@ a{color:var(--ink);text-decoration:none}
 .metric .v{font-size:18px;font-weight:800;margin-top:3px}
 .pills{display:flex;gap:8px;margin-top:14px}
 .pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:700;color:var(--ink);background:var(--card);border:2px solid var(--ink);padding:4px 10px}
-.linkbadge{display:inline-block;font-size:10px;font-weight:800;border:1px solid var(--ink);background:var(--accent);color:#111;padding:1px 5px;margin-inline-start:6px;vertical-align:middle}
+.linkbadge{align-self:flex-start;display:inline-flex;width:max-content;max-width:100%;white-space:nowrap;font-size:10px;font-weight:800;line-height:1.2;border:1px solid var(--ink);border-radius:999px;background:var(--accent);color:#111;padding:2px 6px;margin-top:2px}
 .d{width:9px;height:9px;border:2px solid var(--ink)}
 .d.ok{background:var(--ok)}
 .d.off{background:var(--paper)}
@@ -2431,7 +2431,7 @@ def _render_link_outbounds(obs, editable):
                         "<label class=hint for='ob_dom_%d'>دامنه‌ها؛ هر خط یکی. خالی = خروجی همهٔ ترافیک</label>"
                         "<textarea id='ob_dom_%d' name='ob_dom_%d' rows=3 dir=ltr>%s</textarea>"
                         "<label class=row><input type=checkbox name='ob_delete_%d'>حذف این خروجی</label>"
-                        "</div></div>" % (i, i, i, tag, i, i, link, i, i, domains, i))
+                        "</div></div>" % (i, i, i, tag, i, i, i, link, i, i, i, domains, i))
         else:
             summary = "همهٔ ترافیک" if not ob.get("domains") else "، ".join(ob["domains"])
             rows.append("<div class=eprow style='display:block'><b>%s</b>"

@@ -105,6 +105,17 @@ class LinkSettingsTest(unittest.TestCase):
         bot.set_outbounds([])
         self.assertIn("t1", bot._custom_outbound_sets())
 
+    def test_custom_page_renders_copied_outbound(self):
+        bot.set_outbounds([{"tag": "clean", "link": "socks://1.2.3.4:1080",
+                            "domains": ["example.com"]}])
+        self.assertEqual(self.post({"action": "customize"})[0], 302)
+        status, _, page = bot.route_admin(
+            "GET", "/a/user-config", {"token": ["t1"]}, self.cookie, b"", now=1001)
+        self.assertEqual(status, 200)
+        self.assertIn(b"ob_tag_0", page)
+        self.assertIn(b"ob_link_0", page)
+        self.assertIn(b"ob_dom_0", page)
+
     def test_reality_label_is_saved(self):
         bot.ENDPOINTS = [{"tag": "reality", "proto": "vless", "label": "REALITY",
                           "reality": {"port": 443, "addr": "example.com", "pbk": "key",
