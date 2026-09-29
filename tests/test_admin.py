@@ -139,12 +139,17 @@ class TestRouteGet(TestStats):  # reuse the seeded DB from TestStats.setUp
 class TestRoutePost(TestStats):
     def setUp(self):
         super().setUp()
+        self._xray_methods = (bot.xr_add_user, bot.xr_remove_user, bot.SUB_DIR)
         bot.xr_add_user = lambda *a, **k: True       # stub xray
-        bot.xr_remove_user = lambda *a, **k: None
+        bot.xr_remove_user = lambda *a, **k: True
         bot.SUB_DIR = tempfile.mkdtemp()             # write_sub target
         bot._sessions.clear()
         self.sid, self.csrf = bot.new_session(now=1000)
         self.cookie = "mj_sess=%s" % self.sid
+
+    def tearDown(self):
+        bot.xr_add_user, bot.xr_remove_user, bot.SUB_DIR = self._xray_methods
+        super().tearDown()
 
     def _post(self, path, fields):
         body = urllib.parse.urlencode(fields).encode()
@@ -207,8 +212,11 @@ class TestRoutePost(TestStats):
 class TestConfigPage(TestStats):
     def setUp(self):
         super().setUp()
+        self._xray_methods = (bot.xr_add_user, bot.xr_remove_user, bot.SUB_DIR)
         bot.xr_add_user = lambda *a, **k: True
         bot.xr_remove_user = lambda *a, **k: None
+        self._reconcile = bot.xr_reconcile_all_users
+        bot.xr_reconcile_all_users = lambda *a, **k: True
         bot.SUB_DIR = tempfile.mkdtemp()
         self._eps, self._dom = bot.ENDPOINTS, bot.DOMAIN
         bot.ENDPOINTS = [
@@ -222,7 +230,9 @@ class TestConfigPage(TestStats):
         self.cookie = "mj_sess=%s" % self.sid
 
     def tearDown(self):
+        bot.xr_reconcile_all_users = self._reconcile
         bot.ENDPOINTS, bot.DOMAIN = self._eps, self._dom
+        bot.xr_add_user, bot.xr_remove_user, bot.SUB_DIR = self._xray_methods
         super().tearDown()
 
     def _post(self, fields):

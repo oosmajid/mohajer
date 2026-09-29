@@ -3,7 +3,7 @@
 # VLESS/VMess/Trojan over WebSocket (TLS + no-TLS, fronted by Cloudflare) + VLESS-XHTTP.
 # Per-user quota + expiry are enforced live via `xray api adu/rmu/statsquery` (no xray restart).
 # All config comes from bot.env (see config/bot.env.example). Single-file, runs under systemd.
-import os, re, sys, json, time, html, base64, socket, sqlite3, secrets, threading, subprocess
+import os, re, sys, json, time, html, base64, socket, sqlite3, secrets, threading, subprocess, math, tempfile
 import uuid as uuidlib
 import urllib.request, urllib.parse, ssl
 import http.cookies
@@ -89,7 +89,10 @@ def init_db():
         limit_bytes INTEGER, expiry_ts INTEGER, created_ts INTEGER,
         base_bytes INTEGER DEFAULT 0, last_raw INTEGER DEFAULT 0, used_bytes INTEGER DEFAULT 0,
         usage_reset_bytes INTEGER DEFAULT 0,
-        disabled_ts INTEGER DEFAULT 0, frozen INTEGER DEFAULT 0)""")
+        disabled_ts INTEGER DEFAULT 0, frozen INTEGER DEFAULT 0,
+        config_override TEXT, credential_mode TEXT DEFAULT 'legacy', active_slots TEXT,
+        rebase_floor INTEGER, usage_anchor INTEGER,
+        auth_pending INTEGER DEFAULT 0, pending_delete INTEGER DEFAULT 0)""")
     c.execute("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)")
     c.execute("""CREATE TABLE IF NOT EXISTS usage_daily(
         token TEXT, day TEXT, start_used INTEGER, end_used INTEGER,
@@ -101,6 +104,32 @@ def init_db():
         c.execute("ALTER TABLE users ADD COLUMN frozen INTEGER DEFAULT 0")
     if "usage_reset_bytes" not in cols:  # lifetime usage at the last admin-visible reset
         c.execute("ALTER TABLE users ADD COLUMN usage_reset_bytes INTEGER DEFAULT 0")
+    if "config_override" not in cols:  # NULL means this link follows the global settings
+        c.execute("ALTER TABLE users ADD COLUMN config_override TEXT")
+    if "credential_mode" not in cols:
+        c.execute("ALTER TABLE users ADD COLUMN credential_mode TEXT DEFAULT 'legacy'")
+    if "active_slots" not in cols:
+        c.execute("ALTER TABLE users ADD COLUMN active_slots TEXT")
+    if "rebase_floor" not in cols:
+        c.execute("ALTER TABLE users ADD COLUMN rebase_floor INTEGER")
+    if "usage_anchor" not in cols:
+        c.execute("ALTER TABLE users ADD COLUMN usage_anchor INTEGER")
+    if "auth_pending" not in cols:
+        c.execute("ALTER TABLE users ADD COLUMN auth_pending INTEGER DEFAULT 0")
+    if "pending_delete" not in cols:
+        c.execute("ALTER TABLE users ADD COLUMN pending_delete INTEGER DEFAULT 0")
+    c.execute("""CREATE TABLE IF NOT EXISTS slot_credentials(
+        token TEXT NOT NULL, tag TEXT NOT NULL, security TEXT NOT NULL, external_port INTEGER NOT NULL,
+        email TEXT NOT NULL UNIQUE, secret TEXT NOT NULL,
+        PRIMARY KEY(token, tag, security, external_port))""")
+    c.execute("""CREATE TABLE IF NOT EXISTS slot_mode_tags(
+        token TEXT NOT NULL, tag TEXT NOT NULL, PRIMARY KEY(token,tag))""")
+    c.execute("""CREATE TABLE IF NOT EXISTS legacy_emails(
+        token TEXT NOT NULL, tag TEXT NOT NULL, email TEXT NOT NULL UNIQUE,
+        PRIMARY KEY(token,tag))""")
+    c.execute("""CREATE TABLE IF NOT EXISTS usage_ledger(
+        email TEXT PRIMARY KEY, token TEXT NOT NULL,
+        last_raw INTEGER NOT NULL DEFAULT 0, total_bytes INTEGER NOT NULL DEFAULT 0)""")
     # retired_bytes = lifetime traffic of already-deleted users, so deleting a user never
     # drops the dashboard's "total". Backfill ONCE from any daily rows left by past deletes
     # (their last recorded end_used ≈ their lifetime at deletion) so the count stays honest.
@@ -110,6 +139,9 @@ def init_db():
             "WHERE token NOT IN (SELECT token FROM users) GROUP BY token)").fetchone()["s"]
         c.execute("INSERT INTO meta(k,v) VALUES('retired_bytes',?)", (str(int(orphan or 0)),))
     c.commit(); c.close()
+    # Remember the pre-edit slots for legacy links. A later settings change can then
+    # detect a removed port even though the old credential has no per-port identity.
+    _snapshot_missing_active_slots()
 
 def meta_get(k, d=None):
     c = db(); r = c.execute("SELECT v FROM meta WHERE k=?", (k,)).fetchone(); c.close()
@@ -146,6 +178,24 @@ def answer(cb_id, text=None):
 # ---------------- xray api (multi-endpoint) ----------------
 def ep_email(token, tag): return "u_%s.%s" % (token, tag)
 
+def legacy_email(token, tag):
+    c = db(); row = c.execute("SELECT email FROM legacy_emails WHERE token=? AND tag=?", (token, tag)).fetchone(); c.close()
+    return row["email"] if row else ep_email(token, tag)
+
+def _rotate_legacy_emails(token):
+    """Use new Xray stats identities after a freeze or quota renewal."""
+    c = db(); u = c.execute("SELECT credential_mode,active_slots FROM users WHERE token=?", (token,)).fetchone(); c.close()
+    if not u or u["credential_mode"] == "slots": return
+    slots = _decode_slots(u["active_slots"]) if u["active_slots"] is not None else active_slot_keys(token)
+    tags = {tag for tag, _, _ in slots} - slot_mode_tags(token)
+    if not tags: return
+    c = db()
+    for tag in tags:
+        email = "%s.g%s" % (ep_email(token, tag), secrets.token_hex(5))
+        c.execute("INSERT INTO legacy_emails(token,tag,email) VALUES(?,?,?) "
+                  "ON CONFLICT(token,tag) DO UPDATE SET email=excluded.email", (token, tag, email))
+    c.commit(); c.close()
+
 def _adu(ep, secret, email):
     if "reality" in ep:
         r = ep["reality"]
@@ -165,9 +215,10 @@ def _adu(ep, secret, email):
         elif proto == "vmess": settings = {"clients": [{"id": secret, "email": email, "level": 0}]}
         else:                  settings = {"clients": [{"id": secret, "email": email, "level": 0}], "decryption": "none"}
         ib = {"tag": ep["tag"], "listen": "127.0.0.1", "port": ep["port"], "protocol": proto, "settings": settings, "streamSettings": stream}
-    f = "/tmp/dpbot_adu_%s.json" % email.replace("/", "_")
-    open(f, "w").write(json.dumps({"inbounds": [ib]}))
+    fd, f = tempfile.mkstemp(prefix="dpbot_adu_", suffix=".json")
     try:
+        with os.fdopen(fd, "w") as out:
+            json.dump({"inbounds": [ib]}, out)
         r = subprocess.run([XRAY_BIN, "api", "adu", "--server=%s" % XRAY_API, f], capture_output=True, text=True, timeout=15)
         out = (r.stdout + r.stderr).lower()
     except Exception as e:
@@ -179,17 +230,79 @@ def _adu(ep, secret, email):
 
 def xr_add_user(token, secret):
     ok = True
+    slots = active_slot_keys(token)
+    converted = slot_mode_tags(token)
+    mode = credential_mode(token)
     for ep in ENDPOINTS:
-        if not _adu(ep, secret, ep_email(token, ep["tag"])): ok = False
+        ep_slots = sorted(s for s in slots if s[0] == ep["tag"])
+        if not ep_slots: continue
+        if mode == "slots" or ep["tag"] in converted:
+            for tag, security, port in ep_slots:
+                cred = ensure_slot_credential(token, ep, security, port)
+                if not _adu(ep, cred["secret"], cred["email"]): ok = False
+        elif not _adu(ep, secret, legacy_email(token, ep["tag"])):
+            ok = False
     return ok
 
-def xr_remove_user(token):
-    for ep in ENDPOINTS:
-        try:
-            subprocess.run([XRAY_BIN, "api", "rmu", "--server=%s" % XRAY_API, "-tag=%s" % ep["tag"], ep_email(token, ep["tag"])],
+def _rmu_email(tag, email):
+    try:
+        r = subprocess.run([XRAY_BIN, "api", "rmu", "--server=%s" % XRAY_API, "-tag=%s" % tag, email],
                            capture_output=True, text=True, timeout=15)
-        except Exception as e:
-            print("rmu err", e, flush=True)
+        # Removing an already-absent user is idempotent. Xray versions differ in how
+        # they report it; an API failure is still surfaced to the caller.
+        out = (r.stdout + r.stderr).lower()
+        return r.returncode == 0 or "not found" in out or "no such user" in out
+    except Exception as e:
+        print("rmu err", e, flush=True)
+        return False
+
+def _rmu(token, tag):
+    return _rmu_email(tag, legacy_email(token, tag))
+
+def xr_remove_user(token):
+    # Keep credentials in SQLite for renewal; delete_user forgets them separately.
+    c = db()
+    creds = c.execute("SELECT tag,email FROM slot_credentials WHERE token=?", (token,)).fetchall()
+    user = c.execute("SELECT credential_mode,active_slots FROM users WHERE token=?", (token,)).fetchone()
+    c.close()
+    converted = slot_mode_tags(token)
+    old_slots = (_decode_slots(user["active_slots"]) if user and user["active_slots"] is not None
+                 else active_slot_keys(token))
+    legacy_tags = ({tag for tag, _, _ in old_slots} - converted
+                   if user and user["credential_mode"] != "slots" else set())
+    if legacy_tags: _enable_usage_ledger(token)
+    refresh_usage(token)
+    ok = True
+    for cred in creds:
+        if not _rmu_email(cred["tag"], cred["email"]): ok = False
+    for ep in ENDPOINTS:
+        if ep["tag"] in legacy_tags and not _rmu(token, ep["tag"]): ok = False
+    refresh_usage(token)
+    return ok
+
+def _emergency_clear_dynamic_users():
+    """Restart the existing Xray service when API revocation could not finish."""
+    now = int(time.time())
+    if now - int(meta_get("last_emergency_restart_ts", "0") or 0) < 120:
+        return False
+    meta_set("last_emergency_restart_ts", str(now))
+    try:
+        result = subprocess.run(["systemctl", "restart", XRAY_SERVICE],
+                                capture_output=True, text=True, timeout=30)
+    except Exception as exc:
+        print("emergency xray restart failed:", exc, flush=True)
+        return False
+    if result.returncode != 0:
+        print("emergency xray restart failed:", (result.stderr or result.stdout)[-400:], flush=True)
+        return False
+    # The restarted process has no dynamic users. Restore only eligible links;
+    # pending delete, frozen, and disabled links are excluded by resync_all.
+    try:
+        resync_all()
+    except Exception as exc:
+        meta_set("membership_sync_pending", "1")
+        print("emergency xray resync pending:", exc, flush=True)
+    return True
 
 # ---- online presence + force-disconnect ----
 # xray's rmu blocks NEW auth but never tears down an already-established session; over
@@ -211,13 +324,33 @@ def xr_online_map():
     for s in (data.get("users") or []):        # each entry: "user>>>u_<token>.<tag>>>>online"
         parts = s.split(">>>")
         if len(parts) >= 2 and parts[1].startswith("u_") and "." in parts[1]:
-            tok, tag = parts[1][2:].split(".", 1)
-            m.setdefault(tok, set()).add(tag)
+            tok, rest = parts[1][2:].split(".", 1)
+            # New per-slot emails append .tls443.<generation> (or .none80...).
+            # Map them back to their provisioned inbound tag for socket cutoff.
+            matched = False
+            for ep in sorted(ENDPOINTS, key=lambda item: len(item["tag"]), reverse=True):
+                tag = ep["tag"]
+                if rest == tag or rest.startswith(tag + "."):
+                    m.setdefault(tok, set()).add(tag)
+                    matched = True
+                    break
+            if not matched and "." not in rest:
+                m.setdefault(tok, set()).add(rest)
     return m
 
 def online_tags_of(token):
     m = xr_online_map()
     return None if m is None else m.get(token, set())
+
+def tags_to_cut_for_user(token):
+    # Online presence is best effort: some Xray versions omit loopback-origin
+    # cloudflared sockets. Use the subscribed inbound tags as the safe fallback.
+    online = online_tags_of(token)
+    if online: return online
+    c = db(); u = c.execute("SELECT active_slots FROM users WHERE token=?", (token,)).fetchone(); c.close()
+    if u and u["active_slots"] is not None:
+        return {tag for tag, _, _ in _decode_slots(u["active_slots"])}
+    return {tag for tag, _, _ in active_slot_keys(token)}
 
 def ports_to_kick(online_tags):
     # None -> unknown, reset every endpoint (safe fallback); empty -> offline, nothing;
@@ -229,7 +362,12 @@ def ports_to_kick(online_tags):
 def force_disconnect(online_tags):
     for p in ports_to_kick(online_tags):
         try:
-            subprocess.run(["ss", "-K", "dst", "127.0.0.1", "dport", "=", ":%d" % p],
+            # Cloudflare transports arrive on loopback; direct REALITY connections
+            # instead have the inbound port as their local source port.
+            direct = any(ep["port"] == p and "reality" in ep for ep in ENDPOINTS)
+            selector = (["sport", "=", ":%d" % p] if direct else
+                        ["dst", "127.0.0.1", "dport", "=", ":%d" % p])
+            subprocess.run(["ss", "-K"] + selector,
                            capture_output=True, text=True, timeout=10)
         except Exception as e:
             print("kick err", e, flush=True)
@@ -237,18 +375,20 @@ def force_disconnect(online_tags):
 def xr_usage(token):
     # returns bytes, or None if the stats read FAILED. Never return 0 on failure:
     # a failed read must not be mistaken for "counter reset to 0" (see refresh_usage).
-    try:
-        r = subprocess.run([XRAY_BIN, "api", "statsquery", "--server=%s" % XRAY_API, "-pattern", "user>>>u_%s" % token],
-                           capture_output=True, text=True, timeout=15)
-    except Exception:
-        return None
-    if r.returncode != 0:
-        return None
+    result = _stable_statsquery("user>>>u_%s" % token, 15)
+    if result is None: return None
+    r, pid = result
     try:
         d = json.loads(r.stdout or "{}")
     except Exception:
         return None
-    return sum(int(s.get("value", 0)) for s in (d.get("stat") or []))
+    return UsageValue(sum(int(s.get("value", 0)) for s in (d.get("stat") or [])), pid)
+
+class UsageValue(int):
+    def __new__(cls, value, epoch_pid):
+        item = int.__new__(cls, value)
+        item.epoch_pid = epoch_pid
+        return item
 
 def xray_pid():
     try:
@@ -256,20 +396,75 @@ def xray_pid():
     except Exception:
         return ""
 
+def begin_xray_counter_epoch(pid=None):
+    """Bank old counters once when the running Xray process changes."""
+    pid = xray_pid() if pid is None else pid
+    if not pid or pid == "0": return False
+    c = db()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        row = c.execute("SELECT v FROM meta WHERE k='xray_pid'").fetchone()
+        prior = row["v"] if row else None
+        changed = bool(prior and prior != pid)
+        if changed:
+            c.execute("UPDATE users SET base_bytes=COALESCE(base_bytes,0)+COALESCE(last_raw,0),last_raw=0 "
+                      "WHERE usage_anchor IS NULL")
+            c.execute("UPDATE usage_ledger SET last_raw=0")
+        c.execute("INSERT INTO meta(k,v) VALUES('xray_pid',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (pid,))
+        c.commit()
+        return changed
+    finally:
+        c.close()
+
+def _stable_statsquery(pattern, timeout):
+    """Read stats from one Xray PID, banking a newly observed epoch first."""
+    for _ in range(3):
+        before = xray_pid()
+        begin_xray_counter_epoch(before)
+        try:
+            r = subprocess.run([XRAY_BIN, "api", "statsquery", "--server=%s" % XRAY_API,
+                                "-pattern", pattern], capture_output=True, text=True, timeout=timeout)
+        except Exception:
+            return None
+        after = xray_pid()
+        if before != after and after and after != "0":
+            begin_xray_counter_epoch(after)
+            continue
+        if before and before != "0" and (not after or after == "0"):
+            return None
+        if r.returncode != 0: return None
+        return r, after or before
+    return None
+
+def _stats_epoch_matches(c, pid):
+    if not pid or pid == "0": return True
+    row = c.execute("SELECT v FROM meta WHERE k='xray_pid'").fetchone()
+    return row is not None and row["v"] == pid
+
+def _stats_epoch_still_running(pid):
+    if not pid or pid == "0": return True
+    latest = xray_pid()
+    if latest == pid: return True
+    begin_xray_counter_epoch(latest)
+    return False
+
 # ---------------- sub links ----------------
 def sub_path(token): return os.path.join(SUB_DIR, "sub-u-%s" % token)
 def sub_url(token):  return "%s/sub-u-%s" % (SUB_BASE, token)
 
 def _ws_link(ep, secret, ip, port, sec):
-    proto, net, H = ep["proto"], ep["net"], DOMAIN
+    proto, net = ep["proto"], ep["net"]
+    H = ep.get("host") or DOMAIN
+    sni_host = ep.get("sni") or H
+    fragment_fm = ep.get("fragment_fm", FRAGMENT_FM)
     qp = urllib.parse.quote(ep["path"], safe="")
     tls_on = (sec == "tls")
     base = ep["label"] if tls_on else (ep["label"].replace("-WS", "").replace("-XHTTP", "") + "-noTLS")
     nm = urllib.parse.quote("%s · %s" % (base, ip))
-    sni = ("&sni=%s" % H) if tls_on else ""
-    if tls_on and FRAGMENT_FM:
+    sni = ("&sni=%s" % urllib.parse.quote(sni_host, safe="")) if tls_on else ""
+    if tls_on and fragment_fm:
         alpn = "http/1.1" if net == "ws" else "h2,http/1.1"  # CF only upgrades WebSocket over HTTP/1.1
-        sni += "&fp=chrome&alpn=%s&fm=%s" % (urllib.parse.quote(alpn, safe=""), urllib.parse.quote(FRAGMENT_FM, safe=""))
+        sni += "&fp=chrome&alpn=%s&fm=%s" % (urllib.parse.quote(alpn, safe=""), urllib.parse.quote(fragment_fm, safe=""))
     secp = "tls" if tls_on else "none"
     if proto == "vless":
         extra = "&mode=auto" if net == "xhttp" else ""
@@ -278,13 +473,13 @@ def _ws_link(ep, secret, ip, port, sec):
         return "trojan://%s@%s:%s?security=%s%s&type=%s&host=%s&path=%s#%s" % (secret, ip, port, secp, sni, net, H, qp, nm)
     if proto == "vmess":
         j = {"v": "2", "ps": "%s · %s" % (base, ip), "add": ip, "port": str(port), "id": secret, "aid": "0", "scy": "auto",
-             "net": net, "type": "none", "host": H, "path": ep["path"], "tls": ("tls" if tls_on else ""), "sni": (H if tls_on else "")}
+             "net": net, "type": "none", "host": H, "path": ep["path"], "tls": ("tls" if tls_on else ""), "sni": (sni_host if tls_on else "")}
         return "vmess://" + base64.b64encode(json.dumps(j).encode()).decode()
     return ""
 
 def _reality_link(ep, secret, n=0):
     r = ep["reality"]
-    nm = urllib.parse.quote("REALITY · مستقیم" + (" %d" % (n + 1) if n else ""))
+    nm = urllib.parse.quote(ep.get("label", "REALITY") + " · مستقیم" + (" %d" % (n + 1) if n else ""))
     flow = ("&flow=%s" % r["flow"]) if r.get("flow") else ""
     return ("vless://%s@%s:%s?encryption=none&security=reality&pbk=%s&sni=%s&fp=%s&sid=%s&type=tcp%s#%s"
             % (secret, r["addr"], r["port"], r["pbk"], r["sni"], r["fp"], r["sid"], flow, nm))
@@ -325,6 +520,301 @@ def get_recipe():
 def set_recipe(recipe):
     meta_set("config_recipe", json.dumps(recipe))
 
+def approved_hosts():
+    """Host/SNI pairs provisioned in Cloudflare for this server."""
+    pairs = [{"host": DOMAIN, "sni": DOMAIN}]
+    try:
+        extra = json.loads(ENV.get("HOST_PROFILES", "[]"))
+    except (TypeError, ValueError):
+        extra = []
+    for item in extra if isinstance(extra, list) else []:
+        if not isinstance(item, dict): continue
+        host, sni = str(item.get("host", "")).strip(), str(item.get("sni", "")).strip()
+        if not all(re.fullmatch(r"[A-Za-z0-9.-]{1,253}", name) for name in (host, sni)): continue
+        pair = {"host": host, "sni": sni}
+        if pair not in pairs: pairs.append(pair)
+    return pairs
+
+def _endpoint_defaults(ep):
+    return {"tls_ports": list(ep.get("tls_ports", [])),
+            "notls_ports": list(ep.get("notls_ports", [])),
+            "label": ep.get("label", ep["tag"]), "path": ep.get("path", ""),
+            "host": DOMAIN, "sni": DOMAIN,
+            "fragment_fm": "" if "reality" in ep or ep.get("proto") == "vmess" else FRAGMENT_FM}
+
+def _normal_endpoint_settings(stored):
+    result = {}
+    stored = stored if isinstance(stored, dict) else {}
+    hosts = approved_hosts()
+    for ep in ENDPOINTS:
+        tag = ep["tag"]; base = _endpoint_defaults(ep)
+        raw = stored.get(tag, {})
+        if not isinstance(raw, dict): raw = {}
+        for key in ("tls_ports", "notls_ports"):
+            allowed = base[key]
+            if isinstance(raw.get(key), list):
+                base[key] = [p for p in allowed if p in raw[key]]
+        label = str(raw.get("label", "")).strip()
+        if label: base["label"] = label[:64]
+        pair = {"host": str(raw.get("host", "")), "sni": str(raw.get("sni", ""))}
+        if pair in hosts: base.update(pair)
+        fm = raw.get("fragment_fm")
+        if isinstance(fm, str):
+            try:
+                if fm and not isinstance(json.loads(fm), dict): raise ValueError("fragment must be an object")
+                base["fragment_fm"] = fm
+            except ValueError:
+                pass
+        # Path is pinned to its provisioned inbound and Cloudflare tunnel route.
+        result[tag] = base
+    return result
+
+def get_endpoint_settings():
+    try: stored = json.loads(meta_get("endpoint_settings") or "{}")
+    except (TypeError, ValueError): stored = {}
+    return _normal_endpoint_settings(stored)
+
+def set_endpoint_settings(settings):
+    meta_set("endpoint_settings", json.dumps(_normal_endpoint_settings(settings), ensure_ascii=False))
+
+def get_link_override(token):
+    c = db(); row = c.execute("SELECT config_override FROM users WHERE token=?", (token,)).fetchone(); c.close()
+    if not row or row["config_override"] is None: return None
+    try: value = json.loads(row["config_override"])
+    except (TypeError, ValueError): return {}
+    return value if isinstance(value, dict) else {}
+
+def set_link_override(token, settings, queue_sync=False, queue_outbound=False):
+    c = db(); cur = c.execute("UPDATE users SET config_override=? WHERE token=?",
+                            (json.dumps(settings, ensure_ascii=False) if settings is not None else None, token))
+    if cur.rowcount and queue_sync:
+        c.execute("INSERT INTO meta(k,v) VALUES('membership_sync_pending','1') "
+                  "ON CONFLICT(k) DO UPDATE SET v='1'")
+    if cur.rowcount and queue_outbound:
+        c.execute("INSERT INTO meta(k,v) VALUES('outbound_sync_pending','1') "
+                  "ON CONFLICT(k) DO UPDATE SET v='1'")
+    c.commit(); c.close()
+    return cur.rowcount > 0
+
+def global_settings_snapshot():
+    return {"recipe": get_recipe(), "ips": get_ips(),
+            "endpoint_settings": get_endpoint_settings(), "outbounds": get_outbounds()}
+
+def store_global_config(settings):
+    """Commit all public endpoint settings with a durable reconciliation marker."""
+    c = db()
+    for key, value in (
+        ("config_recipe", json.dumps(settings["recipe"])),
+        ("clean_ips", ",".join(settings["ips"])),
+        ("endpoint_settings", json.dumps(_normal_endpoint_settings(settings["endpoint_settings"]), ensure_ascii=False)),
+        ("membership_sync_pending", "1"),
+    ):
+        c.execute("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (key, value))
+    c.commit(); c.close()
+
+def effective_recipe(token):
+    custom = get_link_override(token)
+    if custom is None: return get_recipe()
+    recipe = custom.get("recipe", {})
+    recipe = recipe if isinstance(recipe, dict) else {}
+    # A newly provisioned endpoint must stay off for a link with a frozen snapshot.
+    return {ep["tag"]: recipe.get(ep["tag"], {"enabled": False, "count": 0}) for ep in ENDPOINTS}
+
+def effective_endpoint_settings(token):
+    custom = get_link_override(token)
+    if custom is None: return get_endpoint_settings()
+    return _normal_endpoint_settings(custom.get("endpoint_settings"))
+
+def effective_ips(token):
+    custom = get_link_override(token)
+    if custom is None: return get_ips()
+    ips = custom.get("ips", [])
+    return ips if isinstance(ips, list) and ips else get_ips()
+
+def effective_outbounds(token):
+    custom = get_link_override(token)
+    if custom is None: return get_outbounds()
+    obs = custom.get("outbounds", [])
+    return obs if isinstance(obs, list) else []
+
+def _configured_ep(ep, settings):
+    merged = dict(ep)
+    merged.update((settings or {}).get(ep["tag"], {}))
+    return merged
+
+def active_slot_keys(token, recipe=None, settings=None):
+    """The distinct external-port identities emitted by this link's recipe."""
+    recipe = effective_recipe(token) if recipe is None else recipe
+    settings = effective_endpoint_settings(token) if settings is None else settings
+    active = set()
+    for source in ENDPOINTS:
+        ep = _configured_ep(source, settings)
+        tag = ep["tag"]
+        r = recipe.get(tag, {"enabled": True, "count": len(_ep_slots(ep))})
+        try: count = max(0, int(r.get("count", 0)))
+        except (TypeError, ValueError): count = 0
+        if not r.get("enabled") or not count: continue
+        slots = [(int(ep["reality"]["port"]), "reality")] if "reality" in ep else _ep_slots(ep)
+        for port, security in slots[:min(count, len(slots))]:
+            active.add((tag, security, int(port)))
+    return active
+
+def _encode_slots(slots):
+    return json.dumps([list(s) for s in sorted(slots)], separators=(",", ":"))
+
+def _decode_slots(raw):
+    try: return {(str(t), str(s), int(p)) for t, s, p in json.loads(raw or "[]")}
+    except (TypeError, ValueError): return set()
+
+def _snapshot_missing_active_slots():
+    c = db(); rows = c.execute("SELECT token,credential_mode FROM users WHERE active_slots IS NULL").fetchall(); c.close()
+    if not rows: return
+    # The previous bot added every legacy credential to its backend inbound,
+    # independent of the subscription recipe. Even an unlisted external port
+    # could still authenticate with that shared credential. Model every
+    # provisioned port as previously active so the first reconciliation revokes
+    # disabled protocols and rotates a tag whose port set has shrunk.
+    provisioned = set()
+    for ep in ENDPOINTS:
+        slots = [(int(ep["reality"]["port"]), "reality")] if "reality" in ep else _ep_slots(ep)
+        provisioned.update((ep["tag"], security, int(port)) for port, security in slots)
+    snapshots = [(_encode_slots(provisioned if (u["credential_mode"] or "legacy") == "legacy"
+                                else active_slot_keys(u["token"])), u["token"]) for u in rows]
+    c = db()
+    c.executemany("UPDATE users SET active_slots=? WHERE token=? AND active_slots IS NULL", snapshots)
+    if any((u["credential_mode"] or "legacy") == "legacy" for u in rows):
+        c.execute("INSERT INTO meta(k,v) VALUES('membership_sync_pending','1') "
+                  "ON CONFLICT(k) DO UPDATE SET v='1'")
+    c.commit(); c.close()
+
+def active_endpoint_tags(recipe, settings=None):
+    """Endpoint tags with at least one emitted configuration."""
+    return {tag for tag, _, _ in active_slot_keys(None, recipe, settings or get_endpoint_settings())}
+
+def credential_mode(token):
+    c = db(); u = c.execute("SELECT credential_mode FROM users WHERE token=?", (token,)).fetchone(); c.close()
+    return u["credential_mode"] if u else "slots"  # create_user provisions before INSERT
+
+def slot_mode_tags(token):
+    c = db(); rows = c.execute("SELECT tag FROM slot_mode_tags WHERE token=?", (token,)).fetchall(); c.close()
+    return {r["tag"] for r in rows}
+
+def _mark_slot_mode_tag(token, tag):
+    c = db(); c.execute("INSERT OR IGNORE INTO slot_mode_tags(token,tag) VALUES(?,?)", (token, tag))
+    c.commit(); c.close()
+
+def _slot_credential_map(token):
+    c = db(); rows = c.execute("SELECT * FROM slot_credentials WHERE token=?", (token,)).fetchall(); c.close()
+    return {(r["tag"], r["security"], int(r["external_port"])): r for r in rows}
+
+def ensure_slot_credential(token, ep, security, port):
+    """Persist a fresh identity when a slot is first enabled or re-enabled."""
+    c = db()
+    row = c.execute("SELECT * FROM slot_credentials WHERE token=? AND tag=? AND security=? AND external_port=?",
+                    (token, ep["tag"], security, port)).fetchone()
+    if row: c.close(); return row
+    secret = (secrets.token_urlsafe(32) if ep["proto"] == "trojan" else str(uuidlib.uuid4()))
+    suffix = {"tls": "tls", "none": "none", "reality": "reality"}[security]
+    email = "%s.%s%d.%s" % (ep_email(token, ep["tag"]), suffix, port, secrets.token_hex(5))
+    c.execute("INSERT OR IGNORE INTO slot_credentials(token,tag,security,external_port,email,secret) VALUES(?,?,?,?,?,?)",
+              (token, ep["tag"], security, port, email, secret))
+    c.commit()
+    row = c.execute("SELECT * FROM slot_credentials WHERE token=? AND tag=? AND security=? AND external_port=?",
+                    (token, ep["tag"], security, port)).fetchone()
+    c.close(); return row
+
+def _set_auth_state(token, mode, slots):
+    c = db(); c.execute("UPDATE users SET credential_mode=?,active_slots=? WHERE token=?",
+                        (mode, _encode_slots(slots), token)); c.commit(); c.close()
+
+def _reconcile_user_membership(u, before_recipe=None, before_settings=None):
+    """Reconcile each endpoint without rotating credentials on other endpoints."""
+    token, secret = u["token"], u["uuid"]
+    desired = active_slot_keys(token)
+    previous = (_decode_slots(u["active_slots"]) if u["active_slots"] is not None else
+                active_slot_keys(token, before_recipe, before_settings))
+    removed = previous - desired
+    desired_tags = {slot[0] for slot in desired}
+    previous_tags = {slot[0] for slot in previous}
+    eligible = _eligible_for_membership(u)
+    mode = u["credential_mode"] or "legacy"
+    converted = slot_mode_tags(token)
+    transition_tags = ({slot[0] for slot in removed} - converted) if mode == "legacy" else set()
+    ep_by_tag = {e["tag"]: e for e in ENDPOINTS}
+    old_creds = _slot_credential_map(token)
+    to_remove = set(old_creds) - desired
+    # An endpoint that was never emitted has no legacy credential to revoke.
+    # Leaving it alone also avoids making an unrelated first-time edit depend
+    # on a historical stats snapshot.
+    revoke_legacy = ((transition_tags | (previous_tags - desired_tags)) - converted
+                     if mode == "legacy" else set())
+    if (revoke_legacy or to_remove) and not _enable_usage_ledger(token):
+        return False, set()
+    ok = True
+    for ep in ENDPOINTS:
+        tag = ep["tag"]
+        keys = sorted(s for s in desired if s[0] == tag)
+        uses_slots = mode == "slots" or tag in converted or tag in transition_tags
+        if uses_slots:
+            for key in keys:
+                cred = old_creds.get(key) or ensure_slot_credential(token, ep, key[1], key[2])
+                if eligible and (tag in transition_tags or key not in old_creds):
+                    if not _adu(ep, cred["secret"], cred["email"]): ok = False
+        elif tag in desired_tags and eligible and tag not in previous_tags:
+            if not _adu(ep, secret, legacy_email(token, tag)): ok = False
+    if not ok: return False, set()
+    cut = set()
+    for ep in ENDPOINTS:
+        tag = ep["tag"]
+        if tag in revoke_legacy:
+            removed_ok = _rmu(token, tag)
+            if not removed_ok: ok = False
+            else:
+                _mark_slot_mode_tag(token, tag)
+                cut.add(tag)
+    for key in sorted(to_remove):
+        cred = old_creds[key]
+        if not _rmu_email(key[0], cred["email"]): ok = False; continue
+        c = db(); c.execute("DELETE FROM slot_credentials WHERE email=?", (cred["email"],)); c.commit(); c.close()
+        cut.add(key[0])
+    if ok: _set_auth_state(token, mode, desired)
+    write_sub(token, secret, u["label"])
+    return ok, cut
+
+def _eligible_for_membership(u):
+    return not (u["disabled_ts"] or u["frozen"] or u["pending_delete"] or exhaust_reason(u))
+
+def xr_reconcile_user_endpoints(token, secret, before_recipe=None, before_settings=None):
+    """Update a link after settings change, including live sessions on removed tags."""
+    c = db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone(); c.close()
+    if not u: return False
+    ok, cut = _reconcile_user_membership(u, before_recipe, before_settings)
+    if cut: force_disconnect(cut)
+    if not ok:
+        meta_set("membership_sync_pending", "1")
+        # A successful restart clears any legacy credential the API could not
+        # revoke. resync_all restores only the desired, eligible identities.
+        if _emergency_clear_dynamic_users():
+            ok = meta_get("membership_sync_pending") != "1"
+    return ok
+
+def xr_reconcile_all_users(before_recipe=None, before_settings=None, tokens=None):
+    """Reconcile eligible links after a global change; reset each affected port once."""
+    c = db(); rows = c.execute("SELECT * FROM users").fetchall(); c.close()
+    selected = set(tokens) if tokens is not None else None
+    rows = [u for u in rows if selected is None or u["token"] in selected]
+    if not rows: return True
+    ok = True; cut = set()
+    for u in rows:
+        user_ok, user_cut = _reconcile_user_membership(u, before_recipe, before_settings)
+        ok = user_ok and ok; cut.update(user_cut)
+    if cut: force_disconnect(cut)
+    if not ok:
+        meta_set("membership_sync_pending", "1")
+        if _emergency_clear_dynamic_users():
+            ok = meta_get("membership_sync_pending") != "1"
+    return ok
+
 # ---------------- outbounds (clean-egress routing) ----------------
 # Route chosen domains out through a CLEAN upstream instead of this VPS's (often flagged)
 # datacenter IP, so AI sites (Gemini/NotebookLM/Claude) work. Everything else stays direct.
@@ -348,8 +838,14 @@ def get_outbounds():
                         "domains": [str(d) for d in (o.get("domains") or [])]})
     return out
 
-def set_outbounds(obs):
-    meta_set("outbounds", json.dumps(obs))
+def set_outbounds(obs, queue_apply=False):
+    c = db()
+    c.execute("INSERT INTO meta(k,v) VALUES('outbounds',?) "
+              "ON CONFLICT(k) DO UPDATE SET v=excluded.v", (json.dumps(obs),))
+    if queue_apply:
+        c.execute("INSERT INTO meta(k,v) VALUES('outbound_sync_pending','1') "
+                  "ON CONFLICT(k) DO UPDATE SET v='1'")
+    c.commit(); c.close()
 
 def ob_test_port(i):
     return OB_TEST_PORT_BASE + i
@@ -444,8 +940,31 @@ def ob_xtag(tag):
     # what we created (a deleted outbound must not leave a dangling rule behind).
     return "mj-" + tag
 
+def ob_user_xtag(token, tag):
+    # ':' is excluded by the panel's outbound-name parser, so this namespace cannot
+    # collide with a global `mj-<name>` outbound even when the names match.
+    return "mj-u:%s:%s" % (token, tag)
+
+def ob_user_matcher(token):
+    # Xray matches `user` against the inbound client's email. The suffix includes
+    # its endpoint tag, and may also include a per-config ID in future.
+    return "regexp:^u_%s\\." % re.escape(token)
+
 def ob_owned(tag):
     return tag.startswith("mj-") or tag in ("direct", "block")
+
+def _routing_rule_owned(rule):
+    """Recognize our generated rules without dropping operator block rules."""
+    outbound = str(rule.get("outboundTag", ""))
+    if outbound.startswith("mj-") or any(str(t).startswith("mjtest-") for t in (rule.get("inboundTag") or [])):
+        return True
+    if outbound != "direct": return False
+    if (rule.get("user") and rule.get("ip") == ["geoip:private"] and
+            set(rule) <= {"type", "ip", "outboundTag", "user"}):
+        return True
+    users = rule.get("user") or []
+    return (rule.get("network") == "tcp,udp" and set(rule) <= {"type", "user", "network", "outboundTag"}
+            and len(users) == 1 and str(users[0]).startswith("regexp:^u_"))
 
 def ob_catchall_index(obs):
     """Index of the outbound that takes ALL traffic (the first one with no domains), or None.
@@ -455,14 +974,17 @@ def ob_catchall_index(obs):
             return i
     return None
 
-def build_xray_sections(obs):
+def build_xray_sections(obs, custom=None):
     """-> (outbounds, routing rules, loopback test inbounds).
 
     xray sends anything no rule matched to the FIRST outbound, so:
       * no catch-all  -> `direct` is first: only the listed domains leave via an outbound.
       * a catch-all   -> that outbound is first: EVERYTHING leaves through it, and the
                          other outbounds still win for their own domains (rules beat default).
+    Custom links get user-scoped rules plus a final user-scoped fallback. That fallback
+    prevents the global rules (and first outbound) from handling their traffic.
     """
+    custom = custom or {}
     direct = {"tag": "direct", "protocol": "freedom", "settings": {}}
     parsed = [parse_outbound_link(o["link"], ob_xtag(o["tag"])) for o in obs]
     catch = ob_catchall_index(obs)
@@ -475,6 +997,24 @@ def build_xray_sections(obs):
                       "protocol": "socks", "settings": {"auth": "noauth", "udp": False}})
         # test-inbound rules FIRST so a test always exits via its own outbound
         rules.append({"type": "field", "inboundTag": [itag], "outboundTag": ob_xtag(o["tag"])})
+    for token, user_obs in custom.items():
+        user_obs = user_obs or []
+        user = [ob_user_matcher(token)]
+        for o in user_obs:
+            outs.append(parse_outbound_link(o["link"], ob_user_xtag(token, o["tag"])))
+        user_catch = ob_catchall_index(user_obs)
+        if user_catch is not None:
+            # Match the global catch-all's safety rule, but only for this link.
+            rules.append({"type": "field", "user": user, "ip": ["geoip:private"], "outboundTag": "direct"})
+        for o in user_obs:
+            doms = [d for d in (o.get("domains") or []) if d]
+            if doms:
+                rules.append({"type": "field", "user": user, "domain": doms,
+                              "outboundTag": ob_user_xtag(token, o["tag"])})
+        # A link with no custom catch-all must go direct when no domain rule matched.
+        # This rule also prevents a global domain rule from leaking into that link.
+        fallback = ob_user_xtag(token, user_obs[user_catch]["tag"]) if user_catch is not None else "direct"
+        rules.append({"type": "field", "user": user, "network": "tcp,udp", "outboundTag": fallback})
     if catch is not None:
         # never push LAN/loopback (incl. our own tunnel plumbing) through the upstream
         rules.append({"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"})
@@ -485,17 +1025,48 @@ def build_xray_sections(obs):
     outs.append({"tag": "block", "protocol": "blackhole", "settings": {}})
     return outs, rules, tests
 
-def apply_xray_outbounds(obs=None):
+def _custom_outbound_sets():
+    # A missing DB is possible in isolated config-builder tests; on a running bot
+    # init_db has already created it, and read errors must stop the apply.
+    if not os.path.exists(DB_PATH): return {}
+    c = db()
+    try:
+        rows = c.execute("SELECT token FROM users WHERE config_override IS NOT NULL").fetchall()
+    finally:
+        c.close()
+    global_outbounds = get_outbounds()
+    # An unchanged custom snapshot has the same route as the global rules. Keep
+    # it in SQLite, but only add user-scoped Xray rules once the two diverge.
+    routed = {}
+    for u in rows:
+        own = effective_outbounds(u["token"])
+        if own != global_outbounds:
+            routed[u["token"]] = own
+    return routed
+
+def _xray_api_ready():
+    try:
+        r = subprocess.run([XRAY_BIN, "api", "statsquery", "--server=%s" % XRAY_API,
+                            "-pattern", "user>>>u_"], capture_output=True, text=True, timeout=3)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+def apply_xray_outbounds(obs=None, custom=None):
     """Rewrite ONLY outbounds/routing (+ our mjtest-* loopback inbounds) in xray's config.
        Validates with `xray -test` and refuses to write a broken config. -> (ok, message)."""
     obs = get_outbounds() if obs is None else obs
     try:
-        cfg = json.loads(open(XRAY_CONF, encoding="utf-8").read())
+        with open(XRAY_CONF, encoding="utf-8") as current_file:
+            original_text = current_file.read()
+        cfg = json.loads(original_text)
     except Exception as e:
         return False, "خواندن کانفیگ xray ناموفق بود: %s" % e
+    original_cfg = json.dumps(cfg, sort_keys=True, ensure_ascii=False)
     try:
-        outs, rules, tests = build_xray_sections(obs)
-    except ValueError as e:
+        custom = _custom_outbound_sets() if custom is None else custom
+        outs, rules, tests = build_xray_sections(obs, custom)
+    except (ValueError, sqlite3.Error) as e:
         return False, str(e)
     # keep every real inbound (endpoints + api); replace only our own test inbounds
     cfg["inbounds"] = [ib for ib in (cfg.get("inbounds") or [])
@@ -508,10 +1079,16 @@ def apply_xray_outbounds(obs=None):
     api_tag = str((cfg.get("api") or {}).get("tag") or "")
     alive = {str(ob.get("tag", "")) for ob in cfg["outbounds"]} | ({api_tag} if api_tag else set())
     keep = [r for r in ((cfg.get("routing") or {}).get("rules") or [])
-            if not ob_owned(str(r.get("outboundTag", "")))                     # drop our old rules
-            and not any(str(t).startswith("mjtest-") for t in (r.get("inboundTag") or []))
-            and str(r.get("outboundTag", "")) in alive]                        # drop dangling ones
-    rules = keep + rules
+            if not _routing_rule_owned(r) and str(r.get("outboundTag", "")) in alive]
+    # API and test inbounds stay first. Operator routing policies then apply to
+    # every link, including custom links; per-link rules override only the panel's
+    # generated global rules.
+    api_keep = [r for r in keep if api_tag and api_tag in (r.get("inboundTag") or [])]
+    foreign_keep = [r for r in keep if r not in api_keep]
+    tests_scoped = [r for r in rules if any(str(t).startswith("mjtest-") for t in (r.get("inboundTag") or []))]
+    user_scoped = [r for r in rules if r.get("user")]
+    global_rules = [r for r in rules if r not in tests_scoped and r not in user_scoped and r not in keep]
+    rules = api_keep + tests_scoped + foreign_keep + user_scoped + global_rules
     if rules:
         # AsIs, NOT IPIfNonMatch: our rules match on the requested domain (and geoip:private
         # sees a literal IP), so resolution buys nothing — but IPIfNonMatch makes xray do a
@@ -519,6 +1096,9 @@ def apply_xray_outbounds(obs=None):
         cfg["routing"] = {"domainStrategy": "AsIs", "rules": rules}
     else:
         cfg.pop("routing", None)
+    if json.dumps(cfg, sort_keys=True, ensure_ascii=False) == original_cfg:
+        return ((True, "تنظیمات خروجی از قبل اعمال شده است.") if _xray_api_ready() else
+                (False, "تنظیمات روی دیسک یکسان است اما API سرویس Xray آماده نیست"))
     # the suffix MUST stay .json: xray picks the config format from the file extension and
     # rejects anything else with "failed to get format of <file>", which made every apply fail.
     tmp = XRAY_CONF + ".mjnew.json"
@@ -537,18 +1117,43 @@ def apply_xray_outbounds(obs=None):
         except Exception: pass
         return False, "نوشتن کانفیگ ناموفق بود: %s" % e
     try:
-        subprocess.run(["systemctl", "restart", XRAY_SERVICE], capture_output=True, text=True, timeout=30)
+        restarted = subprocess.run(["systemctl", "restart", XRAY_SERVICE], capture_output=True, text=True, timeout=30)
+        restart_error = "" if restarted.returncode == 0 else (restarted.stderr or restarted.stdout or "restart failed").strip()
     except Exception as e:
-        return False, "کانفیگ نوشته شد ولی ری‌استارت xray ناموفق بود: %s" % e
-    # xray binds its ports a moment AFTER systemd reports the restart done; without this
-    # wait, pressing 🔎 right after «اعمال» hits a closed port and looks like a failure.
+        restart_error = str(e)
+    if restart_error:
+        # Keep the file and running service aligned if systemd rejects the new
+        # config after the file was replaced. The validated original stays in
+        # memory, and the timestamped on-disk backup is kept for an operator.
+        rollback_tmp = XRAY_CONF + ".mjrollback.json"
+        try:
+            with open(rollback_tmp, "w", encoding="utf-8") as old_file:
+                old_file.write(original_text)
+            os.replace(rollback_tmp, XRAY_CONF)
+            recovered = subprocess.run(["systemctl", "restart", XRAY_SERVICE],
+                                       capture_output=True, text=True, timeout=30)
+            detail = "کانفیگ قبلی بازیابی شد" if recovered.returncode == 0 else "بازیابی سرویس هم ناموفق بود"
+        except Exception as e:
+            detail = "بازیابی کانفیگ قبلی ناموفق بود: %s" % e
+            try: os.unlink(rollback_tmp)
+            except OSError: pass
+        return False, "ری‌استارت xray ناموفق بود: %s؛ %s" % (restart_error[-250:], detail)
     deadline = time.time() + OB_BIND_WAIT
+    first_attempt = True
+    while first_attempt or time.time() < deadline:
+        first_attempt = False
+        if _xray_api_ready(): break
+        time.sleep(0.3)
+    else:
+        return False, "Xray راه‌اندازی شد اما API آن هنوز آماده نیست؛ همگام‌سازی دوباره تلاش می‌شود"
+    # Xray binds its test ports a moment AFTER systemd reports the restart done.
     while obs and time.time() < deadline:
         try:
             socket.create_connection(("127.0.0.1", ob_test_port(0)), timeout=0.5).close(); break
         except OSError:
             time.sleep(0.3)
-    return True, "اعمال شد (%d خروجی). کاربران خودکار resync می‌شوند." % len(obs)
+    return True, "اعمال شد (%d خروجی). کاربران خودکار resync می‌شوند." % \
+           (len(obs) + sum(len(v or []) for v in custom.values()))
 
 def _socks5_get(port, host, path="/", timeout=12):
     """SOCKS5 -> TLS -> minimal HTTPS GET through a loopback test inbound. -> (status, body_head)."""
@@ -608,20 +1213,35 @@ def test_outbound(tag):
     return "IP خروجی: %s · %s" % (ip, " · ".join(marks))
 
 def write_sub(token, secret, label):
-    ips = get_ips() or DEFAULT_IPS; recipe = get_recipe(); links = []; gi = 0
-    for ep in ENDPOINTS:
+    ips = effective_ips(token) or DEFAULT_IPS
+    recipe = effective_recipe(token); settings = effective_endpoint_settings(token)
+    mode = credential_mode(token); converted = slot_mode_tags(token); links = []; gi = 0
+    for source in ENDPOINTS:
+        ep = _configured_ep(source, settings)
         r = recipe.get(ep["tag"], {"enabled": True, "count": len(_ep_slots(ep))})
+        count = max(0, int(r.get("count", 0))) if r.get("enabled") else 0
         if "reality" in ep:      # direct link: no ports/clean IPs to cycle, just `count` copies
-            if r.get("enabled"):
-                links += [_reality_link(ep, secret, k) for k in range(int(r.get("count", 0)))]
+            if count:
+                identity = (ensure_slot_credential(token, ep, "reality", int(ep["reality"]["port"]))["secret"]
+                            if mode == "slots" or ep["tag"] in converted else secret)
+                links += [_reality_link(ep, identity, k) for k in range(count)]
             continue
         slots = _ep_slots(ep)
-        if not r.get("enabled") or not slots:
+        if not count or not slots:
             continue
-        for k in range(int(r.get("count", 0))):
+        for k in range(count):
             port, sec = slots[k % len(slots)]
-            links.append(_ws_link(ep, secret, ips[gi % len(ips)], port, sec)); gi += 1
-    open(sub_path(token), "w").write(base64.b64encode("\n".join(l for l in links if l).encode()).decode())
+            identity = (ensure_slot_credential(token, ep, sec, int(port))["secret"]
+                        if mode == "slots" or ep["tag"] in converted else secret)
+            links.append(_ws_link(ep, identity, ips[gi % len(ips)], port, sec)); gi += 1
+    path = sub_path(token); tmp = path + ".tmp-" + secrets.token_hex(4)
+    try:
+        with open(tmp, "w") as out:
+            out.write(base64.b64encode("\n".join(l for l in links if l).encode()).decode())
+        os.replace(tmp, path)
+    finally:
+        try: os.remove(tmp)
+        except FileNotFoundError: pass
 
 def regenerate_all_subs():
     c = db(); rows = c.execute("SELECT token,uuid,label FROM users").fetchall(); c.close()
@@ -652,7 +1272,9 @@ def human_expiry(ts):
     left = ts - int(time.time())
     if left <= 0: return "منقضی"
     d = left // 86400; h = (left % 86400) // 3600
-    return ("%d روز و %d ساعت" % (d, h)) if d else ("%d ساعت" % h)
+    if d: return "%d روز و %d ساعت" % (d, h)
+    if h: return "%d ساعت" % h
+    return "%d دقیقه" % max(1, (left + 59) // 60)
 
 def is_admin(uid):
     if ADMIN_IDS: return uid in ADMIN_IDS
@@ -664,30 +1286,61 @@ def create_user(vol_gb, dur_days, label=None):
     secret = str(uuidlib.uuid4())
     label = label or ("link-%s" % token[:6])
     limit_bytes = int(vol_gb * GB) if vol_gb and vol_gb > 0 else 0
-    expiry_ts = int(time.time()) + int(dur_days) * 86400 if dur_days and dur_days > 0 else 0
-    if not xr_add_user(token, secret): return None
-    write_sub(token, secret, label)
+    expiry_ts = int(time.time() + float(dur_days) * 86400) if dur_days and dur_days > 0 else 0
+    if not xr_add_user(token, secret):
+        xr_remove_user(token)
+        c = db(); c.execute("DELETE FROM slot_credentials WHERE token=?", (token,)); c.commit(); c.close()
+        return None
+    try: write_sub(token, secret, label)
+    except Exception:
+        xr_remove_user(token)
+        c = db(); c.execute("DELETE FROM slot_credentials WHERE token=?", (token,)); c.commit(); c.close()
+        raise
     c = db()
-    c.execute("""INSERT INTO users(token,uuid,email,label,limit_bytes,expiry_ts,created_ts,base_bytes,last_raw,used_bytes)
-                 VALUES(?,?,?,?,?,?,?,0,0,0)""",
-              (token, secret, "u_" + token, label, limit_bytes, expiry_ts, int(time.time())))
+    c.execute("""INSERT INTO users(token,uuid,email,label,limit_bytes,expiry_ts,created_ts,base_bytes,last_raw,used_bytes,
+                 credential_mode,active_slots,usage_anchor) VALUES(?,?,?,?,?,?,?,0,0,0,'slots',?,0)""",
+              (token, secret, "u_" + token, label, limit_bytes, expiry_ts, int(time.time()),
+               _encode_slots(active_slot_keys(token))))
     c.commit(); c.close()
     return token
 
 def delete_user(token):
+    refresh_usage(token)
     c = db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone()
-    if u:
-        tags = online_tags_of(token)     # capture BEFORE rmu (rmu clears the online stat)
-        xr_remove_user(token); del_sub(token)
-        # deleting a user must NOT drop the dashboard totals. Bank this user's lifetime
-        # traffic into retired_bytes (keeps "total" stable), and LEAVE their usage_daily
-        # rows so they keep counting toward "last 30 days" until they age out naturally.
-        retired = int(meta_get("retired_bytes", "0") or 0) + int(u["used_bytes"] or 0)
-        c.execute("INSERT INTO meta(k,v) VALUES('retired_bytes',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
-                  (str(retired),))
-        c.execute("DELETE FROM users WHERE token=?", (token,)); c.commit()
-        force_disconnect(tags)           # cut the live session now (no-op if it was offline)
+    if not u: c.close(); return False
     c.close()
+    tags = tags_to_cut_for_user(token)
+    c = db(); c.execute("UPDATE users SET pending_delete=1,auth_pending=1 WHERE token=?", (token,))
+    c.commit(); c.close()
+    if not xr_remove_user(token) and not _emergency_clear_dynamic_users():
+        force_disconnect(tags)
+        return False
+    c = db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone()
+    if not u: c.close(); return False
+    custom = u["config_override"] is not None
+    # Keep lifetime totals and daily rows when deleting a subscription.
+    retired = int(meta_get("retired_bytes", "0") or 0) + int(u["used_bytes"] or 0)
+    c.execute("INSERT INTO meta(k,v) VALUES('retired_bytes',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+              (str(retired),))
+    c.execute("DELETE FROM slot_credentials WHERE token=?", (token,))
+    c.execute("DELETE FROM slot_mode_tags WHERE token=?", (token,))
+    c.execute("DELETE FROM legacy_emails WHERE token=?", (token,))
+    c.execute("DELETE FROM usage_ledger WHERE token=?", (token,))
+    c.execute("DELETE FROM users WHERE token=?", (token,)); c.commit(); c.close()
+    del_sub(token)
+    force_disconnect(tags)
+    if custom:
+        try:
+            applied, reason = apply_xray_outbounds()
+        except Exception as exc:
+            applied, reason = False, str(exc)
+        if applied:
+            meta_set("outbound_sync_pending", "")
+            resync_all()
+        else:
+            meta_set("outbound_sync_pending", "1")
+            print("outbound cleanup pending:", reason, flush=True)
+    return True
 
 def exhaust_reason(u, now=None):
     now = now or int(time.time())
@@ -697,49 +1350,91 @@ def exhaust_reason(u, now=None):
 
 def disable_user(token):
     # exhausted: stop service (remove from xray) but KEEP the row + sub file so it can be renewed within the grace window
-    tags = online_tags_of(token)     # capture BEFORE rmu
-    xr_remove_user(token)
-    c = db(); c.execute("UPDATE users SET disabled_ts=? WHERE token=?", (int(time.time()), token)); c.commit(); c.close()
+    tags = tags_to_cut_for_user(token)  # capture BEFORE rmu
+    c = db(); c.execute("UPDATE users SET disabled_ts=?,auth_pending=1 WHERE token=?",
+                        (int(time.time()), token)); c.commit(); c.close()
+    removed = xr_remove_user(token)
+    if not removed: removed = _emergency_clear_dynamic_users()
+    if removed:
+        _rotate_legacy_emails(token)
+        c = db(); c.execute("UPDATE users SET auth_pending=0 WHERE token=?", (token,)); c.commit(); c.close()
     force_disconnect(tags)           # cut the live session so quota/expiry actually takes effect now
+    return removed
 
 def reenable_user(token):
     c = db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone(); c.close()
-    if not u: return
-    xr_add_user(token, u["uuid"]); write_sub(token, u["uuid"], u["label"])
-    c = db(); c.execute("UPDATE users SET disabled_ts=0 WHERE token=?", (token,)); c.commit(); c.close()
+    if not u or u["pending_delete"]: return False
+    if not xr_add_user(token, u["uuid"]): return False
+    write_sub(token, u["uuid"], u["label"])
+    c = db(); c.execute("UPDATE users SET disabled_ts=0,auth_pending=0 WHERE token=?", (token,)); c.commit(); c.close()
+    return True
 
 def maybe_reenable(token):
     # after an extend: if it was disabled but now has quota/time again, bring it back live immediately
     c = db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone(); c.close()
     if u and u["disabled_ts"] and not u["frozen"] and not exhaust_reason(u):
-        reenable_user(token); return True
+        return reenable_user(token)
     return False
 
 def freeze_user(token):
     # manual admin freeze: cut the link NOW and keep it out of xray until unfrozen. Fully
     # independent of the quota/expiry disable — no 48h grace, and the enforcer never touches it.
-    tags = online_tags_of(token)     # capture BEFORE rmu (rmu clears the online stat)
-    xr_remove_user(token)
-    c = db(); c.execute("UPDATE users SET frozen=1 WHERE token=?", (token,)); c.commit(); c.close()
+    tags = tags_to_cut_for_user(token)  # capture BEFORE rmu
+    c = db(); c.execute("UPDATE users SET frozen=1,auth_pending=1 WHERE token=?", (token,)); c.commit(); c.close()
+    removed = xr_remove_user(token)
+    if not removed: removed = _emergency_clear_dynamic_users()
+    if removed:
+        _rotate_legacy_emails(token)
+        c = db(); c.execute("UPDATE users SET auth_pending=0 WHERE token=?", (token,)); c.commit(); c.close()
     force_disconnect(tags)           # drop the live session immediately
+    return removed
 
 def unfreeze_user(token):
-    c = db(); c.execute("UPDATE users SET frozen=0 WHERE token=?", (token,)); c.commit()
-    u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone(); c.close()
+    c = db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone(); c.close()
+    if not u or u["pending_delete"]: return False
     # bring it back live unless it's also quota/expiry-disabled or now exhausted
-    if u and not u["disabled_ts"] and not exhaust_reason(u):
-        xr_add_user(token, u["uuid"]); write_sub(token, u["uuid"], u["label"])
+    if not u["disabled_ts"] and not exhaust_reason(u):
+        if not xr_add_user(token, u["uuid"]): return False
+        write_sub(token, u["uuid"], u["label"])
+    c = db(); c.execute("UPDATE users SET frozen=0,auth_pending=0 WHERE token=?", (token,)); c.commit(); c.close()
+    return True
 
 def refresh_usage(token):
-    c = db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone()
-    if not u: c.close(); return
-    raw = xr_usage(token)
-    if raw is None: c.close(); return   # read failed -> leave counters untouched
-    base = u["base_bytes"]; last = u["last_raw"]
-    if raw < last: base += last
-    used = base + raw
-    c.execute("UPDATE users SET base_bytes=?,last_raw=?,used_bytes=? WHERE token=?", (base, raw, used, token))
-    c.commit(); c.close()
+    for _ in range(3):
+        begin_xray_counter_epoch()
+        c = db(); selected = c.execute("SELECT usage_anchor FROM users WHERE token=?", (token,)).fetchone(); c.close()
+        if not selected: return
+        ledger = selected["usage_anchor"] is not None
+        raw = xr_usage_all() if ledger else xr_usage(token)
+        if raw is None: return  # failed read is never a counter reset
+        pid = getattr(raw, "epoch_pid", None)
+        if not _stats_epoch_still_running(pid): continue
+        c = db()
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone()
+            if not u or not _stats_epoch_matches(c, pid) or (u["usage_anchor"] is not None) != ledger:
+                c.rollback(); continue
+            if ledger:
+                if getattr(raw, "emails", None) is not None:
+                    _ledger_apply_snapshot(c, u, raw.emails)
+            else:
+                base, used = _usage_from_raw(u, raw)
+                c.execute("UPDATE users SET base_bytes=?,last_raw=?,used_bytes=?,rebase_floor=NULL WHERE token=?",
+                          (base, int(raw), used, token))
+            c.commit(); return
+        finally:
+            c.close()
+
+def _usage_from_raw(u, raw):
+    base, last = int(u["base_bytes"] or 0), int(u["last_raw"] or 0)
+    floor = u["rebase_floor"] if "rebase_floor" in u.keys() else None
+    if floor is not None and raw < last:
+        # A removed slot counter disappeared, but surviving slots did not reset.
+        # Preserve the lifetime total instead of counting survivor bytes twice.
+        return int(floor) - raw, int(floor)
+    if raw < last: base += last  # a genuine Xray counter reset
+    return base, base + raw
 
 def reset_usage(token):
     # Capture the freshest available lifetime counter, then atomically move only the
@@ -768,40 +1463,125 @@ def xr_usage_all():
     # ONE statsquery for all users -> {token: bytes}, or None if the read FAILED.
     # None is CRITICAL: a failed/empty read must NOT be treated as "everyone reset to 0",
     # because that false reset double-counts every user's traffic (the 2026-07 usage-spike bug).
-    try:
-        r = subprocess.run([XRAY_BIN, "api", "statsquery", "--server=%s" % XRAY_API, "-pattern", "user>>>u_"],
-                           capture_output=True, text=True, timeout=20)
-    except Exception:
-        return None
-    if r.returncode != 0:
-        return None
+    result = _stable_statsquery("user>>>u_", 20)
+    if result is None: return None
+    r, pid = result
     try:
         d = json.loads(r.stdout or "{}")
     except Exception:
         return None
-    tot = {}
+    tot, emails = {}, {}
     for s in (d.get("stat") or []):
         nm = s.get("name", "")
-        if not nm.startswith("user>>>u_"): continue
-        tk = nm[len("user>>>u_"):].split(".", 1)[0].split(">>>", 1)[0]
-        tot[tk] = tot.get(tk, 0) + int(s.get("value", 0))
-    return tot
+        parts = nm.split(">>>")
+        if len(parts) < 4 or parts[0] != "user" or not parts[1].startswith("u_") or parts[2] != "traffic":
+            continue
+        email = parts[1]
+        if "." not in email: continue
+        tk = email[2:].split(".", 1)[0]
+        value = int(s.get("value", 0))
+        tot[tk] = tot.get(tk, 0) + value
+        emails[email] = emails.get(email, 0) + value
+    return UsageSnapshot(tot, emails, pid)
+
+class UsageSnapshot(dict):
+    def __init__(self, totals, emails, epoch_pid=None):
+        super().__init__(totals)
+        self.emails = emails
+        self.epoch_pid = epoch_pid
+
+def _ledger_apply_snapshot(c, u, emails):
+    token = u["token"]
+    prefix = "u_%s." % token
+    old = {r["email"]: r for r in c.execute(
+        "SELECT email,last_raw,total_bytes FROM usage_ledger WHERE token=?", (token,)).fetchall()}
+    for email, raw in emails.items():
+        if not email.startswith(prefix): continue
+        raw = int(raw)
+        prior = old.get(email)
+        if prior:
+            last = int(prior["last_raw"])
+            delta = raw - last if raw >= last else raw  # only this identity reset
+            c.execute("UPDATE usage_ledger SET last_raw=?,total_bytes=total_bytes+? WHERE email=?",
+                      (raw, max(0, delta), email))
+        else:
+            # Every email first seen after the anchor is a new identity. Slot
+            # credentials include a random generation, so revoked IDs never revive.
+            c.execute("INSERT INTO usage_ledger(email,token,last_raw,total_bytes) VALUES(?,?,?,?)",
+                      (email, token, raw, raw))
+    ledger_total = c.execute("SELECT COALESCE(SUM(total_bytes),0) n FROM usage_ledger WHERE token=?",
+                             (token,)).fetchone()["n"]
+    used = int(u["usage_anchor"]) + int(ledger_total)
+    c.execute("UPDATE users SET used_bytes=? WHERE token=?", (used, token))
+    return used
+
+def _enable_usage_ledger(token):
+    """Anchor existing lifetime usage before rotating any legacy identity."""
+    for _ in range(3):
+        begin_xray_counter_epoch()
+        c = db(); prior = c.execute("SELECT usage_anchor FROM users WHERE token=?", (token,)).fetchone(); c.close()
+        if not prior: return False
+        if prior["usage_anchor"] is not None: return True
+        snapshot = xr_usage_all()
+        if snapshot is None or getattr(snapshot, "emails", None) is None: return False
+        pid = getattr(snapshot, "epoch_pid", None)
+        if not _stats_epoch_still_running(pid): continue
+        c = db()
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            if not _stats_epoch_matches(c, pid): c.rollback(); continue
+            u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone()
+            if not u: c.rollback(); return False
+            if u["usage_anchor"] is not None: c.rollback(); return True
+            if token not in snapshot and int(u["last_raw"] or 0) > 0:
+                # A transiently missing counter cannot serve as a baseline.
+                c.rollback(); return False
+            if token in snapshot:
+                raw = int(snapshot[token])
+                base, used = _usage_from_raw(u, raw)
+            else:
+                raw = int(u["last_raw"] or 0)
+                base, used = int(u["base_bytes"] or 0), int(u["used_bytes"] or 0)
+            c.execute("UPDATE users SET base_bytes=?,last_raw=?,used_bytes=?,usage_anchor=?,rebase_floor=NULL WHERE token=?",
+                      (base, raw, used, used, token))
+            prefix = "u_%s." % token
+            for email, value in snapshot.emails.items():
+                if email.startswith(prefix):
+                    c.execute("INSERT OR IGNORE INTO usage_ledger(email,token,last_raw,total_bytes) VALUES(?,?,?,0)",
+                              (email, token, int(value)))
+            c.commit(); return True
+        finally:
+            c.close()
+    return False
 
 def refresh_all_usage():
-    raws = xr_usage_all()
-    if raws is None: return   # stats read failed -> skip this poll; never guess 0 (would false-reset everyone)
-    c = db(); today = day_key()
-    for u in c.execute("SELECT token,base_bytes,last_raw,used_bytes FROM users").fetchall():
-        if u["token"] in raws:
-            raw = raws[u["token"]]; base = u["base_bytes"]
-            if raw < u["last_raw"]: base += u["last_raw"]   # genuine reset: a REAL reading below last_raw
-            used = base + raw
-            c.execute("UPDATE users SET base_bytes=?,last_raw=?,used_bytes=? WHERE token=?", (base, raw, used, u["token"]))
-        else:
-            used = u["used_bytes"]   # no counter reported for this user this poll -> keep prior used, don't touch
-        record_daily(c, u["token"], used, today)
-    prune_daily(c)
-    c.commit(); c.close()
+    for _ in range(3):
+        begin_xray_counter_epoch()
+        raws = xr_usage_all()
+        if raws is None: return   # failed read must never be mistaken for a counter reset
+        pid = getattr(raws, "epoch_pid", None)
+        if not _stats_epoch_still_running(pid): continue
+        c = db()
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            if not _stats_epoch_matches(c, pid): c.rollback(); continue
+            today = day_key()
+            for u in c.execute("SELECT token,base_bytes,last_raw,used_bytes,rebase_floor,usage_anchor FROM users").fetchall():
+                if u["usage_anchor"] is not None:
+                    emails = getattr(raws, "emails", None)
+                    used = _ledger_apply_snapshot(c, u, emails) if emails is not None else u["used_bytes"]
+                elif u["token"] in raws:
+                    raw = raws[u["token"]]
+                    base, used = _usage_from_raw(u, raw)
+                    c.execute("UPDATE users SET base_bytes=?,last_raw=?,used_bytes=?,rebase_floor=NULL WHERE token=?",
+                              (base, raw, used, u["token"]))
+                else:
+                    used = u["used_bytes"]
+                record_daily(c, u["token"], used, today)
+            prune_daily(c)
+            c.commit(); return
+        finally:
+            c.close()
 
 def record_daily(c, token, used, day):
     r = c.execute("SELECT start_used,end_used FROM usage_daily WHERE token=? AND day=?", (token, day)).fetchone()
@@ -828,10 +1608,26 @@ def panel_usage_summary():
     c.close(); return int(total), int(today), int(last30)
 
 def resync_all():
-    c = db(); rows = c.execute("SELECT token,uuid,label,disabled_ts,frozen FROM users").fetchall(); c.close()
+    # A restart clears Xray's dynamic users. Reconcile stored identities first,
+    # then register every eligible identity again, including unchanged slots.
+    # A failed per-link revocation must not restore its old shared credential.
+    begin_xray_counter_epoch()
+    c = db(); rows = c.execute("SELECT * FROM users").fetchall(); c.close()
+    ok = True; cut = set()
     for u in rows:
-        if u["disabled_ts"] or u["frozen"]: continue   # grace or manual freeze -> keep out of xray
-        xr_add_user(u["token"], u["uuid"]); write_sub(u["token"], u["uuid"], u["label"])
+        user_ok, user_cut = _reconcile_user_membership(u)
+        cut.update(user_cut)
+        if not user_ok:
+            ok = False
+            continue
+        if not _eligible_for_membership(u): continue  # grace, freeze, or exhausted quota -> keep out of xray
+        if not xr_add_user(u["token"], u["uuid"]):
+            ok = False
+            continue
+        write_sub(u["token"], u["uuid"], u["label"])
+    if cut: force_disconnect(cut)
+    meta_set("membership_sync_pending", "" if ok else "1")
+    return ok
 
 def notify_admin(text):
     a = (next(iter(ADMIN_IDS)) if ADMIN_IDS else meta_get("admin_id"))
@@ -923,7 +1719,7 @@ def extend_time(token, days):
     c = db(); u = c.execute("SELECT expiry_ts FROM users WHERE token=?", (token,)).fetchone()
     if u:
         now = int(time.time()); base = u["expiry_ts"] if (u["expiry_ts"] or 0) > now else now
-        c.execute("UPDATE users SET expiry_ts=? WHERE token=?", (base + int(days) * 86400, token)); c.commit()
+        c.execute("UPDATE users SET expiry_ts=? WHERE token=?", (base + int(float(days) * 86400), token)); c.commit()
     c.close()
 
 def set_unlimited(token, field):
@@ -946,13 +1742,13 @@ def route_cb(chat, mid, data, cbid):
     if data.startswith("vol:"):
         v = data.split(":", 1)[1]
         if v == "custom":
-            pending[chat] = {"stage": "vol_custom"}; answer(cbid); edit(chat, mid, "عدد حجم را به <b>گیگابایت</b> بفرست (مثلاً 25):"); return
+            pending[chat] = {"stage": "vol_custom"}; answer(cbid); edit(chat, mid, "عدد حجم را به <b>گیگابایت</b> بفرست (مثلاً 0.5 یا 25):"); return
         pending[chat] = {"stage": "dur", "vol_gb": float(v)}; answer(cbid)
         edit(chat, mid, "حجم: %s ✅\n⏳ مدت زمان را انتخاب کن:" % ("نامحدود" if float(v) == 0 else "%sGB" % v), dur_kb()); return
     if data.startswith("dur:"):
         d = data.split(":", 1)[1]; st = pending.get(chat, {})
         if d == "custom":
-            st["stage"] = "dur_custom"; pending[chat] = st; answer(cbid); edit(chat, mid, "تعداد <b>روز</b> را بفرست (مثلاً 45):"); return
+            st["stage"] = "dur_custom"; pending[chat] = st; answer(cbid); edit(chat, mid, "تعداد <b>روز</b> را بفرست (مثلاً 0.5 یا 45):"); return
         st["dur_days"] = int(d); st["stage"] = "name"; pending[chat] = st; answer(cbid)
         edit(chat, mid, "🏷 یک نام برای این لینک بفرست (مثلاً اسم مشتری):", [[{"text": "⏭ بدون نام", "callback_data": "noname"}]])
         return
@@ -1016,7 +1812,14 @@ def route_cb(chat, mid, data, cbid):
         if not u: answer(cbid, "یافت نشد"); edit(chat, mid, "📋 لینک‌ها:", list_kb()); return
         answer(cbid); edit(chat, mid, detail_text(u), detail_kb(token)); return
     if data.startswith("del:"):
-        delete_user(data[4:]); answer(cbid, "حذف شد 🗑"); edit(chat, mid, "📋 لینک‌ها:", list_kb()); return
+        token = data[4:]
+        if delete_user(token):
+            answer(cbid, "حذف شد 🗑"); edit(chat, mid, "📋 لینک‌ها:", list_kb())
+        else:
+            answer(cbid, "حذف در Xray کامل نشد؛ دوباره تلاش می‌شود")
+            edit(chat, mid, "⚠️ حذف در Xray کامل نشد. پنل دوباره تلاش می‌کند.",
+                 [[{"text": "بازگشت به لینک", "callback_data": "u:%s" % token}]])
+        return
     answer(cbid)
 
 def handle_update(up):
@@ -1040,8 +1843,10 @@ def handle_update(up):
         send(chat, "✅ <b>%d آی‌پی</b> ذخیره و همه‌ی لینک‌ها بروز شدند:\n%s\n\nمشتری‌ها فقط کافیست Update بزنند." % (len(valid), "\n".join("• <code>%s</code>" % i for i in valid)), main_menu_kb()); return
     if st and st.get("stage") in ("addvol_custom", "addtime_custom"):
         is_vol = st["stage"] == "addvol_custom"; token = st["token"]
-        try: n = float(text.replace(",", ".")) if is_vol else int(text)
-        except Exception: send(chat, "یک عدد بفرست:"); return
+        try: n = float(text.replace(",", "."))
+        except Exception: send(chat, "یک عدد مثبت بفرست:"); return
+        if not math.isfinite(n) or n <= 0:
+            send(chat, "یک عدد مثبت بفرست:"); return
         (extend_volume if is_vol else extend_time)(token, n); pending.pop(chat, None); refresh_usage(token); maybe_reenable(token)
         c = db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone(); c.close()
         if u: send(chat, "✅ بروز شد.\n\n" + detail_text(u), detail_kb(token))
@@ -1057,12 +1862,16 @@ def handle_update(up):
         return
     if st and st.get("stage") == "vol_custom":
         try: gb = float(text.replace(",", "."))
-        except Exception: send(chat, "یک عدد بفرست (GB):"); return
+        except Exception: send(chat, "یک عدد مثبت بفرست (GB):"); return
+        if not math.isfinite(gb) or gb <= 0:
+            send(chat, "یک عدد مثبت بفرست (GB):"); return
         st["vol_gb"] = gb; st["stage"] = "dur"; pending[chat] = st
         send(chat, "حجم: %sGB ✅\nحالا مدت را انتخاب کن:" % gb, dur_kb()); return
     if st and st.get("stage") == "dur_custom":
-        try: d = int(text)
-        except Exception: send(chat, "یک عدد بفرست (روز):"); return
+        try: d = float(text.replace(",", "."))
+        except Exception: send(chat, "یک عدد مثبت بفرست (روز):"); return
+        if not math.isfinite(d) or d <= 0:
+            send(chat, "یک عدد مثبت بفرست (روز):"); return
         st["dur_days"] = d; st["stage"] = "name"; pending[chat] = st
         send(chat, "🏷 یک نام برای این لینک بفرست (مثلاً اسم مشتری):", [[{"text": "⏭ بدون نام", "callback_data": "noname"}]]); return
     if st and st.get("stage") == "name":
@@ -1078,27 +1887,57 @@ def handle_update(up):
 
 def enforcer():
     last_pid = meta_get("xray_pid")
+    next_outbound_retry = 0
+    next_membership_retry = 0
     while True:
         try:
             pid = xray_pid()
             if pid and pid != "0" and pid != last_pid:
                 resync_all(); last_pid = pid; meta_set("xray_pid", pid)
+            # Credential changes must settle before a pending outbound rewrite
+            # restarts Xray and clears the counters needed for legacy migration.
+            if meta_get("membership_sync_pending") == "1" and time.time() >= next_membership_retry:
+                next_membership_retry = time.time() + 60
+                resync_all()
+            if (meta_get("outbound_sync_pending") == "1" and
+                    meta_get("membership_sync_pending") != "1" and time.time() >= next_outbound_retry):
+                next_outbound_retry = time.time() + 300
+                refresh_all_usage()  # Xray restart would otherwise discard unbanked counters
+                applied, reason = apply_xray_outbounds()
+                if applied:
+                    meta_set("outbound_sync_pending", "")
+                    resync_all()
+                else:
+                    print("outbound cleanup retry failed:", reason, flush=True)
             refresh_all_usage()
-            c = db(); rows = c.execute("SELECT token,uuid,used_bytes,usage_reset_bytes,limit_bytes,expiry_ts,label,disabled_ts,frozen FROM users").fetchall(); c.close()
+            c = db(); rows = c.execute("SELECT token,uuid,used_bytes,usage_reset_bytes,limit_bytes,expiry_ts,label,disabled_ts,frozen,auth_pending,pending_delete FROM users").fetchall(); c.close()
             now = int(time.time())
             for cur in rows:
+                if cur["pending_delete"]:
+                    if delete_user(cur["token"]):
+                        notify_admin("🗑 لینک «%s» پس از تلاش دوباره حذف شد." % cur["label"])
+                    continue
+                if cur["auth_pending"]:
+                    tags = tags_to_cut_for_user(cur["token"])
+                    removed = xr_remove_user(cur["token"])
+                    force_disconnect(tags)
+                    if not removed: continue
+                    _rotate_legacy_emails(cur["token"])
+                    c = db(); c.execute("UPDATE users SET auth_pending=0 WHERE token=?", (cur["token"],)); c.commit(); c.close()
                 if cur["frozen"]: continue   # manually frozen -> ignore all auto disable/grace/reenable
                 reason = exhaust_reason(cur, now)
                 if reason:
                     if not cur["disabled_ts"]:                       # just ran out -> disable + notify, start 48h grace
-                        disable_user(cur["token"])
-                        notify_admin("⏸ لینک «%s» غیرفعال شد (%s).\nتا ۴۸ ساعت قابل تمدید است؛ بعد از آن خودکار حذف می‌شود." % (cur["label"], reason))
+                        if disable_user(cur["token"]):
+                            notify_admin("⏸ لینک «%s» غیرفعال شد (%s).\nتا ۴۸ ساعت قابل تمدید است؛ بعد از آن خودکار حذف می‌شود." % (cur["label"], reason))
+                        else:
+                            notify_admin("⚠️ غیرفعال‌سازی لینک «%s» در Xray کامل نشد؛ پنل دوباره تلاش می‌کند." % cur["label"])
                     elif now - cur["disabled_ts"] >= GRACE_SECONDS:  # grace over -> delete + notify
-                        delete_user(cur["token"])
-                        notify_admin("🗑 لینک «%s» پس از ۴۸ ساعت مهلتِ تمدید، خودکار حذف شد." % cur["label"])
+                        if delete_user(cur["token"]):
+                            notify_admin("🗑 لینک «%s» پس از ۴۸ ساعت مهلتِ تمدید، خودکار حذف شد." % cur["label"])
                 elif cur["disabled_ts"]:                             # got renewed -> bring back live + notify
-                    reenable_user(cur["token"])
-                    notify_admin("▶️ لینک «%s» تمدید شد و دوباره فعال شد." % cur["label"])
+                    if reenable_user(cur["token"]):
+                        notify_admin("▶️ لینک «%s» تمدید شد و دوباره فعال شد." % cur["label"])
         except Exception as e:
             print("enforcer err", e, flush=True)
         time.sleep(POLL)
@@ -1196,7 +2035,8 @@ def daily_series(days=7, token=None, now=None):
 
 def users_overview():
     c = db(); today = day_key()
-    rows = c.execute("SELECT token,label,used_bytes,usage_reset_bytes,limit_bytes,expiry_ts,disabled_ts,frozen,created_ts FROM users ORDER BY created_ts DESC").fetchall()
+    rows = c.execute("SELECT token,label,used_bytes,usage_reset_bytes,limit_bytes,expiry_ts,disabled_ts,frozen,created_ts,"
+                     "config_override IS NOT NULL AS custom_config FROM users ORDER BY created_ts DESC").fetchall()
     daily = {r["token"]: int(r["v"] or 0) for r in
              c.execute("SELECT token, max(end_used-start_used,0) v FROM usage_daily WHERE day=?", (today,)).fetchall()}
     c.close()
@@ -1237,6 +2077,7 @@ a{color:var(--ink);text-decoration:none}
 .metric .v{font-size:18px;font-weight:800;margin-top:3px}
 .pills{display:flex;gap:8px;margin-top:14px}
 .pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:700;color:var(--ink);background:var(--card);border:2px solid var(--ink);padding:4px 10px}
+.linkbadge{display:inline-block;font-size:10px;font-weight:800;border:1px solid var(--ink);background:var(--accent);color:#111;padding:1px 5px;margin-inline-start:6px;vertical-align:middle}
 .d{width:9px;height:9px;border:2px solid var(--ink)}
 .d.ok{background:var(--ok)}
 .d.off{background:var(--paper)}
@@ -1375,12 +2216,13 @@ def _user_row(u, online=False):
         fill = "<span class=fil style='width:100%;opacity:.3'></span>"
     if u["frozen"]: st = "frz"          # manual freeze -> icy square, overrides quota colour
     if online and not u["frozen"]: st += " on"   # live now -> pulsing halo in the square's own colour
+    badge = "<span class=linkbadge>اختصاصی</span>" if u["custom_config"] else ""
     return ("<a class=u href='/a/user?token=%s'><span class='st %s'></span>"
-            "<span class=nm><b>%s</b><span class=sub><span class=n>%s / %s</span></span></span>"
+            "<span class=nm><b>%s</b>%s<span class=sub><span class=n>%s / %s</span></span></span>"
             "<span class=meter><span class=trk>%s</span></span>"
             "<span class=rt><span class=n>%s</span><br>%s</span></a>") % (
         u["token"], st, html.escape(u["label"]),
-        fmt_bytes(used), human_limit(lim), fill,
+        badge, fmt_bytes(used), human_limit(lim), fill,
         fmt_bytes(u["today"]), human_expiry(u["expiry_ts"]))
 
 def render_dashboard(csrf):
@@ -1408,7 +2250,7 @@ def _form(action, fields, csrf, btn, cls="btn"):
     inner = "".join(fields) + "<input type=hidden name=csrf value='%s'>" % csrf
     return "<form method=post action='%s' class=row>%s<button class='%s'>%s</button></form>" % (action, inner, cls, btn)
 
-def render_user(token, csrf):
+def render_user(token, csrf, msg=""):
     c = db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone(); c.close()
     if not u:
         return _page("یافت نشد", _top("<a href='/a/'>← داشبورد</a>", csrf) + "<div class=card>لینکی با این شناسه پیدا نشد.</div>")
@@ -1430,8 +2272,8 @@ def render_user(token, csrf):
         ("اتصال قطع است — برای فعال‌سازیِ دوباره تیک را بردار" if frz
          else "با زدنِ تیک، این کانفیگ فوراً قطع و تا برداشتنِ تیک غیرفعال می‌ماند"))
     forms = (
-        _form("/a/addvol", [tk, "<input type=number name=gb placeholder='حجم (گیگ)'>"], csrf, "افزودن حجم") +
-        _form("/a/addtime", [tk, "<input type=number name=days placeholder='مدت (روز)'>"], csrf, "افزودن زمان") +
+        _form("/a/addvol", [tk, "<input type=number name=gb step=any min=0 placeholder='حجم (گیگ)'>"], csrf, "افزودن حجم") +
+        _form("/a/addtime", [tk, "<input type=number name=days step=any min=0 placeholder='مدت (روز)'>"], csrf, "افزودن زمان") +
         _form("/a/rename", [tk, "<input type=text name=name placeholder='نام تازه'>"], csrf, "تغییر نام") +
         _form("/a/unlimit", [tk, "<input type=hidden name=field value=limit_bytes>"], csrf, "حجم نامحدود", "btn ghost") +
         _form("/a/unlimit", [tk, "<input type=hidden name=field value=expiry_ts>"], csrf, "زمان نامحدود", "btn ghost"))
@@ -1447,12 +2289,14 @@ def render_user(token, csrf):
         fmt_bytes(current_usage(u)), human_limit(u["limit_bytes"]), fmt_bytes(today_u),
         human_expiry(u["expiry_ts"]), chart)
     link = "<div class=card><h2>لینک اشتراک</h2><code>%s</code></div>" % sub_url(token)
-    actions = "<div class=card><h2>مدیریت</h2><div class=grid>%s</div><div class=row style='margin-top:10px'>%s%s</div></div>" % (forms, reset, dele)
-    return _page("کاربر", _top("<a href='/a/'>← داشبورد</a>", csrf) + hero + frz_card + link + actions)
+    config_link = "<a class='btn ghost' href='/a/user-config?token=%s'>⚙ تنظیمات لینک</a>" % token
+    actions = "<div class=card><h2>مدیریت</h2><div class=grid>%s</div><div class=row style='margin-top:10px'>%s%s%s</div></div>" % (forms, config_link, reset, dele)
+    notice = ("<div class=card role=alert>%s</div>" % html.escape(msg)) if msg else ""
+    return _page("کاربر", _top("<a href='/a/'>← داشبورد</a>", csrf) + notice + hero + frz_card + link + actions)
 
 def render_new(csrf):
-    f = _form("/a/new", ["<input type=number name=gb placeholder='حجم (گیگ) — ۰ = نامحدود'>",
-                         "<input type=number name=days placeholder='مدت (روز) — ۰ = نامحدود'>",
+    f = _form("/a/new", ["<input type=number name=gb step=any min=0 placeholder='حجم (گیگ) — ۰ = نامحدود'>",
+                         "<input type=number name=days step=any min=0 placeholder='مدت (روز) — ۰ = نامحدود'>",
                          "<input type=text name=name placeholder='نام مشتری'>"], csrf, "ساخت لینک")
     return _page("لینک جدید", _top("<a href='/a/'>← داشبورد</a>", csrf) +
                  "<div class=card><h2>لینک جدید</h2>%s</div>" % f)
@@ -1477,26 +2321,184 @@ def render_resetconfirm(token, csrf):
                  "<div class=row>%s<a class='btn ghost' href='/a/user?token=%s'>انصراف</a></div></div>" %
                  (html.escape(u["label"]), f, token))
 
-def render_config(csrf):
-    recipe = get_recipe(); ips = get_ips(); rows = ""
+def _config_html(value):
+    return html.escape(str(value), quote=True)
+
+def _config_message(msg):
+    if not msg: return ""
+    bad = str(msg).startswith(("خطا", "error:", "Error:"))
+    return "<div class='card obmsg %s' role='%s'>%s</div>" % (
+        "bad" if bad else "good", "alert" if bad else "status", _config_html(msg))
+
+def _sync_notice():
+    notes = []
+    if meta_get("membership_sync_pending") == "1":
+        notes.append("اتصال‌ها هنوز کامل همگام نشده‌اند؛ پنل دوباره تلاش می‌کند.")
+    if meta_get("outbound_sync_pending") == "1":
+        notes.append("تغییر خروجی‌ها هنوز در Xray اعمال نشده است؛ پنل دوباره تلاش می‌کند.")
+    return _config_message("خطا: " + " ".join(notes)) if notes else ""
+
+def _render_config_fields(settings, editable=True):
+    """The same provisioned endpoint controls for the global and per-link pages."""
+    recipe = settings.get("recipe") or {}
+    endpoint_settings = settings.get("endpoint_settings") or {}
+    ips = settings.get("ips") or []
+    hosts = approved_hosts()
+    disabled = "" if editable else " disabled"
+    rows = []
     for ep in ENDPOINTS:
-        tag = ep["tag"]; r = recipe.get(tag, {"enabled": True, "count": 0}); nports = len(_ep_slots(ep))
-        rows += ("<div class=eprow>"
-                 "<label class=eplabel><input type=checkbox name='en_%s'%s>"
-                 "<span><b>%s</b><span class=eptag>%s · %s</span></span></label>"
-                 "<input type=number name='cnt_%s' value='%d' min=0 aria-label='تعداد %s'>"
-                 "</div>") % (tag, (" checked" if r["enabled"] else ""), html.escape(ep.get("label", tag)),
-                              html.escape(tag), ("مستقیم روی IP سرور، بدون کلادفلر" if "reality" in ep else "%d پورت" % nports),
-                              tag, r["count"], html.escape(tag))
-    body = ("<form method=post action='/a/config' class=grid>"
-            "<h2>نوع و تعداد کانفیگ‌ها</h2>"
-            "<p class=hint>تعداد سقفی ندارد؛ بیشتر از تعداد پورت، روی آی‌پی‌های تمیز پخش می‌شود.</p>%s"
+        tag = ep["tag"]; key = _config_html(tag)
+        r = recipe.get(tag) or {}
+        cfg = endpoint_settings.get(tag) or _endpoint_defaults(ep)
+        name = _config_html(ep.get("label", tag))
+        is_reality = "reality" in ep
+        try: count = max(0, int(r.get("count", 0)))
+        except (TypeError, ValueError): count = 0
+        head = ("<div class=row style='justify-content:space-between'>"
+                "<label class=eplabel><input type=checkbox name='en_%s'%s%s>"
+                "<span><b>%s</b><span class=eptag>%s · %s</span></span></label>"
+                "<label class=hint>تعداد <input type=number name='cnt_%s' value='%d' min=0%s "
+                "aria-label='تعداد %s'></label></div>") % (
+                    key, " checked" if r.get("enabled", True) else "", disabled,
+                    name, key, "REALITY مستقیم" if is_reality else _config_html(
+                        "%s / %s" % (ep.get("proto", ""), ep.get("net", ""))),
+                    key, count, disabled, key)
+        label = ("<label class=hint for='label_%s'>نام کانفیگ</label>"
+                 "<input type=text id='label_%s' name='label_%s' maxlength=64 value='%s'%s "
+                 "style='width:100%%;max-width:100%%'>") % (
+                     key, key, key, _config_html(cfg.get("label", ep.get("label", tag))), disabled)
+        if is_reality:
+            ports = "<p class=hint>پورت مستقیمِ آماده‌شده: <span class=n>%s</span></p>" % _config_html(ep.get("port", ""))
+            host = "<p class=hint>Host و SNI کلادفلر برای REALITY کاربرد ندارد.</p>"
+            path = "<p class=hint>این پروتکل مسیر Cloudflare ندارد.</p>"
+            fragment = "<p class=hint>Fragment برای این کانفیگ کاربرد ندارد.</p>"
+        else:
+            port_items = []
+            for field, title in (("tls", "TLS"), ("notls", "بدون TLS")):
+                allowed = ep.get("tls_ports" if field == "tls" else "notls_ports", [])
+                selected = cfg.get("tls_ports" if field == "tls" else "notls_ports", [])
+                if not allowed: continue
+                checks = "".join(
+                    "<label class=pill><input type=checkbox name='%s_%s_%s'%s%s>"
+                    "<span class=n>%s</span></label>" % (
+                        field, key, _config_html(port), " checked" if port in selected else "",
+                        disabled, _config_html(port)) for port in allowed)
+                port_items.append("<div><span class=hint>%s</span><div class=row>%s</div></div>" % (title, checks))
+            ports = "<div class=grid>%s</div>" % "".join(port_items)
+            selected_host = next((i for i, pair in enumerate(hosts)
+                                  if pair["host"] == cfg.get("host") and pair["sni"] == cfg.get("sni")), 0)
+            options = "".join("<option value='%d'%s>%s</option>" % (
+                i, " selected" if i == selected_host else "",
+                _config_html("Host: %s · SNI: %s" % (pair["host"], pair["sni"])))
+                for i, pair in enumerate(hosts))
+            host = ("<label class=hint for='hostidx_%s'>جفت Host / SNI آماده‌شده</label>"
+                    "<select id='hostidx_%s' name='hostidx_%s'%s "
+                    "style='width:100%%;max-width:100%%;padding:9px;border:3px solid var(--ink);"
+                    "background:var(--card);color:var(--ink);font:inherit'>%s</select>") % (
+                        key, key, key, disabled, options)
+            path = "<div><span class=hint>مسیر ثابتِ آماده‌شده برای این endpoint</span><code dir=ltr>%s</code></div>" % (
+                _config_html(ep.get("path", "")))
+            if ep.get("proto") == "vmess":
+                fragment = "<p class=hint>Fragment در لینک VMess پشتیبانی نمی‌شود.</p>"
+            else:
+                fragment = ("<label class=hint for='fm_%s'>Fragment JSON (خالی = غیرفعال)</label>"
+                            "<textarea id='fm_%s' name='fm_%s' rows=3 dir=ltr%s>%s</textarea>") % (
+                                key, key, key, disabled, _config_html(cfg.get("fragment_fm", "")))
+        rows.append("<div class=eprow style='display:block'><div class=grid>%s%s%s%s%s%s</div></div>" % (
+            head, label, ports, host, path, fragment))
+    return ("<h2>نوع و تعداد کانفیگ‌ها</h2>"
+            "<p class=hint>فقط پورت‌ها، مسیرها و جفت‌های Host / SNI آماده‌شده روی سرور قابل انتخاب‌اند. "
+            "تعداد سقفی ندارد؛ تعداد بیشتر روی پورت‌ها و آی‌پی‌ها پخش می‌شود. "
+            "با حذف پورت یا غیرفعال‌کردن پروتکل، کانفیگ قدیمی آن قطع می‌شود و برنامهٔ کاربر باید اشتراک را تازه کند.</p>%s"
             "<h2 style='margin-top:16px'>آی‌پی‌های تمیز کلادفلر</h2>"
-            "<textarea name=ips rows=4 placeholder='104.16.96.1, 104.21.96.1'>%s</textarea>"
+            "<textarea name=ips rows=4 dir=ltr placeholder='104.16.96.1, 104.21.96.1'%s>%s</textarea>") % (
+                "".join(rows), disabled, _config_html("\n".join(ips)))
+
+def _render_link_outbounds(obs, editable):
+    rows = []
+    for i, ob in enumerate(obs):
+        if not isinstance(ob, dict): continue
+        tag = _config_html(ob.get("tag", ""))
+        link = _config_html(ob.get("link", ""))
+        domains = _config_html("\n".join(ob.get("domains") or []))
+        if editable:
+            rows.append("<div class=eprow style='display:block'><div class=grid>"
+                        "<label class=hint for='ob_tag_%d'>نام خروجی</label>"
+                        "<input type=text id='ob_tag_%d' name='ob_tag_%d' maxlength=24 value='%s' "
+                        "style='width:100%%;max-width:100%%'>"
+                        "<label class=hint for='ob_link_%d'>لینک خروجی</label>"
+                        "<textarea id='ob_link_%d' name='ob_link_%d' rows=3 dir=ltr>%s</textarea>"
+                        "<label class=hint for='ob_dom_%d'>دامنه‌ها؛ هر خط یکی. خالی = خروجی همهٔ ترافیک</label>"
+                        "<textarea id='ob_dom_%d' name='ob_dom_%d' rows=3 dir=ltr>%s</textarea>"
+                        "<label class=row><input type=checkbox name='ob_delete_%d'>حذف این خروجی</label>"
+                        "</div></div>" % (i, i, i, tag, i, i, link, i, i, domains, i))
+        else:
+            summary = "همهٔ ترافیک" if not ob.get("domains") else "، ".join(ob["domains"])
+            rows.append("<div class=eprow style='display:block'><b>%s</b>"
+                        "<p class=hint>%s</p><details><summary class=hint>نمایش لینک خروجی</summary>"
+                        "<code dir=ltr>%s</code></details></div>" % (
+                            tag, _config_html(summary), link))
+    if editable:
+        rows.append("<div class=eprow style='display:block'><div class=grid>"
+                    "<b>افزودن خروجی</b>"
+                    "<input type=text name=new_ob_tag maxlength=24 placeholder='نام کوتاه، مثلاً clean-ai' "
+                    "style='width:100%;max-width:100%'>"
+                    "<textarea name=new_ob_link rows=3 dir=ltr placeholder='vless://… یا socks://…'></textarea>"
+                    "<label class=hint for=new_ob_dom>دامنه‌ها؛ هر خط یکی. خالی = همهٔ ترافیک</label>"
+                    "<textarea id=new_ob_dom name=new_ob_dom rows=3 dir=ltr></textarea>"
+                    "</div></div>")
+    elif not rows:
+        rows.append("<p class=hint>خروجی‌ای تعریف نشده؛ ترافیک مستقیم می‌رود.</p>")
+    return "<h2 style='margin-top:16px'>خروجی‌ها و دامنه‌ها</h2>%s" % "".join(rows)
+
+def render_config(csrf, msg=""):
+    fields = _render_config_fields(global_settings_snapshot())
+    body = ("<form method=post action='/a/config' class=grid>%s"
+            "<input type=hidden name=endpoint_fields value=1>"
             "<input type=hidden name=csrf value='%s'>"
-            "<button class=btn style='margin-top:12px'>ذخیره و بازتولیدِ همه لینک‌ها</button></form>") % (
-        rows, html.escape("\n".join(ips)), csrf)
-    return _page("پیکربندی", _top("<a href='/a/'>← داشبورد</a>", csrf) + "<div class=card>%s</div>" % body)
+            "<button class=btn style='margin-top:12px'>ذخیره و بازتولید همهٔ لینک‌های پیش‌فرض</button>"
+            "</form>") % (fields, _config_html(csrf))
+    return _page("پیکربندی", _top("<a href='/a/'>← داشبورد</a>", csrf) +
+                 _config_message(msg) + _sync_notice() + "<div class=card>%s</div>" % body)
+
+def render_user_config(token, csrf, msg=""):
+    c = db(); user = c.execute("SELECT label FROM users WHERE token=?", (token,)).fetchone(); c.close()
+    if not user:
+        return _page("یافت نشد", _top("<a href='/a/'>← داشبورد</a>", csrf) +
+                     "<div class=card>لینکی با این شناسه پیدا نشد.</div>")
+    token_attr = _config_html(token)
+    back = "<a href='/a/user?token=%s'>← %s</a>" % (
+        _config_html(urllib.parse.quote(token, safe="")), _config_html(user["label"]))
+    custom = get_link_override(token)
+    if custom is None:
+        snapshot = global_settings_snapshot()
+        mode = "<div class='card hero'><b>حالت پیش‌فرض عمومی</b><p>این لینک تغییرات بعدی تنظیمات عمومی را دنبال می‌کند.</p></div>"
+        fields = _render_config_fields(snapshot, editable=False)
+        outbounds = _render_link_outbounds(snapshot.get("outbounds") or [], editable=False)
+        buttons = ("<form method=post action='/a/user-config'>"
+                   "<input type=hidden name=token value='%s'>"
+                   "<input type=hidden name=csrf value='%s'>"
+                   "<button class=btn name=action value=customize>فعال‌سازی تنظیمات اختصاصی</button>"
+                   "</form>") % (token_attr, _config_html(csrf))
+        body = "<div class=card><div class=grid>%s%s</div></div>%s" % (fields, outbounds, buttons)
+    else:
+        mode = "<div class='card hero'><b>حالت اختصاصی</b><p>تغییرات این صفحه فقط روی همین لینک اعمال می‌شود.</p></div>"
+        fields = _render_config_fields(custom, editable=True)
+        outbounds = _render_link_outbounds(custom.get("outbounds") or [], editable=True)
+        save = ("<form method=post action='/a/user-config' class=grid>"
+                "<input type=hidden name=token value='%s'>"
+                "<input type=hidden name=csrf value='%s'>"
+                "<input type=hidden name=endpoint_fields value=1>"
+                "<input type=hidden name=outbound_fields value=1>%s%s"
+                "<button class=btn name=action value=save>ذخیره و بازتولید این لینک</button>"
+                "</form>") % (token_attr, _config_html(csrf), fields, outbounds)
+        reset = ("<form method=post action='/a/user-config' style='margin-top:14px'>"
+                 "<input type=hidden name=token value='%s'>"
+                 "<input type=hidden name=csrf value='%s'>"
+                 "<button class='btn ghost' name=action value=default>بازگشت به پیش‌فرض عمومی</button>"
+                 "</form>") % (token_attr, _config_html(csrf))
+        body = "<div class=card>%s%s</div>" % (save, reset)
+    return _page("تنظیمات لینک", _top(back, csrf) + _config_message(msg) + _sync_notice() + mode + body)
 
 OB_JS = """
 var OB={csrf:''};
@@ -1617,9 +2619,11 @@ def route_admin(method, path, query, cookie_header, body, now=None):
         return 200, {"Content-Type": "text/html; charset=utf-8"}, render_expired().encode("utf-8")
     if method == "GET":
         if path in ("/a", "/a/"):      return _html(render_dashboard(csrf))
-        if path == "/a/user":          return _html(render_user(query.get("token", [""])[0], csrf))
+        if path == "/a/user":          return _html(render_user(query.get("token", [""])[0], csrf, query.get("msg", [""])[0]))
         if path == "/a/new":           return _html(render_new(csrf))
-        if path == "/a/config":        return _html(render_config(csrf))
+        if path == "/a/config":        return _html(render_config(csrf, query.get("msg", [""])[0]))
+        if path == "/a/user-config":
+            return _html(render_user_config(query.get("token", [""])[0], csrf, query.get("msg", [""])[0]))
         if path == "/a/outbounds":     return _html(render_outbounds(csrf, query.get("msg", [""])[0]))
         if path == "/a/reset":         return _html(render_resetconfirm(query.get("token", [""])[0], csrf))
         if path == "/a/del":           return _html(render_delconfirm(query.get("token", [""])[0], csrf))
@@ -1628,6 +2632,72 @@ def route_admin(method, path, query, cookie_header, body, now=None):
 
 def _redirect(loc):
     return 302, {"Location": loc}, b""
+
+def _parse_config_fields(form, current):
+    """Parse settings common to the global and one-link forms before any writes."""
+    recipe = {}
+    for ep in ENDPOINTS:
+        tag = ep["tag"]
+        try: count = int(form.get("cnt_" + tag, "0"))
+        except (TypeError, ValueError): raise ValueError("تعداد کانفیگ «%s» نامعتبر است" % tag)
+        if count < 0: raise ValueError("تعداد کانفیگ نمی‌تواند منفی باشد")
+        recipe[tag] = {"enabled": ("en_" + tag) in form, "count": count}
+    ips = parse_ips(form.get("ips", ""))
+    if not ips: raise ValueError("حداقل یک آی‌پی تمیز معتبر وارد کنید")
+    options = current["endpoint_settings"]
+    if form.get("endpoint_fields") == "1":
+        options = {}
+        hosts = approved_hosts()
+        for ep in ENDPOINTS:
+            tag = ep["tag"]; base = _endpoint_defaults(ep)
+            if "reality" in ep:
+                label = (form.get("label_" + tag) or "").strip()
+                if not label or len(label) > 64:
+                    raise ValueError("نام کانفیگ باید بین ۱ تا ۶۴ نویسه باشد")
+                options[tag] = {**base, "label": label}
+                continue
+            try: host_index = int(form.get("hostidx_" + tag, "0"))
+            except (TypeError, ValueError): raise ValueError("گزینهٔ دامنه/SNI نامعتبر است")
+            if not 0 <= host_index < len(hosts): raise ValueError("گزینهٔ دامنه/SNI آماده نیست")
+            label = (form.get("label_" + tag) or "").strip()
+            if not label or len(label) > 64: raise ValueError("نام کانفیگ باید بین ۱ تا ۶۴ نویسه باشد")
+            fragment = "" if ep.get("proto") == "vmess" else (form.get("fm_" + tag) or "").strip()
+            if fragment:
+                try:
+                    if not isinstance(json.loads(fragment), dict): raise ValueError()
+                except ValueError: raise ValueError("Fragment برای «%s» باید JSON معتبر باشد" % tag)
+            options[tag] = {**base,
+                "tls_ports": [p for p in ep.get("tls_ports", []) if ("tls_%s_%s" % (tag, p)) in form],
+                "notls_ports": [p for p in ep.get("notls_ports", []) if ("notls_%s_%s" % (tag, p)) in form],
+                "label": label, "host": hosts[host_index]["host"], "sni": hosts[host_index]["sni"],
+                "fragment_fm": fragment}
+    return {"recipe": recipe, "ips": ips, "endpoint_settings": _normal_endpoint_settings(options)}
+
+def _parse_custom_outbounds(form, previous):
+    if form.get("outbound_fields") != "1": return previous
+    obs = []
+    indexes = sorted({int(m.group(1)) for key in form for m in [re.fullmatch(r"ob_tag_(\d+)", key)] if m})
+    for i in indexes:
+        if form.get("ob_delete_%d" % i): continue
+        tag = (form.get("ob_tag_%d" % i) or "").strip()
+        link = (form.get("ob_link_%d" % i) or "").strip()
+        domains = parse_domains(form.get("ob_dom_%d" % i, ""))
+        if tag or link: obs.append({"tag": tag, "link": link, "domains": domains})
+    new_tag = (form.get("new_ob_tag") or "").strip()
+    new_link = (form.get("new_ob_link") or "").strip()
+    if new_tag or new_link:
+        obs.append({"tag": new_tag, "link": new_link,
+                    "domains": parse_domains(form.get("new_ob_dom", ""))})
+    seen = set()
+    for o in obs:
+        tag = o["tag"]
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,24}", tag) or tag in ("direct", "block"):
+            raise ValueError("نام خروجی باید ۱ تا ۲۴ حرف/عدد یا _ و - باشد")
+        if tag in seen: raise ValueError("نام خروجی تکراری است: %s" % tag)
+        seen.add(tag)
+        try: parse_outbound_link(o["link"], ob_user_xtag("check", tag))
+        except ValueError as e: raise ValueError("لینک خروجی «%s» نامعتبر است: %s" % (tag, e))
+    return obs
 
 def route_admin_post(method, path, query, csrf, body, now, sid):
     form = {k: v[0] for k, v in urllib.parse.parse_qs(body.decode("utf-8", "ignore")).items()}
@@ -1639,14 +2709,16 @@ def route_admin_post(method, path, query, csrf, body, now, sid):
         return 200, {"Content-Type": "text/html; charset=utf-8", "Set-Cookie": ck}, render_loggedout().encode("utf-8")
     token = form.get("token", "")
     def _num(x, cast):
-        try: return cast(str(x).replace(",", "."))
+        try:
+            n = cast(str(x).replace(",", "."))
+            return n if math.isfinite(n) and n >= 0 else None
         except Exception: return None
     if path == "/a/addvol":
         gb = _num(form.get("gb"), float)
         if gb: extend_volume(token, gb)
         refresh_usage(token); maybe_reenable(token); return _redirect("/a/user?token=" + token)
     if path == "/a/addtime":
-        days = _num(form.get("days"), int)
+        days = _num(form.get("days"), float)
         if days: extend_time(token, days)
         maybe_reenable(token); return _redirect("/a/user?token=" + token)
     if path == "/a/rename":
@@ -1661,27 +2733,119 @@ def route_admin_post(method, path, query, csrf, body, now, sid):
         maybe_reenable(token); return _redirect("/a/user?token=" + token)
     if path == "/a/freeze":
         if token:
-            if form.get("on"): freeze_user(token)     # checkbox ticked -> cut now
-            else:              unfreeze_user(token)    # ticked off -> bring back live
+            ok = freeze_user(token) if form.get("on") else unfreeze_user(token)
+            if not ok:
+                return _redirect("/a/user?token=%s&msg=%s" % (
+                    urllib.parse.quote(token), urllib.parse.quote("همگام‌سازی Xray کامل نشد؛ پنل دوباره تلاش می‌کند")))
         return _redirect("/a/user?token=" + token)
     if path == "/a/delete":
-        if form.get("confirm") == "yes" and token: delete_user(token)
+        if form.get("confirm") == "yes" and token and not delete_user(token):
+            return _redirect("/a/user?token=%s&msg=%s" % (
+                urllib.parse.quote(token), urllib.parse.quote("حذف در Xray کامل نشد؛ پنل دوباره تلاش می‌کند")))
         return _redirect("/a/")
     if path == "/a/new":
         gb = _num(form.get("gb"), float) or 0
-        days = _num(form.get("days"), int) or 0
+        days = _num(form.get("days"), float) or 0
         name = (form.get("name") or "").strip()[:40] or None
         create_user(gb, days, label=name)
         return _redirect("/a/")
     if path == "/a/config":
-        recipe = {ep["tag"]: {"enabled": form.get("en_" + ep["tag"]) is not None,
-                              "count": max(0, _num(form.get("cnt_" + ep["tag"]), int) or 0)}
-                  for ep in ENDPOINTS}
-        set_recipe(recipe)
-        ips = parse_ips(form.get("ips", ""))
-        if ips: set_ips(ips)
-        regenerate_all_subs()
-        return _redirect("/a/config")
+        before = global_settings_snapshot()
+        already_pending = meta_get("membership_sync_pending") == "1"
+        try: updated = _parse_config_fields(form, before)
+        except ValueError as e:
+            return _redirect("/a/config?msg=" + urllib.parse.quote("خطا: " + str(e)))
+        store_global_config(updated)
+        synced = xr_reconcile_all_users(before_recipe=before["recipe"],
+                                        before_settings=before["endpoint_settings"])
+        if not synced:
+            store_global_config(before)
+            restored = xr_reconcile_all_users(before_recipe=updated["recipe"],
+                                              before_settings=updated["endpoint_settings"])
+            regenerate_all_subs()
+            if restored and not already_pending: meta_set("membership_sync_pending", "")
+            msg = ("خطا: تنظیمات عمومی قبلی بازگردانده شد؛ کانفیگ‌هایی که شناسه‌شان در میانهٔ تغییر "
+                   "لغو شده، نیاز به به‌روزرسانی اشتراک دارند" if restored else
+                   "خطا: تنظیمات عمومی قبلی بازگردانده شد اما همگام‌سازی Xray هنوز کامل نیست")
+        else:
+            regenerate_all_subs()
+            if not already_pending: meta_set("membership_sync_pending", "")
+            msg = "ذخیره شد"
+        return _redirect("/a/config?msg=" + urllib.parse.quote(msg))
+    if path == "/a/user-config":
+        c = db(); user = c.execute("SELECT uuid,label FROM users WHERE token=?", (token,)).fetchone(); c.close()
+        if not user: return _redirect("/a/")
+        action = form.get("action", "")
+        before_override = get_link_override(token)
+        before_recipe = effective_recipe(token)
+        before_settings = effective_endpoint_settings(token)
+        before_outbounds = effective_outbounds(token)
+        if action == "customize":
+            if before_override is not None:
+                return _redirect("/a/user-config?token=" + urllib.parse.quote(token))
+            updated = global_settings_snapshot()
+        elif action == "default":
+            updated = None
+        elif action == "save" and before_override is not None:
+            try:
+                fields = _parse_config_fields(form, before_override)
+                obs = _parse_custom_outbounds(form, before_override.get("outbounds", []))
+            except ValueError as e:
+                return _redirect("/a/user-config?token=%s&msg=%s" % (
+                    urllib.parse.quote(token), urllib.parse.quote("خطا: " + str(e))))
+            updated = {**fields, "outbounds": obs}
+        else:
+            return _redirect("/a/user-config?token=" + urllib.parse.quote(token))
+        # A copied custom snapshot routes exactly as the current global rules.
+        # Xray only needs new user-scoped rules once either recipe diverges.
+        global_outbounds = get_outbounds()
+        before_route = before_outbounds if before_override is not None and before_outbounds != global_outbounds else None
+        after_outbounds = global_outbounds if updated is None else updated.get("outbounds", [])
+        after_route = after_outbounds if updated is not None and after_outbounds != global_outbounds else None
+        routing_changed = before_route != after_route
+        already_pending = meta_get("membership_sync_pending") == "1"
+        outbound_was_pending = meta_get("outbound_sync_pending") == "1"
+        if not set_link_override(token, updated, queue_sync=True,
+                                 queue_outbound=routing_changed): return _redirect("/a/")
+        after_recipe = effective_recipe(token)
+        after_settings = effective_endpoint_settings(token)
+        # Revoke/migrate credentials while their Xray usage counters are still
+        # available. Applying outbound routing restarts Xray and clears them.
+        synced = xr_reconcile_user_endpoints(token, user["uuid"],
+                                             before_recipe=before_recipe,
+                                             before_settings=before_settings)
+        if not synced:
+            set_link_override(token, before_override)
+            restored = xr_reconcile_user_endpoints(token, user["uuid"],
+                                                   before_recipe=after_recipe,
+                                                   before_settings=after_settings)
+            write_sub(token, user["uuid"], user["label"])
+            if restored and not already_pending: meta_set("membership_sync_pending", "")
+            if routing_changed and not outbound_was_pending: meta_set("outbound_sync_pending", "")
+            detail = ("تنظیمات قبلی بازگردانده شد؛ اگر شناسه‌ای در میانهٔ تغییر لغو شده باشد، "
+                      "کاربر باید اشتراک را تازه کند" if restored else
+                      "تنظیمات قبلی بازگردانده شد اما همگام‌سازی اتصال‌ها هنوز کامل نیست")
+            return _redirect("/a/user-config?token=%s&msg=%s" % (
+                urllib.parse.quote(token), urllib.parse.quote("خطا: " + detail)))
+        if routing_changed:
+            ok, reason = apply_xray_outbounds()
+            if not ok:
+                # Credential revocation cannot be undone by restoring an old
+                # snapshot: the old imported URI must stay revoked. Keep the
+                # saved endpoint settings and retry only the outbound apply.
+                meta_set("outbound_sync_pending", "1")
+                write_sub(token, user["uuid"], user["label"])
+                resync_all()
+                return _redirect("/a/user-config?token=%s&msg=%s" % (
+                    urllib.parse.quote(token), urllib.parse.quote(
+                        "خطا: تنظیمات لینک ذخیره شد، اما خروجی هنوز اعمال نشده و دوباره تلاش می‌شود: " + reason)))
+            meta_set("outbound_sync_pending", "")
+        write_sub(token, user["uuid"], user["label"])
+        if routing_changed: resync_all()  # Xray restart dropped the in-memory clients
+        elif not already_pending: meta_set("membership_sync_pending", "")
+        msg = "تنظیمات این لینک ذخیره شد" if synced else "خطا: ذخیره شد اما همگام‌سازی Xray کامل نشد"
+        return _redirect("/a/user-config?token=%s&msg=%s" % (
+            urllib.parse.quote(token), urllib.parse.quote(msg)))
     # --- outbounds: answer JSON to the panel's fetch(), plain redirects without JS ---
     def _ob_reply(ok, msg, relist=True, **extra):
         if form.get("ajax") != "1":
@@ -1717,15 +2881,26 @@ def route_admin_post(method, path, query, csrf, body, now, sid):
                                "برای فعال شدن «ذخیره و اعمال» را بزنید." % tag)
     if path == "/a/obdel":
         tag = (form.get("tag") or "").strip()
-        set_outbounds([o for o in _ob_keep_domains(get_outbounds()) if o["tag"] != tag])
+        set_outbounds([o for o in _ob_keep_domains(get_outbounds()) if o["tag"] != tag], queue_apply=True)
         meta_set("ob_test_" + tag, "")
+        refresh_all_usage()  # the Xray restart clears live traffic counters
         ok, msg = apply_xray_outbounds()
-        return _ob_reply(ok, ("حذف شد. " + msg) if ok else msg)
+        if ok:
+            meta_set("outbound_sync_pending", "")
+            resync_all()
+        return _ob_reply(ok, ("حذف شد. " + msg) if ok else
+                         "حذف ذخیره شد؛ اعمال روی Xray دوباره تلاش می‌شود: " + msg)
     if path == "/a/obsave":
         obs = _ob_keep_domains(get_outbounds())
-        set_outbounds(obs)
+        set_outbounds(obs, queue_apply=True)
+        refresh_all_usage()
         ok, msg = apply_xray_outbounds(obs)
-        return _ob_reply(ok, msg, relist=False)
+        if ok:
+            meta_set("outbound_sync_pending", "")
+            resync_all()
+        return _ob_reply(ok, msg if ok else
+                         "تنظیمات ذخیره شد؛ اعمال روی Xray دوباره تلاش می‌شود: " + msg,
+                         relist=False)
     if path == "/a/obtest":
         tag = (form.get("tag") or "").strip()
         res = test_outbound(tag)

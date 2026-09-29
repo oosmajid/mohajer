@@ -1,4 +1,5 @@
-import os, sys, json, base64, tempfile, unittest
+import os, sys, json, base64, tempfile, unittest, urllib.parse
+from unittest import mock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bot"))
 os.environ.setdefault("DPBOT_ENV", "/nonexistent-dpbot-env")
 import bot  # noqa: E402
@@ -136,6 +137,45 @@ class CatchAllTests(unittest.TestCase):
         self.assertEqual([t["port"] for t in tests], [bot.ob_test_port(0), bot.ob_test_port(1)])
 
 
+class CustomRoutingTests(unittest.TestCase):
+    GLOBAL = [{"tag": "clean", "link": "socks://1.2.3.4:1080", "domains": []}]
+    CUSTOM = [{"tag": "clean", "link": "socks://5.6.7.8:1080", "domains": []},
+              {"tag": "ai", "link": "socks://9.9.9.9:1080", "domains": ["claude.ai"]}]
+
+    def test_custom_outbounds_are_unique_and_user_scoped(self):
+        outs, rules, tests = bot.build_xray_sections(self.GLOBAL, {"abc": self.CUSTOM, "def": self.CUSTOM})
+        tags = [o["tag"] for o in outs]
+        self.assertIn("mj-clean", tags)
+        self.assertIn("mj-u:abc:clean", tags)
+        self.assertIn("mj-u:def:clean", tags)
+        self.assertEqual(len(tags), len(set(tags)))
+        self.assertEqual(len(tests), 1)  # no per-link listener on a memory-constrained VPS
+        abc = [r for r in rules if r.get("user") == ["regexp:^u_abc\\."]]
+        self.assertEqual(abc[0]["ip"], ["geoip:private"])
+        self.assertEqual(abc[1]["domain"], ["claude.ai"])
+        self.assertEqual(abc[1]["outboundTag"], "mj-u:abc:ai")
+        self.assertEqual(abc[-1]["outboundTag"], "mj-u:abc:clean")
+        self.assertEqual(abc[-1]["network"], "tcp,udp")
+
+    def test_custom_without_catchall_goes_direct_before_global_rules(self):
+        custom = {"abc": [{"tag": "ai", "link": "socks://9.9.9.9:1080", "domains": ["claude.ai"]}],
+                  "empty": []}
+        outs, rules, _ = bot.build_xray_sections(self.GLOBAL, custom)
+        self.assertEqual(outs[0]["tag"], "mj-clean")  # global unmatched default remains global
+        abc = [r for r in rules if r.get("user") == ["regexp:^u_abc\\."]]
+        self.assertEqual([r["outboundTag"] for r in abc], ["mj-u:abc:ai", "direct"])
+        empty = [r for r in rules if r.get("user") == ["regexp:^u_empty\\."]]
+        self.assertEqual(len(empty), 1)
+        self.assertEqual(empty[0]["outboundTag"], "direct")
+        self.assertLess(rules.index(empty[0]), rules.index(next(r for r in rules if r.get("ip") == ["geoip:private"] and not r.get("user"))))
+
+    def test_first_custom_empty_domain_list_is_catchall(self):
+        custom = {"abc": [{"tag": "one", "link": "socks://5.5.5.5:1080", "domains": []},
+                          {"tag": "two", "link": "socks://6.6.6.6:1080", "domains": []}]}
+        _, rules, _ = bot.build_xray_sections([], custom)
+        self.assertEqual([r for r in rules if r.get("user")][-1]["outboundTag"], "mj-u:abc:one")
+
+
 class ApplyBase(unittest.TestCase):
     """Writes BASE to a temp file and points bot.XRAY_CONF at it; xray calls are stubbed."""
     BASE = {
@@ -229,6 +269,51 @@ class ApplyConfigTests(ApplyBase):
         self.assertNotIn("routing", cfg)
         self.assertEqual([i["tag"] for i in cfg["inbounds"]], ["vless-ws", "api"])  # test inbound cleaned up
 
+    def test_reapplying_identical_config_skips_xray_restart(self):
+        self._stub_run()
+        obs = [{"tag": "clean", "link": "socks://1.2.3.4:1080", "domains": ["claude.ai"]}]
+        ok, _ = bot.apply_xray_outbounds(obs, custom={})
+        self.assertTrue(ok)
+        self.cmds.clear()
+        ok, _ = bot.apply_xray_outbounds(obs, custom={})
+        self.assertTrue(ok)
+        self.assertEqual(len(self.cmds), 1)
+        self.assertIn("statsquery", self.cmds[0])
+
+    def test_restart_failure_restores_previous_config(self):
+        old = open(self.tmp.name).read()
+        calls = []
+        def run(cmd, *args, **kwargs):
+            calls.append(list(cmd))
+            class R: pass
+            r = R()
+            r.returncode = 1 if cmd[:2] == ["systemctl", "restart"] and len(calls) == 2 else 0
+            r.stdout, r.stderr = "", "restart failed" if r.returncode else ""
+            return r
+        bot.subprocess.run = run
+        ok, msg = bot.apply_xray_outbounds(
+            [{"tag": "clean", "link": "socks://1.2.3.4:1080", "domains": []}], custom={})
+        self.assertFalse(ok)
+        self.assertIn("بازیابی شد", msg)
+        self.assertEqual(open(self.tmp.name).read(), old)
+        self.assertEqual(sum(c[:2] == ["systemctl", "restart"] for c in calls), 2)
+
+    def test_custom_outbounds_replace_their_old_rules_without_extra_inbounds(self):
+        self._stub_run()
+        user_obs = {"abc": [{"tag": "clean", "link": "socks://5.6.7.8:1080", "domains": []}]}
+        ok, msg = bot.apply_xray_outbounds([], custom=user_obs)
+        self.assertTrue(ok, msg)
+        cfg = json.load(open(self.tmp.name))
+        self.assertIn("mj-u:abc:clean", [o["tag"] for o in cfg["outbounds"]])
+        self.assertEqual([i["tag"] for i in cfg["inbounds"]], ["vless-ws", "api"])
+        ok, msg = bot.apply_xray_outbounds([], custom={"abc": []})
+        self.assertTrue(ok, msg)
+        cfg = json.load(open(self.tmp.name))
+        self.assertNotIn("mj-u:abc:clean", [o["tag"] for o in cfg["outbounds"]])
+        self.assertEqual([r for r in cfg["routing"]["rules"] if r.get("user")],
+                         [{"type": "field", "user": ["regexp:^u_abc\\."],
+                           "network": "tcp,udp", "outboundTag": "direct"}])
+
 
 class PreserveExistingRoutingTests(ApplyBase):
     """The shipped xray config routes the api inbound to the api service. Losing that rule
@@ -274,6 +359,72 @@ class PreserveExistingRoutingTests(ApplyBase):
     def test_catch_all_outbound_is_first_in_written_config(self):
         cfg = self._apply([{"tag": "clean", "link": "socks://1.2.3.4:1080", "domains": []}])
         self.assertEqual(cfg["outbounds"][0]["tag"], "mj-clean")
+
+    def test_operator_rules_apply_before_custom_fallback(self):
+        self._stub_run()
+        global_obs = [{"tag": "clean", "link": "socks://1.2.3.4:1080", "domains": ["claude.ai"]}]
+        ok, msg = bot.apply_xray_outbounds(global_obs, custom={"abc": []})
+        self.assertTrue(ok, msg)
+        rules = json.load(open(self.tmp.name))["routing"]["rules"]
+        self.assertEqual(rules[0]["outboundTag"], "api")
+        self.assertEqual(rules[1]["inboundTag"], ["mjtest-clean"])
+        custom = next(i for i, r in enumerate(rules) if r.get("user") == ["regexp:^u_abc\\."])
+        foreign = next(i for i, r in enumerate(rules) if r.get("domain") == ["ads.example"])
+        global_rule = next(i for i, r in enumerate(rules) if r.get("domain") == ["claude.ai"])
+        self.assertLess(foreign, custom)
+        self.assertLess(custom, global_rule)
+
+    def test_manual_block_rule_is_preserved_for_custom_links(self):
+        base = json.load(open(self.tmp.name))
+        base["routing"]["rules"].insert(1, {"type": "field", "domain": ["blocked.example"], "outboundTag": "block"})
+        base["routing"]["rules"].insert(2, {"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"})
+        with open(self.tmp.name, "w") as f: json.dump(base, f)
+        self._stub_run()
+        ok, msg = bot.apply_xray_outbounds([], custom={"abc": []})
+        self.assertTrue(ok, msg)
+        rules = json.load(open(self.tmp.name))["routing"]["rules"]
+        block = next(i for i, r in enumerate(rules) if r.get("domain") == ["blocked.example"])
+        custom = next(i for i, r in enumerate(rules) if r.get("user") == ["regexp:^u_abc\\."])
+        self.assertLess(block, custom)
+        self.assertEqual(sum(r.get("ip") == ["geoip:private"] and not r.get("user") for r in rules), 1)
+
+
+class GlobalOutboundApplyTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.old_db = bot.DB_PATH
+        bot.DB_PATH = self.tmp.name
+        bot.init_db()
+        bot.set_outbounds([{"tag": "clean", "link": "socks://1.2.3.4:1080", "domains": []}])
+
+    def tearDown(self):
+        bot.DB_PATH = self.old_db
+        os.unlink(self.tmp.name)
+
+    def test_failed_save_keeps_durable_retry_marker(self):
+        seen = []
+        def apply(*args):
+            seen.append((bot.meta_get("outbound_sync_pending"), bot.get_outbounds()))
+            return False, "unavailable"
+        body = urllib.parse.urlencode({"csrf": "key", "ajax": "1", "dom_clean": "claude.ai"}).encode()
+        with mock.patch.object(bot, "apply_xray_outbounds", side_effect=apply), \
+             mock.patch.object(bot, "refresh_all_usage"):
+            status, _, _ = bot.route_admin_post("POST", "/a/obsave", {}, "key", body, 1, "sid")
+        self.assertEqual(status, 200)
+        self.assertEqual(seen[0][0], "1")
+        self.assertEqual(seen[0][1][0]["domains"], ["claude.ai"])
+        self.assertEqual(bot.meta_get("outbound_sync_pending"), "1")
+
+    def test_successful_save_clears_marker_and_resyncs(self):
+        body = urllib.parse.urlencode({"csrf": "key", "ajax": "1"}).encode()
+        with mock.patch.object(bot, "apply_xray_outbounds", return_value=(True, "ok")), \
+             mock.patch.object(bot, "refresh_all_usage") as usage, \
+             mock.patch.object(bot, "resync_all") as resync:
+            bot.route_admin_post("POST", "/a/obsave", {}, "key", body, 1, "sid")
+        usage.assert_called_once()
+        resync.assert_called_once()
+        self.assertEqual(bot.meta_get("outbound_sync_pending"), "")
 
 
 if __name__ == "__main__":

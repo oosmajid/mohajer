@@ -60,7 +60,7 @@ class TestRealityEndpoint(DbCase):
     def test_config_page_lists_reality(self):
         page = bot.render_config("csrf")
         self.assertIn("cnt_vless-reality", page)
-        self.assertIn("مستقیم روی IP سرور", page)
+        self.assertIn("پورت مستقیمِ آماده‌شده", page)
 
 
 class TestBotMessages(DbCase):

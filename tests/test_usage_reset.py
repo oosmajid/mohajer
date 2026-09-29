@@ -26,13 +26,15 @@ def fail_rc(*a, **k):
 class UsageBase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False); self.tmp.close()
-        self._db, self._eps, self._run = bot.DB_PATH, bot.ENDPOINTS, bot.subprocess.run
+        self._db, self._eps, self._run, self._pid = bot.DB_PATH, bot.ENDPOINTS, bot.subprocess.run, bot.xray_pid
         bot.DB_PATH = self.tmp.name
         bot.ENDPOINTS = [{"tag": "vless-ws", "port": 10000, "proto": "vless", "net": "ws"}]
         bot.init_db()
+        bot.xray_pid = lambda: ""  # statsquery stubs do not represent systemctl's PID response
 
     def tearDown(self):
         bot.subprocess.run = self._run
+        bot.xray_pid = self._pid
         bot.DB_PATH, bot.ENDPOINTS = self._db, self._eps
         os.unlink(self.tmp.name)
 

@@ -25,45 +25,50 @@ framework, no DB server. Everything is configured through one env file (`bot.env
 
 ## 2. The mental model (read this twice)
 
-1. A "user"/"link" = one row in sqlite `users` + one `sub-u-<token>` file + a client
-   added to **every** xray inbound (one per endpoint) under email `u_<token>.<tag>`.
+1. A "user"/"link" = one row in sqlite `users` + one `sub-u-<token>` file.
+   Its enabled endpoints and external port slots determine which clients are added
+   to Xray. New links have a separate credential per `(endpoint tag, TLS mode,
+   external port)` in `slot_credentials`; legacy links retain their original
+   per-endpoint credential until an endpoint needs revocation.
 2. The **subscription link** the customer gets is ONE url
    (`https://<DOMAIN>/sub-u-<token>`). Behind it are N configs (one per endpoint ×
-   per TLS/no-TLS port), all sharing the same uuid/password `secret` and the same
-   `<token>`. That's why quota is aggregated by the `user>>>u_<token>` prefix.
+   per TLS/no-TLS port), and the URL keeps the same `<token>` across edits.
+   Quota is aggregated across all `user>>>u_<token>.*` Xray emails. Each fresh
+   external port slot has its own UUID/password, so removing that port invalidates
+   its old imported URI. If multiple emitted configs share a slot and differ only
+   by clean IP, they share that slot credential.
 3. Clients connect to **clean Cloudflare edge IPs** (the link's host is the IP; the
    real hostname rides in SNI/`host=`). The bot can rewrite the IPs of every link at
    once from the "🌐 آی‌پی‌های تمیز" panel without changing anyone's link.
 4. Quota/expiry are enforced by the **enforcer thread**, not by xray. xray just
    counts bytes; the bot reads the counters and deletes the user when over limit.
 
-## 3. Production server (the live deployment)
+## 3. Production servers (verified 2026-09-29)
 
-The canonical running instance ("delplayer") differs from this repo's fresh-install
-defaults — **mind the path mapping** when SSHing in:
+There are **five active Mohajer instances**. Keep this inventory when planning
+changes or deployments; each has its own users, `bot.env`, Xray, and cloudflared.
+All five running bot/sub files matched repository commit `2297d9d` when checked.
 
-| Thing                | This repo (fresh install) | Live server (delplayer)        |
-|----------------------|---------------------------|--------------------------------|
-| bot dir / file       | `/opt/mohajer/bot/bot.py` | `/opt/dpbot/bot.py`            |
-| sub server           | `/opt/mohajer/sub/...`    | `/opt/dpsub/subserver.py`      |
-| env file             | `/opt/mohajer/bot.env`    | `/opt/dpbot/bot.env`           |
-| sqlite db            | `/opt/mohajer/dpbot.db`   | `/opt/dpbot/dpbot.db`          |
-| sub files dir        | `/opt/mohajer/sub`        | `/opt/dpsub`                   |
-| systemd units        | `mohajer-bot/-sub`        | `dpbot` / `dpsub`              |
-| xray config          | `/usr/local/etc/xray/config.json` (same) |                 |
-| cloudflared config   | `/root/.cloudflared/config.yml` (same)   |                 |
-| public hostname      | `cdn.example.ir`          | `cdn.delplayer.ir`             |
+| Public hostname | SSH target | Bot/env/DB | Bot/sub services |
+|-----------------|------------|------------|------------------|
+| `cdn.delplayer.ir` | `delplayer` (`root@23.94.29.30:49531`) | `/opt/dpbot/{bot.py,bot.env,dpbot.db}` | `dpbot` / `dpsub` (`/opt/dpsub`) |
+| `cdn2.delplayer.ir` | `ubuntu@130.185.122.107` (sudo) | `/opt/mohajer/{bot/bot.py,bot.env,dpbot.db}` | `mohajer-bot` / `mohajer-sub` |
+| `cdn3.delplayer.ir` | `ubuntu@130.185.121.65` (sudo) | `/opt/mohajer/{bot/bot.py,bot.env,dpbot.db}` | `mohajer-bot` / `mohajer-sub` |
+| `cdn4.delplayer.ir` | `root@149.112.84.49:40273` | `/opt/mohajer/{bot/bot.py,bot.env,dpbot.db}` | `mohajer-bot` / `mohajer-sub` |
+| `cdn5.delplayer.ir` | `root@23.94.29.30:50035` | `/opt/mohajer/{bot/bot.py,bot.env,dpbot.db}` | `mohajer-bot` / `mohajer-sub` |
 
-SSH: `ssh -p 49531 root@23.94.29.30`. **The box has only 512MB RAM.** Under memory
-pressure `sshd` can't fork and you get *"Connection timed out during banner
-exchange"* even though the TCP port is open. When the direct route is throttled
-from Iran, tunnel SSH through the operator's local proxy:
-
-```
-ssh -p 49531 -o "ProxyCommand=nc -x 127.0.0.1:10808 -X 5 %h %p" root@23.94.29.30
-```
-
-(`10808` = SOCKS5, `10809` = HTTP, on the operator's laptop.)
+The cdn2 password is in macOS Keychain service `codex-ssh-cdn2` (account `ubuntu`);
+cdn5 uses Keychain service `ssh-cdn5` (account `root`). Other SSH credentials also
+stay in Keychain/SSH config, never in this repository.
+SSH from the operator's laptop may require SOCKS5 `127.0.0.1:10808`:
+`-o "ProxyCommand=nc -x 127.0.0.1:10808 -X 5 %h %p"`.
+Verify host keys; cdn4 uses port **40273**, not the default port 22.
+`cdn.delplayer.ir` is a 512 MB VPS; avoid spawning extra Xray processes there.
+Each server currently has one provisioned domain and one path per endpoint; cdn,
+cdn2 and cdn3 have REALITY, while cdn4 and cdn5 do not.
+On all five hosts, the active `xray.service` reads
+`/usr/local/etc/xray/config.json` (verified 2026-09-29). Always recheck
+`bot.env` and the unit's `ExecStart` before a future deployment.
 
 ## 4. Golden rules / constraints (do NOT relearn these the hard way)
 
@@ -90,8 +95,10 @@ ssh -p 49531 -o "ProxyCommand=nc -x 127.0.0.1:10808 -X 5 %h %p" root@23.94.29.30
   `path` (xray inbound ↔ ENDPOINTS ↔ cloudflared ingress rule).
 - **Single admin assumption** keeps the in-memory `pending` dict tiny (≈1 entry).
   Don't turn this into a multi-tenant service without revisiting that.
-- **Per-user email format is `u_<token>.<tag>`**; usage is summed across tags by the
-  `user>>>u_<token>` stats prefix. Keep that scheme or quota breaks.
+- **Per-user email format starts `u_<token>.<tag>`**. Port-scoped emails add a
+  `.tls<port>`, `.none<port>`, or `.reality<port>` suffix and a generation. Usage
+  must still be summed across the `user>>>u_<token>` stats prefix. The per-email
+  ledger preserves lifetime usage when an old identity is revoked.
 
 ## 5. How to make common changes
 
@@ -109,6 +116,20 @@ ssh -p 49531 -o "ProxyCommand=nc -x 127.0.0.1:10808 -X 5 %h %p" root@23.94.29.30
   the legacy output. `count` is UNCAPPED; when it exceeds an endpoint's port-slots the
   extra configs cycle over ports × clean IPs (`write_sub` honors this). Saving
   regenerates every sub. `get_recipe()`/`set_recipe()` live next to `get_ips()`.
+- **Per-link settings:** `/a/user-config?token=<token>` selects the public default
+  or stores a full settings snapshot in `users.config_override`. A custom link has
+  its own recipe, clean IP list, prepared endpoint options, and outbound routing;
+  it shows an `اختصاصی` badge in the dashboard. Switching back to default deletes
+  the snapshot, so later global changes apply again. Port and protocol removals
+  revoke old Xray credentials; older links migrate the affected endpoint to slot
+  credentials the first time its ports change.
+- **First boot after the per-link migration:** existing legacy rows have no
+  `active_slots`. `init_db()` snapshots *every provisioned port* for those rows,
+  because the old bot had registered their shared secret on every endpoint even
+  when the recipe hid some configs. It sets `membership_sync_pending`; the first
+  enforcer pass reconciles and revokes hidden protocols/ports without requiring
+  an Xray restart. Affected legacy clients need to refresh the same subscription
+  URL when an endpoint moves to per-port credentials.
 - **Outbounds / clean egress (`/a/outbounds`, `meta.outbounds`):** paste a
   `vless/trojan/ss/socks/http` link → it becomes an xray outbound tagged **`mj-<name>`**.
   Per outbound you list domains; **an empty list makes it the catch-all** (it is written
@@ -122,8 +143,10 @@ ssh -p 49531 -o "ProxyCommand=nc -x 127.0.0.1:10808 -X 5 %h %p" root@23.94.29.30
   `.bak` kept). Each outbound also gets a **loopback-only** SOCKS inbound on
   `OB_TEST_PORT_BASE+i` (10810+) that the panel's 🔎 test dials through — that is how we
   test egress **without spawning a second xray** (see the golden rule above).
-  `XRAY_CONF` **must** point at the config the Mohajer xray unit actually runs; on cdn2
-  that is `/opt/mohajer/xray.json`, NOT the default (which belongs to another stack).
+  `XRAY_CONF` **must** point at the config the Mohajer xray unit actually runs. On
+  cdn2, both `bot.env` and the active `xray.service` use
+  `/usr/local/etc/xray/config.json` (verified 2026-09-29). The previously recorded
+  `/opt/mohajer/xray.json` path does not exist on that host.
   The page is AJAX: every action posts `ajax=1` and gets JSON back (`ok/msg/list`), so
   nothing reloads; the same routes still answer with redirects when JS is off.
 - **Subscriber page extras:** `subserver.py` shows a quick-connect card: a Happ deep-link
@@ -159,8 +182,8 @@ ssh -p 49531 -o "ProxyCommand=nc -x 127.0.0.1:10808 -X 5 %h %p" root@23.94.29.30
 ```
 users(
   token TEXT PRIMARY KEY,   -- 16 hex chars; identifies the link everywhere
-  uuid  TEXT,               -- the shared secret (uuid for vless/vmess, password for trojan)
-  email TEXT UNIQUE,        -- "u_<token>" (db bookkeeping; xray emails are u_<token>.<tag>)
+  uuid  TEXT,               -- original legacy credential; new links use slot_credentials
+  email TEXT UNIQUE,        -- "u_<token>" (db bookkeeping)
   label TEXT,               -- human name ("Fifi", "Me", …)
   limit_bytes INTEGER,      -- 0 = unlimited
   expiry_ts   INTEGER,      -- unix; 0 = never
@@ -168,9 +191,21 @@ users(
   base_bytes  INTEGER,      -- carried-over usage across xray counter resets
   last_raw    INTEGER,      -- last raw counter value seen (reset detection)
   used_bytes  INTEGER,      -- lifetime traffic: base + last_raw
-  usage_reset_bytes INTEGER -- lifetime baseline; UIs/quota use max(used_bytes-this, 0)
+  usage_reset_bytes INTEGER, -- lifetime baseline; UIs/quota use max(used_bytes-this, 0)
+  config_override TEXT,     -- NULL = public default; JSON = full per-link snapshot
+  credential_mode TEXT,     -- legacy or slots
+  active_slots TEXT,        -- JSON snapshot of emitted endpoint/port identities
+  usage_anchor INTEGER,     -- lifetime usage before per-email ledger starts
+  auth_pending INTEGER,     -- retry incomplete Xray revocation
+  pending_delete INTEGER    -- keep deletion state until access is revoked
 )
-meta(k TEXT PRIMARY KEY, v TEXT)   -- clean_ips, config_recipe, xray_pid, admin_id (bootstrap)
+slot_credentials(token, tag, security, external_port, email, secret)
+slot_mode_tags(token, tag)         -- legacy endpoints migrated to per-port credentials
+legacy_emails(token, tag, email)   -- rotated stats identity after freeze/disable
+usage_ledger(email, token, last_raw, total_bytes)
+meta(k TEXT PRIMARY KEY, v TEXT)   -- includes clean_ips, config_recipe,
+                                   -- endpoint_settings, outbounds, xray_pid,
+                                   -- membership_sync_pending, outbound_sync_pending
 ```
 
 See `docs/ARCHITECTURE.md` for the full flow diagrams and `docs/OPERATIONS.md` for

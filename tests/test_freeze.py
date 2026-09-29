@@ -15,8 +15,8 @@ class FreezeBase(unittest.TestCase):
         self.added, self.removed, self.wrote, self.cut = [], [], [], []
         self._save = {}
         for name, fn in [
-            ("xr_add_user",    lambda t, s: self.added.append(t)),
-            ("xr_remove_user", lambda t: self.removed.append(t)),
+            ("xr_add_user",    lambda t, s: self.added.append(t) or True),
+            ("xr_remove_user", lambda t: self.removed.append(t) or True),
             ("write_sub",      lambda t, s, l: self.wrote.append(t)),
             ("online_tags_of", lambda t: set()),
             ("force_disconnect", lambda tags: self.cut.append(tags)),
