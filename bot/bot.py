@@ -298,7 +298,7 @@ def _emergency_clear_dynamic_users():
     # The restarted process has no dynamic users. Restore only eligible links;
     # pending delete, frozen, and disabled links are excluded by resync_all.
     try:
-        resync_all()
+        resync_all(allow_missing_stats_restart=False)
     except Exception as exc:
         meta_set("membership_sync_pending", "1")
         print("emergency xray resync pending:", exc, flush=True)
@@ -748,8 +748,9 @@ def _reconcile_user_membership(u, before_recipe=None, before_settings=None):
     # on a historical stats snapshot.
     revoke_legacy = ((transition_tags | (previous_tags - desired_tags)) - converted
                      if mode == "legacy" else set())
-    if (revoke_legacy or to_remove) and not _enable_usage_ledger(token):
-        return False, set()
+    diagnosis = {}
+    if (revoke_legacy or to_remove) and not _enable_usage_ledger(token, diagnosis):
+        return False, set(), diagnosis
     ok = True
     for ep in ENDPOINTS:
         tag = ep["tag"]
@@ -762,7 +763,7 @@ def _reconcile_user_membership(u, before_recipe=None, before_settings=None):
                     if not _adu(ep, cred["secret"], cred["email"]): ok = False
         elif tag in desired_tags and eligible and tag not in previous_tags:
             if not _adu(ep, secret, legacy_email(token, tag)): ok = False
-    if not ok: return False, set()
+    if not ok: return False, set(), diagnosis
     cut = set()
     for ep in ENDPOINTS:
         tag = ep["tag"]
@@ -779,7 +780,7 @@ def _reconcile_user_membership(u, before_recipe=None, before_settings=None):
         cut.add(key[0])
     if ok: _set_auth_state(token, mode, desired)
     write_sub(token, secret, u["label"])
-    return ok, cut
+    return ok, cut, diagnosis
 
 def _eligible_for_membership(u):
     return not (u["disabled_ts"] or u["frozen"] or u["pending_delete"] or exhaust_reason(u))
@@ -788,7 +789,7 @@ def xr_reconcile_user_endpoints(token, secret, before_recipe=None, before_settin
     """Update a link after settings change, including live sessions on removed tags."""
     c = db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone(); c.close()
     if not u: return False
-    ok, cut = _reconcile_user_membership(u, before_recipe, before_settings)
+    ok, cut, _ = _reconcile_user_membership(u, before_recipe, before_settings)
     if cut: force_disconnect(cut)
     if not ok:
         meta_set("membership_sync_pending", "1")
@@ -806,7 +807,7 @@ def xr_reconcile_all_users(before_recipe=None, before_settings=None, tokens=None
     if not rows: return True
     ok = True; cut = set()
     for u in rows:
-        user_ok, user_cut = _reconcile_user_membership(u, before_recipe, before_settings)
+        user_ok, user_cut, _ = _reconcile_user_membership(u, before_recipe, before_settings)
         ok = user_ok and ok; cut.update(user_cut)
     if cut: force_disconnect(cut)
     if not ok:
@@ -1515,7 +1516,7 @@ def _ledger_apply_snapshot(c, u, emails):
     c.execute("UPDATE users SET used_bytes=? WHERE token=?", (used, token))
     return used
 
-def _enable_usage_ledger(token):
+def _enable_usage_ledger(token, diagnosis=None):
     """Anchor existing lifetime usage before rotating any legacy identity."""
     for _ in range(3):
         begin_xray_counter_epoch()
@@ -1535,6 +1536,8 @@ def _enable_usage_ledger(token):
             if u["usage_anchor"] is not None: c.rollback(); return True
             if token not in snapshot and int(u["last_raw"] or 0) > 0:
                 # A transiently missing counter cannot serve as a baseline.
+                if diagnosis is not None:
+                    diagnosis["missing_stats_pid"] = pid
                 c.rollback(); return False
             if token in snapshot:
                 raw = int(snapshot[token])
@@ -1607,18 +1610,20 @@ def panel_usage_summary():
     last30 = c.execute("SELECT COALESCE(SUM(max(end_used-start_used,0)),0) v FROM usage_daily WHERE day>=?", (cutoff30,)).fetchone()["v"]
     c.close(); return int(total), int(today), int(last30)
 
-def resync_all():
+def resync_all(allow_missing_stats_restart=True):
     # A restart clears Xray's dynamic users. Reconcile stored identities first,
     # then register every eligible identity again, including unchanged slots.
     # A failed per-link revocation must not restore its old shared credential.
     begin_xray_counter_epoch()
     c = db(); rows = c.execute("SELECT * FROM users").fetchall(); c.close()
-    ok = True; cut = set()
+    ok = True; cut = set(); missing_stats = {}
     for u in rows:
-        user_ok, user_cut = _reconcile_user_membership(u)
+        user_ok, user_cut, diagnosis = _reconcile_user_membership(u)
         cut.update(user_cut)
         if not user_ok:
             ok = False
+            if "missing_stats_pid" in diagnosis:
+                missing_stats[u["token"]] = diagnosis["missing_stats_pid"]
             continue
         if not _eligible_for_membership(u): continue  # grace, freeze, or exhausted quota -> keep out of xray
         if not xr_add_user(u["token"], u["uuid"]):
@@ -1627,6 +1632,19 @@ def resync_all():
         write_sub(u["token"], u["uuid"], u["label"])
     if cut: force_disconnect(cut)
     meta_set("membership_sync_pending", "" if ok else "1")
+    if not ok and missing_stats and allow_missing_stats_restart:
+        # These historical counters cannot be reconstructed from a successful
+        # but empty stats response. Refresh every available counter before a
+        # controlled restart, then require a second absent read on the same PID.
+        # The new PID banks last_raw and can safely anchor known lifetime usage.
+        refresh_all_usage()
+        pid = xray_pid()
+        if pid and pid != "0" and all(seen == pid for seen in missing_stats.values()):
+            snapshot = xr_usage_all()
+            if (snapshot is not None and getattr(snapshot, "epoch_pid", None) == pid
+                    and all(token not in snapshot for token in missing_stats)):
+                if _emergency_clear_dynamic_users():
+                    return meta_get("membership_sync_pending") != "1"
     return ok
 
 def notify_admin(text):

@@ -222,6 +222,39 @@ class ProtocolEnforcement(unittest.TestCase):
         self.assertEqual(bot.meta_get("membership_sync_pending"), "")
         self.assertIn(("vless-ws", "u_a.vless-ws"), self.removed)
 
+    def test_resync_restarts_once_for_persistently_missing_legacy_stats(self):
+        self.user("a", used=100)
+        c = bot.db(); c.execute("UPDATE users SET last_raw=100 WHERE token='a'"); c.commit(); c.close()
+        bot.meta_set("xray_pid", "old-pid")
+        bot.set_endpoint_settings({"vless-ws": {"tls_ports": [2053]}})
+        pid = {"value": "old-pid"}
+        self.patch("xray_pid", lambda: pid["value"])
+        self.patch("xr_usage_all", lambda: bot.UsageSnapshot({}, {}, pid["value"]))
+        restarts = []
+        def run(cmd, **kwargs):
+            restarts.append(cmd)
+            pid["value"] = "new-pid"
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        self.patch("subprocess", type("RunStub", (), {"run": staticmethod(run)}))
+        self.assertTrue(bot.resync_all())
+        self.assertEqual(restarts, [["systemctl", "restart", bot.XRAY_SERVICE]])
+        c = bot.db(); u = c.execute("SELECT used_bytes,usage_anchor,active_slots FROM users WHERE token='a'").fetchone(); c.close()
+        self.assertEqual((u["used_bytes"], u["usage_anchor"]), (100, 100))
+        self.assertEqual(bot._decode_slots(u["active_slots"]), {("vless-ws", "tls", 2053)})
+        self.assertEqual(bot.meta_get("membership_sync_pending"), "")
+
+    def test_resync_waits_if_missing_legacy_stat_reappears(self):
+        self.user("a", used=100)
+        c = bot.db(); c.execute("UPDATE users SET last_raw=100 WHERE token='a'"); c.commit(); c.close()
+        bot.meta_set("xray_pid", "same-pid")
+        bot.set_endpoint_settings({"vless-ws": {"tls_ports": [2053]}})
+        self.patch("xray_pid", lambda: "same-pid")
+        polls = iter([{}, {}, {"a": 100}])
+        self.patch("xr_usage_all", lambda: bot.UsageSnapshot(next(polls), {}, "same-pid"))
+        self.patch("_emergency_clear_dynamic_users", lambda: self.fail("restart should wait"))
+        self.assertFalse(bot.resync_all())
+        self.assertEqual(bot.meta_get("membership_sync_pending"), "1")
+
     def test_failed_settings_rmu_restarts_and_revokes_old_identity(self):
         self.user("a")
         bot.set_endpoint_settings({"vless-ws": {"tls_ports": [2053]}})
