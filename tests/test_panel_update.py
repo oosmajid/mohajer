@@ -16,12 +16,15 @@ class DbCase(unittest.TestCase):
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False); self.tmp.close()
         self.subdir = tempfile.mkdtemp()
         self._saved = (bot.DB_PATH, bot.SUB_DIR, bot.ENDPOINTS, bot.DEFAULT_IPS, bot.DOMAIN)
+        self._adu = bot._adu
         bot.DB_PATH = self.tmp.name; bot.SUB_DIR = self.subdir; bot.DEFAULT_IPS = ["1.1.1.1"]
         bot.DOMAIN = "cdn.example.ir"
+        bot._adu = lambda *args: True
         bot.init_db()
 
     def tearDown(self):
         bot.DB_PATH, bot.SUB_DIR, bot.ENDPOINTS, bot.DEFAULT_IPS, bot.DOMAIN = self._saved
+        bot._adu = self._adu
         os.unlink(self.tmp.name)
 
     def links(self, token):
@@ -44,11 +47,13 @@ class TestRealityEndpoint(DbCase):
 
     def test_reality_defaults_to_zero_links(self):
         self.assertEqual(bot.get_recipe()["vless-reality"]["count"], 0)
+        self.assertTrue(bot.xr_add_user("t1", "uuid-1"))
         bot.write_sub("t1", "uuid-1", "x")
         self.assertFalse(any(l.startswith("vless://") and "security=reality" in l for l in self.links("t1")))
 
     def test_reality_count_emits_direct_links(self):
         bot.set_recipe({"vless-ws": {"enabled": True, "count": 1}, "vless-reality": {"enabled": True, "count": 2}})
+        self.assertTrue(bot.xr_add_user("t1", "uuid-1"))
         bot.write_sub("t1", "uuid-1", "x")
         rl = [l for l in self.links("t1") if "security=reality" in l]
         self.assertEqual(len(rl), 2)
@@ -68,15 +73,14 @@ class TestBotMessages(DbCase):
         super().setUp()
         bot.ENDPOINTS = [WS_EP]
         self.edits = []
-        self._fns = (bot.send, bot.edit, bot.answer, bot.xr_add_user)
+        self._fns = (bot.send, bot.edit, bot.answer)
         bot.send = lambda *a, **k: None
         bot.edit = lambda *a, **k: self.edits.append(a)
         bot.answer = lambda *a, **k: None
-        bot.xr_add_user = lambda token, secret: True
         bot.pending.clear()
 
     def tearDown(self):
-        bot.send, bot.edit, bot.answer, bot.xr_add_user = self._fns
+        bot.send, bot.edit, bot.answer = self._fns
         bot.pending.clear()
         super().tearDown()
 

@@ -26,17 +26,18 @@ framework, no DB server. Everything is configured through one env file (`bot.env
 ## 2. The mental model (read this twice)
 
 1. A "user"/"link" = one row in sqlite `users` + one `sub-u-<token>` file.
-   Its enabled endpoints and external port slots determine which clients are added
-   to Xray. New links have a separate credential per `(endpoint tag, TLS mode,
-   external port)` in `slot_credentials`; legacy links retain their original
-   per-endpoint credential until an endpoint needs revocation.
+   Each emitted configuration has its own Xray credential in
+   `emission_credentials`, keyed by endpoint tag and config index. A durable
+   `active_emissions` snapshot records each emitted configuration's signature.
+   A one-time startup migration retires older shared per-endpoint and per-port
+   credentials, then gives every current configuration its own identity.
 2. The **subscription link** the customer gets is ONE url
-   (`https://<DOMAIN>/sub-u-<token>`). Behind it are N configs (one per endpoint ×
-   per TLS/no-TLS port), and the URL keeps the same `<token>` across edits.
-   Quota is aggregated across all `user>>>u_<token>.*` Xray emails. Each fresh
-   external port slot has its own UUID/password, so removing that port invalidates
-   its old imported URI. If multiple emitted configs share a slot and differ only
-   by clean IP, they share that slot credential.
+   (`https://<DOMAIN>/sub-u-<token>`). Behind it are the configurations selected
+   by the recipe, and the URL keeps the same `<token>` across edits.
+   Quota is aggregated across all `user>>>u_<token>.*` Xray emails. Distinct
+   emitted configurations have distinct UUIDs/passwords, even when they share
+   a protocol and external port. Removing one configuration, or changing its
+   connection URI (including its clean IP), revokes its old imported URI.
 3. Clients connect to **clean Cloudflare edge IPs** (the link's host is the IP; the
    real hostname rides in SNI/`host=`). The bot can rewrite the IPs of every link at
    once from the "🌐 آی‌پی‌های تمیز" panel without changing anyone's link.
@@ -95,10 +96,11 @@ On all five hosts, the active `xray.service` reads
   `path` (xray inbound ↔ ENDPOINTS ↔ cloudflared ingress rule).
 - **Single admin assumption** keeps the in-memory `pending` dict tiny (≈1 entry).
   Don't turn this into a multi-tenant service without revisiting that.
-- **Per-user email format starts `u_<token>.<tag>`**. Port-scoped emails add a
-  `.tls<port>`, `.none<port>`, or `.reality<port>` suffix and a generation. Usage
-  must still be summed across the `user>>>u_<token>` stats prefix. The per-email
-  ledger preserves lifetime usage when an old identity is revoked.
+- **Per-user email format starts `u_<token>.<tag>`**. Emitted-configuration
+  credentials have a config index and a fresh generation in their email; older
+  port-scoped emails use `.tls<port>`, `.none<port>`, or `.reality<port>` suffixes.
+  Usage must still be summed across the `user>>>u_<token>` stats prefix. The
+  per-email ledger preserves lifetime usage when an old identity is revoked.
 
 ## 5. How to make common changes
 
@@ -109,27 +111,38 @@ On all five hosts, the active `xray.service` reads
 - **Change clean IPs:** use the bot panel or the web panel's `/a/config` page
   (both live, no restart) or set `IPS=` in `bot.env` as the default. Stored override
   lives in `meta.clean_ips`. Use `scripts/cf-clean-ip-scan.sh <host>` from a client
-  network to pick them.
+  network to pick them. A changed emitted URI needs a fresh credential; apply
+  the change through reconciliation before publishing regenerated subscriptions.
 - **Config recipe (types & counts):** the web panel's `/a/config` page (stored in
   `meta.config_recipe` JSON) sets, per endpoint, `enabled` + `count` = how many
   configs of that type to emit. Default (no override) = one per TLS/no-TLS port, i.e.
-  the legacy output. `count` is UNCAPPED; when it exceeds an endpoint's port-slots the
-  extra configs cycle over ports × clean IPs (`write_sub` honors this). Saving
-  regenerates every sub. `get_recipe()`/`set_recipe()` live next to `get_ips()`.
+  the legacy output. The limit is 16 per endpoint and 64 enabled configurations
+  per link. When `count` exceeds an endpoint's port-slots, the extra configs cycle
+  over ports × clean IPs (`write_sub` honors this). Every
+  extra configuration has its own credential; reducing `count` revokes the
+  removed identities even when other configurations use the same port. Saving
+  reconciles credentials and regenerates subscriptions. `get_recipe()`/
+  `set_recipe()` live next to `get_ips()`.
 - **Per-link settings:** `/a/user-config?token=<token>` selects the public default
   or stores a full settings snapshot in `users.config_override`. A custom link has
   its own recipe, clean IP list, prepared endpoint options, and outbound routing;
   it shows an `اختصاصی` badge in the dashboard. Switching back to default deletes
-  the snapshot, so later global changes apply again. Port and protocol removals
-  revoke old Xray credentials; older links migrate the affected endpoint to slot
-  credentials the first time its ports change.
-- **First boot after the per-link migration:** existing legacy rows have no
-  `active_slots`. `init_db()` snapshots *every provisioned port* for those rows,
-  because the old bot had registered their shared secret on every endpoint even
-  when the recipe hid some configs. It sets `membership_sync_pending`; the first
-  enforcer pass reconciles and revokes hidden protocols/ports without requiring
-  an Xray restart. Affected legacy clients need to refresh the same subscription
-  URL when an endpoint moves to per-port credentials.
+  the snapshot, so later global changes apply again. Removed or changed emitted
+  configurations revoke their old Xray credentials. A signature change to a
+  connection parameter (protocol, port, clean IP, Host, SNI, or path) rotates the
+  affected credential. Changing only the display label keeps that credential.
+- **First boot after the per-configuration migration:** `init_db()` snapshots
+  every provisioned port for legacy links missing `active_slots`, because the old
+  bot registered their shared secret on every endpoint even when the recipe hid
+  some configs. It also snapshots the current output in `active_emissions` and
+  marks every pre-emission link with `emission_migration_pending` and
+  `membership_sync_pending`. The enforcer retires all older shared identities,
+  including those of frozen or disabled links, and provisions separate identities
+  for current configurations. This proactively revokes old imported URIs whose
+  prior count or clean-IP edits cannot be reconstructed from SQLite. **Every
+  existing customer must refresh the same subscription URL after this one-time
+  migration.** Normal API reconciliation does not require an Xray restart; a
+  failed revocation can trigger a controlled restart and resync.
 - **Outbounds / clean egress (`/a/outbounds`, `meta.outbounds`):** paste a
   `vless/trojan/ss/socks/http` link → it becomes an xray outbound tagged **`mj-<name>`**.
   Per outbound you list domains; **an empty list makes it the catch-all** (it is written
@@ -182,7 +195,7 @@ On all five hosts, the active `xray.service` reads
 ```
 users(
   token TEXT PRIMARY KEY,   -- 16 hex chars; identifies the link everywhere
-  uuid  TEXT,               -- original legacy credential; new links use slot_credentials
+  uuid  TEXT,               -- original legacy credential; new links use emission_credentials
   email TEXT UNIQUE,        -- "u_<token>" (db bookkeeping)
   label TEXT,               -- human name ("Fifi", "Me", …)
   limit_bytes INTEGER,      -- 0 = unlimited
@@ -193,14 +206,18 @@ users(
   used_bytes  INTEGER,      -- lifetime traffic: base + last_raw
   usage_reset_bytes INTEGER, -- lifetime baseline; UIs/quota use max(used_bytes-this, 0)
   config_override TEXT,     -- NULL = public default; JSON = full per-link snapshot
-  credential_mode TEXT,     -- legacy or slots
-  active_slots TEXT,        -- JSON snapshot of emitted endpoint/port identities
+  credential_mode TEXT,     -- legacy, slots, or emissions
+  active_slots TEXT,        -- JSON snapshot of legacy endpoint/port identities
+  active_emissions TEXT,    -- JSON [tag,index,signature] snapshot of emitted configs
   usage_anchor INTEGER,     -- lifetime usage before per-email ledger starts
   auth_pending INTEGER,     -- retry incomplete Xray revocation
-  pending_delete INTEGER    -- keep deletion state until access is revoked
+  pending_delete INTEGER,   -- keep deletion state until access is revoked
+  emission_migration_pending INTEGER -- retire pre-emission shared credentials
 )
 slot_credentials(token, tag, security, external_port, email, secret)
 slot_mode_tags(token, tag)         -- legacy endpoints migrated to per-port credentials
+emission_credentials(token, tag, config_index, signature, email, secret)
+emission_mode_tags(token, tag)     -- endpoints migrated to per-config credentials
 legacy_emails(token, tag, email)   -- rotated stats identity after freeze/disable
 usage_ledger(email, token, last_raw, total_bytes)
 meta(k TEXT PRIMARY KEY, v TEXT)   -- includes clean_ips, config_recipe,

@@ -9,13 +9,15 @@ class FreezeBase(unittest.TestCase):
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False); self.tmp.close()
         self._db, self._eps = bot.DB_PATH, bot.ENDPOINTS
         bot.DB_PATH = self.tmp.name
-        bot.ENDPOINTS = [{"tag": "vless-ws", "port": 10000, "proto": "vless", "net": "ws"}]
+        bot.ENDPOINTS = [{"tag": "vless-ws", "port": 10000, "proto": "vless", "net": "ws",
+                          "path": "/v", "label": "VLESS", "tls_ports": [443], "notls_ports": []}]
         bot.init_db()
         # stub every xray/network side-effect so we test pure state transitions
         self.added, self.removed, self.wrote, self.cut = [], [], [], []
         self._save = {}
         for name, fn in [
             ("xr_add_user",    lambda t, s: self.added.append(t) or True),
+            ("_adu",           lambda ep, secret, email: self.added.append(email.split(".")[0][2:]) or True),
             ("xr_remove_user", lambda t: self.removed.append(t) or True),
             ("write_sub",      lambda t, s, l: self.wrote.append(t)),
             ("online_tags_of", lambda t: set()),

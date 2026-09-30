@@ -17,16 +17,23 @@ class RecipeBase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False); self.tmp.close()
         self.subdir = tempfile.mkdtemp()
-        self._db, self._sub, self._eps, self._ips, self._dom = (
-            bot.DB_PATH, bot.SUB_DIR, bot.ENDPOINTS, bot.DEFAULT_IPS, bot.DOMAIN)
+        self._db, self._sub, self._eps, self._ips, self._dom, self._adu = (
+            bot.DB_PATH, bot.SUB_DIR, bot.ENDPOINTS, bot.DEFAULT_IPS, bot.DOMAIN, bot._adu)
         bot.DB_PATH = self.tmp.name; bot.SUB_DIR = self.subdir
         bot.ENDPOINTS = EPS; bot.DEFAULT_IPS = ["1.1.1.1", "2.2.2.2"]; bot.DOMAIN = "cdn.example.ir"
+        bot._adu = lambda *args: True
         bot.init_db()
 
     def tearDown(self):
         bot.DB_PATH, bot.SUB_DIR, bot.ENDPOINTS, bot.DEFAULT_IPS, bot.DOMAIN = (
             self._db, self._sub, self._eps, self._ips, self._dom)
+        bot._adu = self._adu
         os.unlink(self.tmp.name)
+
+    def publish(self, token, label):
+        secret = "11111111-1111-1111-1111-111111111111"
+        self.assertTrue(bot.xr_add_user(token, secret))
+        self.assertTrue(bot.write_sub(token, secret, label))
 
     def _links(self, token):
         raw = open(bot.sub_path(token)).read().strip()
@@ -46,10 +53,19 @@ class TestRecipeModel(RecipeBase):
         # tags absent from stored recipe still fall back to endpoint default
         self.assertEqual(bot.get_recipe()["vmess-ws"], {"enabled": True, "count": 2})
 
+    def test_capacity_limit_blocks_excessive_client_creation(self):
+        with self.assertRaises(ValueError):
+            bot.set_recipe({"vless-ws": {"enabled": True, "count": 17}})
+        with self.assertRaises(ValueError):
+            bot.emitted_configs("a", {"vless-ws": {"enabled": True, "count": 17}})
+        bot.ENDPOINTS = EPS + [{**EPS[0], "tag": "extra-a"}, {**EPS[0], "tag": "extra-b"}]
+        recipe = {ep["tag"]: {"enabled": True, "count": 16} for ep in bot.ENDPOINTS}
+        with self.assertRaises(ValueError): bot.set_recipe(recipe)  # 80 > 64 per link
+
 
 class TestWriteSubHonorsRecipe(RecipeBase):
     def test_default_emits_one_per_slot(self):
-        bot.write_sub("aa", "11111111-1111-1111-1111-111111111111", "A")
+        self.publish("aa", "A")
         links = self._links("aa")
         self.assertEqual(len(links), 8)                                  # 4+2+2
         self.assertEqual(sum(l.startswith("vless://") for l in links), 4)
@@ -60,7 +76,7 @@ class TestWriteSubHonorsRecipe(RecipeBase):
         bot.set_recipe({"vless-ws": {"enabled": True, "count": 2},
                         "vmess-ws": {"enabled": False, "count": 0},
                         "trojan-ws": {"enabled": True, "count": 1}})
-        bot.write_sub("bb", "11111111-1111-1111-1111-111111111111", "B")
+        self.publish("bb", "B")
         links = self._links("bb")
         self.assertEqual(len(links), 3)
         self.assertEqual(sum(l.startswith("vless://") for l in links), 2)
@@ -72,7 +88,7 @@ class TestWriteSubHonorsRecipe(RecipeBase):
         bot.set_recipe({"vless-ws": {"enabled": False, "count": 0},
                         "vmess-ws": {"enabled": False, "count": 0},
                         "trojan-ws": {"enabled": True, "count": 10}})
-        bot.write_sub("dd", "11111111-1111-1111-1111-111111111111", "D")
+        self.publish("dd", "D")
         links = self._links("dd")
         self.assertEqual(len(links), 10)
         self.assertTrue(all(l.startswith("trojan://") for l in links))
@@ -82,7 +98,7 @@ class TestWriteSubHonorsRecipe(RecipeBase):
         bot.set_recipe({"vless-ws": {"enabled": True, "count": 6},
                         "vmess-ws": {"enabled": False, "count": 0},
                         "trojan-ws": {"enabled": False, "count": 0}})
-        bot.write_sub("cc", "11111111-1111-1111-1111-111111111111", "C")
+        self.publish("cc", "C")
         links = self._links("cc")
         self.assertEqual(len(links), 6)
         hosts = [l.split("@", 1)[1].split("?", 1)[0] for l in links]     # ip:port
