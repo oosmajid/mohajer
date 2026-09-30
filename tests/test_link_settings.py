@@ -15,8 +15,7 @@ class LinkSettingsTest(unittest.TestCase):
         self.orig = {k: getattr(bot, k) for k in (
             "DB_PATH", "ENDPOINTS", "DEFAULT_IPS", "DOMAIN", "write_sub",
             "apply_xray_outbounds", "resync_all", "xr_reconcile_user_endpoints", "xr_reconcile_all_users",
-            "regenerate_all_subs", "xr_online_map", "refresh_all_usage", "refresh_usage",
-            "xr_remove_user", "force_disconnect", "tags_to_cut_for_user")}
+            "regenerate_all_subs", "xr_online_map")}
         bot.DB_PATH = self.tmp.name
         bot.ENDPOINTS = [dict(EP)]
         bot.DEFAULT_IPS = ["1.1.1.1"]
@@ -33,7 +32,6 @@ class LinkSettingsTest(unittest.TestCase):
         bot.xr_reconcile_user_endpoints = lambda *args, **kwargs: True
         bot.xr_reconcile_all_users = lambda *args, **kwargs: True
         bot.regenerate_all_subs = lambda: None
-        bot.refresh_all_usage = lambda: None
         bot.xr_online_map = lambda: {}
         bot._sessions.clear()
         self.sid, self.csrf = bot.new_session(now=1000)
@@ -132,25 +130,12 @@ class LinkSettingsTest(unittest.TestCase):
         self.post({"action": "customize"})
         order = []
         bot.xr_reconcile_user_endpoints = lambda *a, **k: (order.append("reconcile") or True)
-        bot.refresh_all_usage = lambda: order.append("refresh")
         bot.apply_xray_outbounds = lambda *a, **k: (order.append("restart") or (True, "ok"))
         self.post({"action": "save", "endpoint_fields": "1", "outbound_fields": "1",
                    "en_vless-ws": "on", "cnt_vless-ws": "1", "label_vless-ws": "Ali WS",
                    "hostidx_vless-ws": "0", "tls_vless-ws_443": "on", "ips": "1.1.1.1",
                    "new_ob_tag": "clean", "new_ob_link": "socks://1.2.3.4:1080"})
-        self.assertEqual(order, ["reconcile", "refresh", "restart"])
-
-    def test_deleting_custom_link_banks_other_usage_before_outbound_restart(self):
-        self.post({"action": "customize"})
-        order = []
-        bot.refresh_usage = lambda token: None
-        bot.xr_remove_user = lambda token: True
-        bot.force_disconnect = lambda tags: None
-        bot.tags_to_cut_for_user = lambda token: set()
-        bot.refresh_all_usage = lambda: order.append("refresh")
-        bot.apply_xray_outbounds = lambda *a, **k: (order.append("restart") or (True, "ok"))
-        self.assertTrue(bot.delete_user("t1"))
-        self.assertEqual(order, ["refresh", "restart"])
+        self.assertEqual(order, ["reconcile", "restart"])
 
     def test_outbound_apply_failure_keeps_revoked_port_settings(self):
         self.post({"action": "customize"})

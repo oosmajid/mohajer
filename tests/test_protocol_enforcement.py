@@ -53,305 +53,23 @@ class ProtocolEnforcement(unittest.TestCase):
 
     def user(self, token, mode="legacy", frozen=0, disabled=0, limit=0, used=0):
         slots = bot._encode_slots(bot.active_slot_keys(token))
-        emissions = bot._encode_emissions(bot.emitted_configs(token))
         c = bot.db()
         c.execute("INSERT INTO users(token,uuid,email,label,limit_bytes,expiry_ts,created_ts,"
-                  "used_bytes,disabled_ts,frozen,credential_mode,active_slots,active_emissions) "
-                  "VALUES(?,?,?,?,?,?,0,?,?,?,?,?,?)",
+                  "used_bytes,disabled_ts,frozen,credential_mode,active_slots) "
+                  "VALUES(?,?,?,?,?,?,0,?,?,?,?,?)",
                   (token, "00000000-0000-4000-8000-000000000001", "u_" + token, token,
-                   limit, 0, used, disabled, frozen, mode, slots, emissions))
+                   limit, 0, used, disabled, frozen, mode, slots))
         c.commit(); c.close()
 
     def test_new_link_uses_distinct_credentials_per_external_port(self):
         self.assertTrue(bot.xr_add_user("new", "00000000-0000-4000-8000-000000000001"))
-        self.assertEqual({email.split(".")[2] for _, _, email in self.added}, {"c0", "c1"})
+        self.assertEqual({email.split(".")[2] for _, _, email in self.added}, {"tls443", "tls2053"})
         self.assertEqual(len({secret for _, secret, _ in self.added}), 2)
         bot.write_sub("new", "00000000-0000-4000-8000-000000000001", "new")
         raw = base64.b64decode(open(bot.sub_path("new")).read()).decode()
         self.assertIn(":443?", raw)
         self.assertIn(":2053?", raw)
         self.assertNotIn("00000000-0000-4000-8000-000000000001", raw)
-
-    def test_count_reduction_revokes_duplicate_on_surviving_port(self):
-        self.recipe(3)  # two ports; index 2 repeats the first port
-        self.user("a", mode="emissions")
-        self.assertTrue(bot.xr_add_user("a", "unused"))
-        original = bot._emission_credential_map("a")
-        self.assertEqual(len(original), 3)
-        self.assertEqual(len({r["secret"] for r in original.values()}), 3)
-        self.assertTrue(bot.write_sub("a", "unused", "a"))
-        with open(bot.sub_path("a")) as f: old_sub = f.read()
-        self.recipe(2)
-        # Regeneration while Xray still holds the old membership must not
-        # publish new settings or silently mint an unregistered identity.
-        bot.regenerate_all_subs()
-        with open(bot.sub_path("a")) as f: self.assertEqual(f.read(), old_sub)
-        self.assertTrue(bot.xr_reconcile_user_endpoints("a", "unused"))
-        current = bot._emission_credential_map("a")
-        self.assertEqual(set(current), {("vless-ws", 0), ("vless-ws", 1)})
-        self.assertIn(("vless-ws", original[("vless-ws", 2)]["email"]), self.removed)
-        self.assertEqual(current[("vless-ws", 0)]["secret"], original[("vless-ws", 0)]["secret"])
-        with open(bot.sub_path("a")) as f: raw = base64.b64decode(f.read()).decode()
-        self.assertEqual(len(raw.splitlines()), 2)
-        self.assertNotIn(original[("vless-ws", 2)]["secret"], raw)
-
-    def test_legacy_count_reduction_migrates_only_affected_tag(self):
-        bot.set_ips(["1.1.1.1"])
-        self.recipe(3, vmess_count=1)
-        self.user("a")
-        self.recipe(2, vmess_count=1)
-        self.assertTrue(bot.xr_reconcile_user_endpoints("a", "unused"))
-        self.assertIn(("vless-ws", "u_a.vless-ws"), self.removed)
-        self.assertNotIn(("vmess-ws", "u_a.vmess-ws"), self.removed)
-        self.assertEqual(len(bot._emission_credential_map("a")), 2)
-        self.assertEqual(bot.emission_mode_tags("a"), {"vless-ws"})
-
-    def test_clean_ip_change_rotates_existing_uri_identity(self):
-        bot.set_ips(["1.1.1.1"])
-        self.user("a", mode="emissions")
-        self.assertTrue(bot.xr_add_user("a", "unused"))
-        original = bot._emission_credential_map("a")
-        bot.set_ips(["2.2.2.2"])
-        self.assertTrue(bot.xr_reconcile_user_endpoints("a", "unused"))
-        current = bot._emission_credential_map("a")
-        for key, old in original.items():
-            self.assertIn((key[0], old["email"]), self.removed)
-            self.assertNotEqual(current[key]["secret"], old["secret"])
-        with open(bot.sub_path("a")) as f: raw = base64.b64decode(f.read()).decode()
-        self.assertIn("2.2.2.2", raw)
-        self.assertNotIn("1.1.1.1", raw)
-
-    def test_reality_duplicate_emissions_have_distinct_revocable_ids(self):
-        bot.ENDPOINTS = EPS + [{"proto": "vless", "net": "tcp", "tag": "vless-reality", "port": 10443,
-            "label": "REALITY", "reality": {"addr": "1.2.3.4", "port": 443, "pbk": "public",
-            "sni": "example.com", "fp": "chrome", "sid": "abc", "priv": "private"}}]
-        bot.set_recipe({"vless-ws": {"enabled": False, "count": 0},
-                        "vmess-ws": {"enabled": False, "count": 0},
-                        "trojan-ws": {"enabled": False, "count": 0},
-                        "vless-reality": {"enabled": True, "count": 3}})
-        self.user("a", mode="emissions")
-        self.assertTrue(bot.xr_add_user("a", "unused"))
-        original = bot._emission_credential_map("a")
-        self.assertEqual(len({r["secret"] for r in original.values()}), 3)
-        self.assertTrue(bot.write_sub("a", "unused", "a"))
-        bot.set_recipe({"vless-ws": {"enabled": False, "count": 0},
-                        "vmess-ws": {"enabled": False, "count": 0},
-                        "trojan-ws": {"enabled": False, "count": 0},
-                        "vless-reality": {"enabled": True, "count": 2}})
-        self.assertTrue(bot.xr_reconcile_user_endpoints("a", "unused"))
-        self.assertIn(("vless-reality", original[("vless-reality", 2)]["email"]), self.removed)
-        with open(bot.sub_path("a")) as f: raw = base64.b64decode(f.read()).decode()
-        self.assertEqual(len(raw.splitlines()), 2)
-        self.assertNotIn(original[("vless-reality", 2)]["secret"], raw)
-
-    def test_failed_rmu_keeps_old_subscription_then_resync_finishes(self):
-        self.recipe(3)
-        self.user("a", mode="emissions")
-        self.assertTrue(bot.xr_add_user("a", "unused"))
-        self.assertTrue(bot.write_sub("a", "unused", "a"))
-        with open(bot.sub_path("a")) as f: old_sub = f.read()
-        removed = bot._emission_credential_map("a")[("vless-ws", 2)]
-        self.recipe(2)
-        self.patch("_rmu_email", lambda tag, email: False)
-        c = bot.db(); u = c.execute("SELECT * FROM users WHERE token='a'").fetchone(); c.close()
-        ok, _, _ = bot._reconcile_user_membership(u)
-        self.assertFalse(ok)
-        with open(bot.sub_path("a")) as f: self.assertEqual(f.read(), old_sub)
-        self.assertIn(("vless-ws", 2), bot._emission_credential_map("a"))
-        self.patch("_rmu_email", lambda tag, email: self.removed.append((tag, email)) or True)
-        self.assertTrue(bot.resync_all())
-        self.assertIn(("vless-ws", removed["email"]), self.removed)
-        with open(bot.sub_path("a")) as f: raw = base64.b64decode(f.read()).decode()
-        self.assertEqual(len(raw.splitlines()), 2)
-
-    def test_failed_legacy_migration_can_roll_back_without_extra_ids(self):
-        self.recipe(3)
-        self.user("a")
-        self.assertTrue(bot.write_sub("a", "00000000-0000-4000-8000-000000000001", "a"))
-        self.recipe(2)
-        self.patch("_rmu_email", lambda tag, email: email != "u_a.vless-ws")
-        c = bot.db(); u = c.execute("SELECT * FROM users WHERE token='a'").fetchone(); c.close()
-        self.assertFalse(bot._reconcile_user_membership(u)[0])
-        self.assertEqual(len(bot._emission_credential_map("a")), 2)
-        self.recipe(3)
-        self.patch("_rmu_email", lambda tag, email: self.removed.append((tag, email)) or True)
-        self.assertTrue(bot.xr_reconcile_user_endpoints("a", "unused"))
-        self.assertEqual(bot._emission_credential_map("a"), {})
-        self.assertIn(("vless-ws", "00000000-0000-4000-8000-000000000001", "u_a.vless-ws"), self.added)
-        with open(bot.sub_path("a")) as f: raw = base64.b64decode(f.read()).decode()
-        self.assertIn("00000000-0000-4000-8000-000000000001", raw)
-
-    def test_publish_failure_remains_pending_and_retries(self):
-        self.recipe(3)
-        self.user("a", mode="emissions")
-        self.assertTrue(bot.xr_add_user("a", "unused"))
-        self.assertTrue(bot.write_sub("a", "unused", "a"))
-        self.recipe(2)
-        self.patch("write_sub", lambda *args: False)
-        self.patch("_emergency_clear_dynamic_users", lambda: False)
-        self.assertFalse(bot.xr_reconcile_user_endpoints("a", "unused"))
-        self.assertEqual(bot.meta_get("membership_sync_pending"), "1")
-        self.patch("write_sub", self.saved["write_sub"])
-        self.assertTrue(bot.resync_all())
-        self.assertEqual(bot.meta_get("membership_sync_pending"), "")
-
-    def test_disappearing_emission_counter_does_not_lose_survivor_usage(self):
-        self.recipe(3)
-        self.user("a", mode="emissions")
-        self.assertTrue(bot.xr_add_user("a", "unused"))
-        creds = bot._emission_credential_map("a")
-        gone = creds[("vless-ws", 2)]["email"]
-        live = [creds[("vless-ws", i)]["email"] for i in (0, 1)]
-        c = bot.db(); c.execute("UPDATE users SET usage_anchor=0 WHERE token='a'"); c.commit(); c.close()
-        self.patch("xr_usage_all", lambda: bot.UsageSnapshot({"a": 300},
-                   {gone: 100, live[0]: 100, live[1]: 100}))
-        bot.refresh_usage("a")
-        self.recipe(2)
-        self.assertTrue(bot.xr_reconcile_user_endpoints("a", "unused"))
-        self.patch("xr_usage_all", lambda: bot.UsageSnapshot({"a": 220},
-                   {live[0]: 110, live[1]: 110}))
-        bot.refresh_usage("a")
-        c = bot.db(); used = c.execute("SELECT used_bytes FROM users WHERE token='a'").fetchone()[0]; c.close()
-        self.assertEqual(used, 320)
-        self.patch("xr_usage_all", lambda: bot.UsageSnapshot({"a": 360},
-                   {live[0]: 250, live[1]: 110}))
-        bot.refresh_usage("a")
-        c = bot.db(); used = c.execute("SELECT used_bytes FROM users WHERE token='a'").fetchone()[0]; c.close()
-        self.assertEqual(used, 460)
-
-    def test_new_user_create_and_resync_register_each_emission_once(self):
-        self.recipe(3)
-        token = bot.create_user(1, 1, "new")
-        self.assertIsNotNone(token)
-        self.assertEqual(bot.credential_mode(token), "emissions")
-        self.assertEqual(len(bot._emission_credential_map(token)), 3)
-        self.added.clear()
-        self.assertTrue(bot.resync_all())
-        self.assertEqual(len(self.added), 3)
-
-    def test_upgrade_migrates_all_old_identities_and_marks_pending_once(self):
-        self.recipe(3)
-        self.user("a")
-        self.assertTrue(bot.write_sub("a", "00000000-0000-4000-8000-000000000001", "a"))
-        bot.init_db()  # startup on an existing pre-emission database
-        c = bot.db(); u = c.execute("SELECT emission_migration_pending FROM users WHERE token='a'").fetchone(); c.close()
-        self.assertEqual(u[0], 1)
-        self.assertEqual(bot.meta_get("membership_sync_pending"), "1")
-        self.assertTrue(bot.resync_all())
-        c = bot.db(); u = c.execute("SELECT credential_mode,emission_migration_pending FROM users WHERE token='a'").fetchone(); c.close()
-        self.assertEqual(tuple(u), ("emissions", 0))
-        self.assertEqual(bot.meta_get("membership_sync_pending"), "")
-        self.assertEqual(set(self.removed), {(ep["tag"], "u_a." + ep["tag"]) for ep in EPS})
-        self.assertEqual(len(bot._emission_credential_map("a")), 3)
-        with open(bot.sub_path("a")) as f: raw = base64.b64decode(f.read()).decode()
-        self.assertNotIn("00000000-0000-4000-8000-000000000001", raw)
-
-    def test_upgrade_retry_preserves_old_subscription_until_revocation(self):
-        self.recipe(3)
-        self.user("a")
-        self.assertTrue(bot.write_sub("a", "00000000-0000-4000-8000-000000000001", "a"))
-        with open(bot.sub_path("a")) as f: old_sub = f.read()
-        bot.init_db()
-        self.patch("_rmu_email", lambda tag, email: False if email == "u_a.vless-ws" else True)
-        self.assertFalse(bot.resync_all())
-        self.assertEqual(bot.meta_get("membership_sync_pending"), "1")
-        with open(bot.sub_path("a")) as f: self.assertEqual(f.read(), old_sub)
-        c = bot.db(); u = c.execute("SELECT credential_mode,emission_migration_pending FROM users WHERE token='a'").fetchone(); c.close()
-        self.assertEqual(tuple(u), ("legacy", 1))
-        self.patch("_rmu_email", lambda tag, email: self.removed.append((tag, email)) or True)
-        self.assertTrue(bot.resync_all())
-        c = bot.db(); u = c.execute("SELECT credential_mode,emission_migration_pending FROM users WHERE token='a'").fetchone(); c.close()
-        self.assertEqual(tuple(u), ("emissions", 0))
-        with open(bot.sub_path("a")) as f: self.assertNotEqual(f.read(), old_sub)
-
-    def test_upgrade_revokes_frozen_legacy_without_registering_new_ids(self):
-        self.user("a", frozen=1)
-        bot.init_db()
-        self.assertTrue(bot.resync_all())
-        self.assertEqual(self.added, [])
-        self.assertIn(("vless-ws", "u_a.vless-ws"), self.removed)
-        self.assertEqual(bot.credential_mode("a"), "emissions")
-
-    def test_revocation_banks_fresh_email_bytes_before_counter_disappears(self):
-        self.recipe(3)
-        self.user("a", mode="emissions", used=300)
-        self.assertTrue(bot.xr_add_user("a", "unused"))
-        creds = bot._emission_credential_map("a")
-        gone = creds[("vless-ws", 2)]["email"]
-        live = [creds[("vless-ws", i)]["email"] for i in (0, 1)]
-        c = bot.db(); c.execute("UPDATE users SET usage_anchor=0 WHERE token='a'")
-        c.executemany("INSERT INTO usage_ledger(email,token,last_raw,total_bytes) VALUES(?,'a',100,100)",
-                      [(gone,), (live[0],), (live[1],)])
-        c.commit(); c.close()
-        self.patch("xr_usage_all", lambda: bot.UsageSnapshot({"a": 350},
-                   {gone: 150, live[0]: 100, live[1]: 100}))
-        self.recipe(2)
-        self.assertTrue(bot.xr_reconcile_user_endpoints("a", "unused"))
-        self.patch("xr_usage_all", lambda: bot.UsageSnapshot({"a": 200},
-                   {live[0]: 100, live[1]: 100}))
-        bot.refresh_usage("a")
-        c = bot.db(); used = c.execute("SELECT used_bytes FROM users WHERE token='a'").fetchone()[0]; c.close()
-        self.assertEqual(used, 350)
-
-    def test_failed_stats_read_defers_revocation(self):
-        self.recipe(3)
-        self.user("a", mode="emissions")
-        self.assertTrue(bot.xr_add_user("a", "unused"))
-        self.recipe(2)
-        self.patch("xr_usage_all", lambda: None)
-        self.patch("_emergency_clear_dynamic_users", lambda: self.fail("must preserve unbanked counters"))
-        self.assertFalse(bot.xr_reconcile_user_endpoints("a", "unused"))
-        self.assertEqual(self.removed, [])
-        self.assertEqual(bot.meta_get("membership_sync_pending"), "1")
-
-    def test_failed_legacy_anchor_read_defers_restart_and_revocation(self):
-        self.user("a", used=100)
-        c = bot.db(); c.execute("UPDATE users SET last_raw=100 WHERE token='a'"); c.commit(); c.close()
-        self.recipe(1)
-        self.patch("xr_usage_all", lambda: None)
-        self.patch("_emergency_clear_dynamic_users", lambda: self.fail("must keep old counters"))
-        self.assertFalse(bot.xr_reconcile_user_endpoints("a", "unused"))
-        self.assertEqual(self.removed, [])
-        self.assertEqual(bot.meta_get("membership_sync_pending"), "1")
-
-    def test_unstable_stats_epoch_defers_revocation(self):
-        self.recipe(3)
-        self.user("a", mode="emissions")
-        self.assertTrue(bot.xr_add_user("a", "unused"))
-        self.recipe(2)
-        self.patch("_stats_epoch_still_running", lambda pid: False)
-        self.patch("_emergency_clear_dynamic_users", lambda: self.fail("must wait for stable stats"))
-        self.assertFalse(bot.xr_reconcile_user_endpoints("a", "unused"))
-        self.assertEqual(self.removed, [])
-
-    def test_missing_revoked_email_with_live_survivor_restarts_once(self):
-        self.recipe(3)
-        self.user("a", mode="emissions", used=300)
-        self.assertTrue(bot.xr_add_user("a", "unused"))
-        creds = bot._emission_credential_map("a")
-        gone = creds[("vless-ws", 2)]["email"]
-        live = creds[("vless-ws", 0)]["email"]
-        c = bot.db(); c.execute("UPDATE users SET usage_anchor=0 WHERE token='a'")
-        c.executemany("INSERT INTO usage_ledger(email,token,last_raw,total_bytes) VALUES(?,'a',100,100)",
-                      [(r["email"],) for r in creds.values()])
-        c.commit(); c.close()
-        pid = {"value": "old-pid"}; restarts = []
-        self.patch("xray_pid", lambda: pid["value"])
-        bot.meta_set("xray_pid", pid["value"])
-        self.patch("xr_usage_all", lambda: bot.UsageSnapshot(
-            {"a": 110} if pid["value"] == "old-pid" else {},
-            {live: 110} if pid["value"] == "old-pid" else {}, pid["value"]))
-        self.recipe(2)
-        def emergency():
-            restarts.append(1)
-            pid["value"] = "new-pid"
-            bot.resync_all(allow_missing_stats_restart=False)
-            return True
-        self.patch("_emergency_clear_dynamic_users", emergency)
-        self.assertTrue(bot.resync_all())
-        self.assertEqual(restarts, [1])
-        self.assertIn(("vless-ws", gone), self.removed)
-        self.assertEqual(bot.meta_get("membership_sync_pending"), "")
 
     def test_legacy_link_keeps_imported_identity_for_non_port_edit(self):
         self.user("a")
@@ -366,8 +84,8 @@ class ProtocolEnforcement(unittest.TestCase):
         bot.set_endpoint_settings({"vless-ws": {"tls_ports": [2053]}})
         self.assertTrue(bot.xr_reconcile_user_endpoints("a", "00000000-0000-4000-8000-000000000001"))
         self.assertEqual(bot.credential_mode("a"), "legacy")
-        self.assertIn("vless-ws", bot.emission_mode_tags("a"))
-        self.assertEqual({key[1] for key in bot._emission_credential_map("a")}, {0, 1})
+        self.assertIn("vless-ws", bot.slot_mode_tags("a"))
+        self.assertEqual({key[2] for key in bot._slot_credential_map("a")}, {2053})
         self.assertIn(("vless-ws", "u_a.vless-ws"), self.removed)
         self.assertTrue(any("vless-ws" in tags for tags in self.kicked))
         raw = base64.b64decode(open(bot.sub_path("a")).read()).decode()
@@ -375,7 +93,6 @@ class ProtocolEnforcement(unittest.TestCase):
         self.assertNotIn(":443?", raw)
 
     def test_disabling_whole_protocol_keeps_other_legacy_uris(self):
-        bot.set_ips(["1.1.1.1"])
         self.recipe(2, vmess_count=1)
         self.user("a")
         self.recipe(0, vmess_count=1)
@@ -386,7 +103,7 @@ class ProtocolEnforcement(unittest.TestCase):
         self.assertNotIn(("vmess-ws", "u_a.vmess-ws"), self.removed)
         c = bot.db(); u = c.execute("SELECT active_slots FROM users WHERE token='a'").fetchone(); c.close()
         self.assertEqual(bot._decode_slots(u["active_slots"]), {("vmess-ws", "tls", 443)})
-        self.assertIn("vless-ws", bot.emission_mode_tags("a"))
+        self.assertIn("vless-ws", bot.slot_mode_tags("a"))
         bot.set_recipe({"vless-ws": {"enabled": True, "count": 2},
                         "vmess-ws": {"enabled": True, "count": 1},
                         "trojan-ws": {"enabled": False, "count": 0}})
@@ -403,13 +120,11 @@ class ProtocolEnforcement(unittest.TestCase):
         self.assertTrue(bot.xr_reconcile_user_endpoints("a", "unused"))
         self.assertIn(("vless-ws", old["email"]), self.removed)
         self.assertNotIn(("vless-ws", "tls", 443), bot._slot_credential_map("a"))
-        converted = bot._emission_credential_map("a")[("vless-ws", 0)]
         bot.set_endpoint_settings({"vless-ws": {"tls_ports": [443, 2053]}})
         self.assertTrue(bot.xr_reconcile_user_endpoints("a", "unused"))
-        new = bot._emission_credential_map("a")[("vless-ws", 0)]
+        new = bot._slot_credential_map("a")[("vless-ws", "tls", 443)]
         self.assertNotEqual(old["secret"], new["secret"])
         self.assertNotEqual(old["email"], new["email"])
-        self.assertIn(("vless-ws", converted["email"]), self.removed)
 
     def test_per_email_ledger_keeps_survivor_growth_when_slot_disappears(self):
         self.user("a", mode="slots", used=200)
@@ -485,11 +200,10 @@ class ProtocolEnforcement(unittest.TestCase):
         self.patch("_rmu_email", lambda tag, email: False)
         self.patch("xray_pid", lambda: "new-pid")
         commands = []
-        self.patch("refresh_all_usage", lambda: commands.append("usage"))
         self.patch("subprocess", type("RunStub", (), {"run": staticmethod(
-            lambda cmd, **kwargs: commands.append("restart") or subprocess.CompletedProcess(cmd, 0, "", ""))}))
+            lambda cmd, **kwargs: commands.append(cmd) or subprocess.CompletedProcess(cmd, 0, "", ""))}))
         self.assertTrue(bot.freeze_user("a"))
-        self.assertEqual(commands, ["usage", "restart"])
+        self.assertEqual(commands, [["systemctl", "restart", bot.XRAY_SERVICE]])
         self.assertEqual({email.split(".")[0] for _, _, email in self.added}, {"u_b"})
 
     def test_missing_legacy_stats_defers_rotation_and_resync_retries(self):
@@ -551,7 +265,7 @@ class ProtocolEnforcement(unittest.TestCase):
         self.patch("subprocess", type("RunStub", (), {"run": staticmethod(
             lambda cmd, **kwargs: first.update(pending=False) or subprocess.CompletedProcess(cmd, 0, "", ""))}))
         self.assertTrue(bot.xr_reconcile_user_endpoints("a", "unused"))
-        self.assertIn("vless-ws", bot.emission_mode_tags("a"))
+        self.assertIn("vless-ws", bot.slot_mode_tags("a"))
         self.assertEqual(bot.meta_get("membership_sync_pending"), "")
         c = bot.db(); u = c.execute("SELECT active_slots FROM users WHERE token='a'").fetchone(); c.close()
         self.assertEqual(bot._decode_slots(u["active_slots"]), {("vless-ws", "tls", 2053)})

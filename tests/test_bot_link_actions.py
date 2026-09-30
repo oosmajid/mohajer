@@ -1,5 +1,4 @@
 import os, sys, tempfile, unittest
-from unittest import mock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bot"))
 os.environ.setdefault("DPBOT_ENV", "/nonexistent-dpbot-env")
 import bot  # noqa: E402
@@ -50,33 +49,6 @@ class BotLinkActionsTests(unittest.TestCase):
         bot.route_cb(10, 20, "rst:t1", "cb")
         c = bot.db(); u = c.execute("SELECT * FROM users WHERE token='t1'").fetchone(); c.close()
         self.assertEqual(bot.current_usage(u), 0)
-
-    def test_telegram_clean_ip_change_reconciles_before_republishing(self):
-        bot.set_ips(["1.1.1.1"])
-        bot.pending[10] = {"stage": "ips_edit"}
-        observed = []
-        def reconcile(**kwargs):
-            observed.append((bot.get_ips(), bot.meta_get("membership_sync_pending")))
-            return True
-        with mock.patch.object(bot, "xr_reconcile_all_users", side_effect=reconcile), \
-             mock.patch.object(bot, "regenerate_all_subs") as regenerate:
-            bot.handle_update({"message": {"from": {"id": 1}, "chat": {"id": 10},
-                                           "text": "2.2.2.2"}})
-        self.assertEqual(observed, [(["2.2.2.2"], "1")])
-        regenerate.assert_called_once()
-        self.assertEqual(bot.meta_get("membership_sync_pending"), "")
-
-    def test_failed_telegram_clean_ip_change_restores_previous_ips(self):
-        bot.set_ips(["1.1.1.1"])
-        bot.pending[10] = {"stage": "ips_edit"}
-        with mock.patch.object(bot, "xr_reconcile_all_users", side_effect=[False, True]) as reconcile, \
-             mock.patch.object(bot, "regenerate_all_subs") as regenerate:
-            bot.handle_update({"message": {"from": {"id": 1}, "chat": {"id": 10},
-                                           "text": "2.2.2.2"}})
-        self.assertEqual(reconcile.call_count, 2)
-        regenerate.assert_called_once()
-        self.assertEqual(bot.get_ips(), ["1.1.1.1"])
-        self.assertEqual(bot.meta_get("membership_sync_pending"), "")
 
 
 if __name__ == "__main__":

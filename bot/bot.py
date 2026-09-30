@@ -3,7 +3,7 @@
 # VLESS/VMess/Trojan over WebSocket (TLS + no-TLS, fronted by Cloudflare) + VLESS-XHTTP.
 # Per-user quota + expiry are enforced live via `xray api adu/rmu/statsquery` (no xray restart).
 # All config comes from bot.env (see config/bot.env.example). Single-file, runs under systemd.
-import os, re, sys, json, time, html, base64, socket, sqlite3, secrets, threading, subprocess, math, tempfile, hashlib
+import os, re, sys, json, time, html, base64, socket, sqlite3, secrets, threading, subprocess, math, tempfile
 import uuid as uuidlib
 import urllib.request, urllib.parse, ssl
 import http.cookies
@@ -62,8 +62,6 @@ FRAGMENT_FM = ENV.get("FRAGMENT_FM", json.dumps(
     separators=(",", ":")))
 DEFAULT_IPS = [x.strip() for x in ENV.get("IPS", "104.16.96.1,104.21.96.1,104.19.96.1").split(",") if x.strip()]
 GB = 1024 ** 3
-MAX_CONFIGS_PER_ENDPOINT = 16
-MAX_CONFIGS_PER_LINK = 64
 IRAN_OFFSET = 3 * 3600 + 30 * 60  # UTC+03:30; Iran has no DST since 2022
 GRACE_SECONDS = 48 * 3600  # after quota/time runs out, keep the link (disabled) this long for renewal, then auto-delete
 
@@ -92,10 +90,9 @@ def init_db():
         base_bytes INTEGER DEFAULT 0, last_raw INTEGER DEFAULT 0, used_bytes INTEGER DEFAULT 0,
         usage_reset_bytes INTEGER DEFAULT 0,
         disabled_ts INTEGER DEFAULT 0, frozen INTEGER DEFAULT 0,
-        config_override TEXT, credential_mode TEXT DEFAULT 'legacy', active_slots TEXT, active_emissions TEXT,
+        config_override TEXT, credential_mode TEXT DEFAULT 'legacy', active_slots TEXT,
         rebase_floor INTEGER, usage_anchor INTEGER,
-        auth_pending INTEGER DEFAULT 0, pending_delete INTEGER DEFAULT 0,
-        emission_migration_pending INTEGER DEFAULT 0)""")
+        auth_pending INTEGER DEFAULT 0, pending_delete INTEGER DEFAULT 0)""")
     c.execute("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)")
     c.execute("""CREATE TABLE IF NOT EXISTS usage_daily(
         token TEXT, day TEXT, start_used INTEGER, end_used INTEGER,
@@ -113,8 +110,6 @@ def init_db():
         c.execute("ALTER TABLE users ADD COLUMN credential_mode TEXT DEFAULT 'legacy'")
     if "active_slots" not in cols:
         c.execute("ALTER TABLE users ADD COLUMN active_slots TEXT")
-    if "active_emissions" not in cols:
-        c.execute("ALTER TABLE users ADD COLUMN active_emissions TEXT")
     if "rebase_floor" not in cols:
         c.execute("ALTER TABLE users ADD COLUMN rebase_floor INTEGER")
     if "usage_anchor" not in cols:
@@ -123,19 +118,11 @@ def init_db():
         c.execute("ALTER TABLE users ADD COLUMN auth_pending INTEGER DEFAULT 0")
     if "pending_delete" not in cols:
         c.execute("ALTER TABLE users ADD COLUMN pending_delete INTEGER DEFAULT 0")
-    if "emission_migration_pending" not in cols:
-        c.execute("ALTER TABLE users ADD COLUMN emission_migration_pending INTEGER DEFAULT 0")
     c.execute("""CREATE TABLE IF NOT EXISTS slot_credentials(
         token TEXT NOT NULL, tag TEXT NOT NULL, security TEXT NOT NULL, external_port INTEGER NOT NULL,
         email TEXT NOT NULL UNIQUE, secret TEXT NOT NULL,
         PRIMARY KEY(token, tag, security, external_port))""")
     c.execute("""CREATE TABLE IF NOT EXISTS slot_mode_tags(
-        token TEXT NOT NULL, tag TEXT NOT NULL, PRIMARY KEY(token,tag))""")
-    c.execute("""CREATE TABLE IF NOT EXISTS emission_credentials(
-        token TEXT NOT NULL, tag TEXT NOT NULL, config_index INTEGER NOT NULL,
-        signature TEXT NOT NULL, email TEXT NOT NULL UNIQUE, secret TEXT NOT NULL,
-        PRIMARY KEY(token,tag,config_index))""")
-    c.execute("""CREATE TABLE IF NOT EXISTS emission_mode_tags(
         token TEXT NOT NULL, tag TEXT NOT NULL, PRIMARY KEY(token,tag))""")
     c.execute("""CREATE TABLE IF NOT EXISTS legacy_emails(
         token TEXT NOT NULL, tag TEXT NOT NULL, email TEXT NOT NULL UNIQUE,
@@ -143,12 +130,6 @@ def init_db():
     c.execute("""CREATE TABLE IF NOT EXISTS usage_ledger(
         email TEXT PRIMARY KEY, token TEXT NOT NULL,
         last_raw INTEGER NOT NULL DEFAULT 0, total_bytes INTEGER NOT NULL DEFAULT 0)""")
-    # Historical count/IP edits cannot be reconstructed from the old database.
-    # Retire every shared legacy/port identity once, including disabled links.
-    c.execute("UPDATE users SET emission_migration_pending=1 WHERE COALESCE(credential_mode,'legacy')!='emissions'")
-    if c.execute("SELECT 1 FROM users WHERE emission_migration_pending=1 LIMIT 1").fetchone():
-        c.execute("INSERT INTO meta(k,v) VALUES('membership_sync_pending','1') "
-                  "ON CONFLICT(k) DO UPDATE SET v='1'")
     # retired_bytes = lifetime traffic of already-deleted users, so deleting a user never
     # drops the dashboard's "total". Backfill ONCE from any daily rows left by past deletes
     # (their last recorded end_used ≈ their lifetime at deletion) so the count stays honest.
@@ -161,7 +142,6 @@ def init_db():
     # Remember the pre-edit slots for legacy links. A later settings change can then
     # detect a removed port even though the old credential has no per-port identity.
     _snapshot_missing_active_slots()
-    _snapshot_missing_active_emissions()
 
 def meta_get(k, d=None):
     c = db(); r = c.execute("SELECT v FROM meta WHERE k=?", (k,)).fetchone(); c.close()
@@ -204,22 +184,16 @@ def legacy_email(token, tag):
 
 def _rotate_legacy_emails(token):
     """Use new Xray stats identities after a freeze or quota renewal."""
-    c = db(); u = c.execute("SELECT credential_mode,active_slots,emission_migration_pending FROM users WHERE token=?", (token,)).fetchone(); c.close()
-    if not u: return
+    c = db(); u = c.execute("SELECT credential_mode,active_slots FROM users WHERE token=?", (token,)).fetchone(); c.close()
+    if not u or u["credential_mode"] == "slots": return
     slots = _decode_slots(u["active_slots"]) if u["active_slots"] is not None else active_slot_keys(token)
-    tags = ({tag for tag, _, _ in slots} - slot_mode_tags(token) - emission_mode_tags(token)
-            if u["credential_mode"] == "legacy" else set())
-    if u["credential_mode"] == "legacy" and u["emission_migration_pending"]:
-        tags = {ep["tag"] for ep in ENDPOINTS}
+    tags = {tag for tag, _, _ in slots} - slot_mode_tags(token)
+    if not tags: return
     c = db()
     for tag in tags:
         email = "%s.g%s" % (ep_email(token, tag), secrets.token_hex(5))
         c.execute("INSERT INTO legacy_emails(token,tag,email) VALUES(?,?,?) "
                   "ON CONFLICT(token,tag) DO UPDATE SET email=excluded.email", (token, tag, email))
-    for table in ("slot_credentials", "emission_credentials"):
-        for row in c.execute("SELECT rowid,tag FROM %s WHERE token=?" % table, (token,)).fetchall():
-            email = "%s.g%s" % (ep_email(token, row["tag"]), secrets.token_hex(6))
-            c.execute("UPDATE %s SET email=? WHERE rowid=?" % table, (email, row["rowid"]))
     c.commit(); c.close()
 
 def _adu(ep, secret, email):
@@ -258,16 +232,8 @@ def xr_add_user(token, secret):
     ok = True
     slots = active_slot_keys(token)
     converted = slot_mode_tags(token)
-    emission_tags = emission_mode_tags(token)
     mode = credential_mode(token)
-    specs = emitted_configs(token)
     for ep in ENDPOINTS:
-        tag = ep["tag"]
-        if mode == "emissions" or tag in emission_tags:
-            for spec in (s for s in specs if s["tag"] == tag):
-                cred = ensure_emission_credential(token, spec)
-                if not cred or not _adu(ep, cred["secret"], cred["email"]): ok = False
-            continue
         ep_slots = sorted(s for s in slots if s[0] == ep["tag"])
         if not ep_slots: continue
         if mode == "slots" or ep["tag"] in converted:
@@ -296,17 +262,14 @@ def _rmu(token, tag):
 def xr_remove_user(token):
     # Keep credentials in SQLite for renewal; delete_user forgets them separately.
     c = db()
-    creds = c.execute("SELECT tag,email FROM slot_credentials WHERE token=? UNION ALL "
-                      "SELECT tag,email FROM emission_credentials WHERE token=?", (token, token)).fetchall()
-    user = c.execute("SELECT credential_mode,active_slots,emission_migration_pending FROM users WHERE token=?", (token,)).fetchone()
+    creds = c.execute("SELECT tag,email FROM slot_credentials WHERE token=?", (token,)).fetchall()
+    user = c.execute("SELECT credential_mode,active_slots FROM users WHERE token=?", (token,)).fetchone()
     c.close()
-    converted = slot_mode_tags(token) | emission_mode_tags(token)
+    converted = slot_mode_tags(token)
     old_slots = (_decode_slots(user["active_slots"]) if user and user["active_slots"] is not None
                  else active_slot_keys(token))
     legacy_tags = ({tag for tag, _, _ in old_slots} - converted
-                   if user and user["credential_mode"] == "legacy" else set())
-    if user and user["credential_mode"] == "legacy" and user["emission_migration_pending"]:
-        legacy_tags = {ep["tag"] for ep in ENDPOINTS}
+                   if user and user["credential_mode"] != "slots" else set())
     if legacy_tags: _enable_usage_ledger(token)
     refresh_usage(token)
     ok = True
@@ -323,10 +286,6 @@ def _emergency_clear_dynamic_users():
     if now - int(meta_get("last_emergency_restart_ts", "0") or 0) < 120:
         return False
     meta_set("last_emergency_restart_ts", str(now))
-    try:
-        refresh_all_usage()  # preserve other users' unpolled traffic before restart
-    except Exception as exc:
-        print("emergency usage refresh failed:", exc, flush=True)
     try:
         result = subprocess.run(["systemctl", "restart", XRAY_SERVICE],
                                 capture_output=True, text=True, timeout=30)
@@ -388,9 +347,7 @@ def tags_to_cut_for_user(token):
     # cloudflared sockets. Use the subscribed inbound tags as the safe fallback.
     online = online_tags_of(token)
     if online: return online
-    c = db(); u = c.execute("SELECT active_slots,credential_mode,emission_migration_pending FROM users WHERE token=?", (token,)).fetchone(); c.close()
-    if u and u["credential_mode"] == "legacy" and u["emission_migration_pending"]:
-        return {ep["tag"] for ep in ENDPOINTS}
+    c = db(); u = c.execute("SELECT active_slots FROM users WHERE token=?", (token,)).fetchone(); c.close()
     if u and u["active_slots"] is not None:
         return {tag for tag, _, _ in _decode_slots(u["active_slots"])}
     return {tag for tag, _, _ in active_slot_keys(token)}
@@ -560,24 +517,7 @@ def get_recipe():
             pass
     return rec
 
-def validate_recipe_capacity(recipe):
-    """Bound the Xray client count minted for each link, including migrations."""
-    if not isinstance(recipe, dict): raise ValueError("پیکربندی کانفیگ نامعتبر است")
-    total = 0
-    for ep in ENDPOINTS:
-        item = recipe.get(ep["tag"], {})
-        if not isinstance(item, dict): raise ValueError("پیکربندی کانفیگ نامعتبر است")
-        try: count = int(item.get("count", 0))
-        except (TypeError, ValueError): raise ValueError("تعداد کانفیگ نامعتبر است")
-        if count < 0 or count > MAX_CONFIGS_PER_ENDPOINT:
-            raise ValueError("حداکثر %d کانفیگ برای هر پروتکل مجاز است" % MAX_CONFIGS_PER_ENDPOINT)
-        if item.get("enabled"): total += count
-    if total > MAX_CONFIGS_PER_LINK:
-        raise ValueError("حداکثر %d کانفیگ برای هر لینک مجاز است" % MAX_CONFIGS_PER_LINK)
-    return True
-
 def set_recipe(recipe):
-    validate_recipe_capacity(recipe)
     meta_set("config_recipe", json.dumps(recipe))
 
 def approved_hosts():
@@ -645,8 +585,6 @@ def get_link_override(token):
     return value if isinstance(value, dict) else {}
 
 def set_link_override(token, settings, queue_sync=False, queue_outbound=False):
-    if settings is not None and "recipe" in settings:
-        validate_recipe_capacity(settings["recipe"])
     c = db(); cur = c.execute("UPDATE users SET config_override=? WHERE token=?",
                             (json.dumps(settings, ensure_ascii=False) if settings is not None else None, token))
     if cur.rowcount and queue_sync:
@@ -664,7 +602,6 @@ def global_settings_snapshot():
 
 def store_global_config(settings):
     """Commit all public endpoint settings with a durable reconciliation marker."""
-    validate_recipe_capacity(settings["recipe"])
     c = db()
     for key, value in (
         ("config_recipe", json.dumps(settings["recipe"])),
@@ -722,60 +659,6 @@ def active_slot_keys(token, recipe=None, settings=None):
             active.add((tag, security, int(port)))
     return active
 
-def emitted_configs(token, recipe=None, settings=None, ips=None):
-    """Ordered URI positions. Each position has its own revocable Xray identity."""
-    recipe = effective_recipe(token) if recipe is None else recipe
-    validate_recipe_capacity(recipe)
-    settings = effective_endpoint_settings(token) if settings is None else settings
-    ips = (effective_ips(token) if ips is None else ips) or DEFAULT_IPS
-    result = []; ip_index = 0
-    for source in ENDPOINTS:
-        ep = _configured_ep(source, settings)
-        r = recipe.get(ep["tag"], {"enabled": True, "count": len(_ep_slots(ep))})
-        try: count = max(0, int(r.get("count", 0))) if r.get("enabled") else 0
-        except (TypeError, ValueError): count = 0
-        if "reality" in ep:
-            for index in range(count):
-                identity = {"tag": ep["tag"], "index": index, "proto": "vless",
-                            "security": "reality", "reality": {k: ep["reality"].get(k)
-                            for k in ("addr", "port", "pbk", "sni", "fp", "sid", "flow")}}
-                signature = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-                result.append({"tag": ep["tag"], "index": index, "ep": ep, "security": "reality",
-                               "port": int(ep["reality"]["port"]), "ip": None, "signature": signature})
-            continue
-        slots = _ep_slots(ep)
-        for index in range(count if slots else 0):
-            port, security = slots[index % len(slots)]
-            ip = ips[ip_index % len(ips)]; ip_index += 1
-            identity = {"tag": ep["tag"], "index": index, "proto": ep["proto"], "net": ep["net"],
-                        "path": ep["path"], "ip": ip, "port": int(port), "security": security,
-                        "host": ep.get("host") or DOMAIN}
-            if security == "tls":
-                identity["sni"] = ep.get("sni") or ep.get("host") or DOMAIN
-                if ep["proto"] != "vmess": identity["fragment_fm"] = ep.get("fragment_fm", FRAGMENT_FM)
-            signature = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-            result.append({"tag": ep["tag"], "index": index, "ep": ep, "security": security,
-                           "port": int(port), "ip": ip, "signature": signature})
-    return result
-
-def _emission_map(specs):
-    return {(s["tag"], int(s["index"])): s["signature"] for s in specs}
-
-def _encode_emissions(specs):
-    entries = sorted((tag, index, signature) for (tag, index), signature in _emission_map(specs).items())
-    return json.dumps(entries, separators=(",", ":"))
-
-def _decode_emissions(raw):
-    try: return {(str(tag), int(index)): str(sig) for tag, index, sig in json.loads(raw or "[]")}
-    except (TypeError, ValueError): return {}
-
-def _snapshot_missing_active_emissions():
-    c = db(); rows = c.execute("SELECT token FROM users WHERE active_emissions IS NULL").fetchall(); c.close()
-    if not rows: return
-    snapshots = [(_encode_emissions(emitted_configs(u["token"])), u["token"]) for u in rows]
-    c = db(); c.executemany("UPDATE users SET active_emissions=? WHERE token=? AND active_emissions IS NULL", snapshots)
-    c.commit(); c.close()
-
 def _encode_slots(slots):
     return json.dumps([list(s) for s in sorted(slots)], separators=(",", ":"))
 
@@ -810,38 +693,7 @@ def active_endpoint_tags(recipe, settings=None):
 
 def credential_mode(token):
     c = db(); u = c.execute("SELECT credential_mode FROM users WHERE token=?", (token,)).fetchone(); c.close()
-    return u["credential_mode"] if u else "emissions"  # create_user provisions before INSERT
-
-def emission_mode_tags(token):
-    c = db(); rows = c.execute("SELECT tag FROM emission_mode_tags WHERE token=?", (token,)).fetchall(); c.close()
-    return {r["tag"] for r in rows}
-
-def _mark_emission_mode_tag(token, tag):
-    c = db(); c.execute("INSERT OR IGNORE INTO emission_mode_tags(token,tag) VALUES(?,?)", (token, tag))
-    c.commit(); c.close()
-
-def _emission_credential_map(token):
-    c = db(); rows = c.execute("SELECT * FROM emission_credentials WHERE token=?", (token,)).fetchall(); c.close()
-    return {(r["tag"], int(r["config_index"])): r for r in rows}
-
-def ensure_emission_credential(token, spec):
-    """Create only a previously unused identity; a changed signature needs an RMU first."""
-    tag, index = spec["tag"], int(spec["index"])
-    c = db()
-    row = c.execute("SELECT * FROM emission_credentials WHERE token=? AND tag=? AND config_index=?",
-                    (token, tag, index)).fetchone()
-    if row:
-        c.close(); return row if row["signature"] == spec["signature"] else None
-    ep = spec["ep"]
-    secret = secrets.token_urlsafe(32) if ep.get("proto") == "trojan" else str(uuidlib.uuid4())
-    email = "%s.c%d.%s" % (ep_email(token, tag), index, secrets.token_hex(6))
-    c.execute("INSERT OR IGNORE INTO emission_credentials(token,tag,config_index,signature,email,secret) "
-              "VALUES(?,?,?,?,?,?)", (token, tag, index, spec["signature"], email, secret))
-    c.commit()
-    row = c.execute("SELECT * FROM emission_credentials WHERE token=? AND tag=? AND config_index=?",
-                    (token, tag, index)).fetchone()
-    c.close()
-    return row if row and row["signature"] == spec["signature"] else None
+    return u["credential_mode"] if u else "slots"  # create_user provisions before INSERT
 
 def slot_mode_tags(token):
     c = db(); rows = c.execute("SELECT tag FROM slot_mode_tags WHERE token=?", (token,)).fetchall(); c.close()
@@ -871,112 +723,64 @@ def ensure_slot_credential(token, ep, security, port):
                     (token, ep["tag"], security, port)).fetchone()
     c.close(); return row
 
-def _set_auth_state(token, mode, slots, specs, migrated=False):
-    c = db(); c.execute("UPDATE users SET credential_mode=?,active_slots=?,active_emissions=?,"
-                        "emission_migration_pending=? WHERE token=?",
-                        ("emissions" if migrated else mode, _encode_slots(slots),
-                         _encode_emissions(specs), 0, token))
-    if migrated:
-        c.execute("DELETE FROM slot_mode_tags WHERE token=?", (token,))
-        c.execute("DELETE FROM emission_mode_tags WHERE token=?", (token,))
-    c.commit(); c.close()
+def _set_auth_state(token, mode, slots):
+    c = db(); c.execute("UPDATE users SET credential_mode=?,active_slots=? WHERE token=?",
+                        (mode, _encode_slots(slots), token)); c.commit(); c.close()
 
-def _reconcile_user_membership(u, before_recipe=None, before_settings=None,
-                               publish=True, register=True, register_all=False,
-                               allow_missing_revoked_stats=False):
-    """Retire changed URI identities before publishing their replacements."""
+def _reconcile_user_membership(u, before_recipe=None, before_settings=None):
+    """Reconcile each endpoint without rotating credentials on other endpoints."""
     token, secret = u["token"], u["uuid"]
-    specs = emitted_configs(token)
-    desired_map = _emission_map(specs)
-    previous_map = (_decode_emissions(u["active_emissions"]) if u["active_emissions"] is not None else
-                    _emission_map(emitted_configs(token, before_recipe, before_settings)))
-    changed_tags = {key[0] for key in set(previous_map) | set(desired_map)
-                    if previous_map.get(key) != desired_map.get(key)}
     desired = active_slot_keys(token)
     previous = (_decode_slots(u["active_slots"]) if u["active_slots"] is not None else
                 active_slot_keys(token, before_recipe, before_settings))
+    removed = previous - desired
     desired_tags = {slot[0] for slot in desired}
     previous_tags = {slot[0] for slot in previous}
     eligible = _eligible_for_membership(u)
     mode = u["credential_mode"] or "legacy"
-    migration = bool(u["emission_migration_pending"])
-    slot_tags = slot_mode_tags(token)
-    emission_tags = emission_mode_tags(token)
-    transition_tags = (((changed_tags | {slot[0] for slot in previous - desired}) & previous_tags) - emission_tags
-                       if mode != "emissions" else set())
-    uses_emissions = ({ep["tag"] for ep in ENDPOINTS} if mode == "emissions" or migration else
-                     emission_tags | transition_tags)
+    converted = slot_mode_tags(token)
+    transition_tags = ({slot[0] for slot in removed} - converted) if mode == "legacy" else set()
     ep_by_tag = {e["tag"]: e for e in ENDPOINTS}
-    old_slots = _slot_credential_map(token)
-    old_emissions = _emission_credential_map(token)
-    stale_emissions = {key: cred for key, cred in old_emissions.items()
-                       if key[0] not in uses_emissions or key not in desired_map
-                       or cred["signature"] != desired_map[key]}
-    rolled_back_tags = {key[0] for key in stale_emissions if key[0] not in uses_emissions}
-    stale_slots = {key: cred for key, cred in old_slots.items()
-                   if key[0] in uses_emissions or key not in desired}
-    # A legacy endpoint never emitted before has no historical identity to revoke.
-    revoke_legacy = ((({ep["tag"] for ep in ENDPOINTS} - slot_tags - emission_tags) if migration else
-                      (transition_tags | (previous_tags - desired_tags)) - slot_tags - emission_tags)
+    old_creds = _slot_credential_map(token)
+    to_remove = set(old_creds) - desired
+    # An endpoint that was never emitted has no legacy credential to revoke.
+    # Leaving it alone also avoids making an unrelated first-time edit depend
+    # on a historical stats snapshot.
+    revoke_legacy = ((transition_tags | (previous_tags - desired_tags)) - converted
                      if mode == "legacy" else set())
     diagnosis = {}
-    revoked_emails = ({cred["email"] for cred in stale_emissions.values()} |
-                      {cred["email"] for cred in stale_slots.values()} |
-                      {legacy_email(token, tag) for tag in revoke_legacy})
-    if revoked_emails:
-        if not _enable_usage_ledger(token, diagnosis): return False, set(), diagnosis
-        if not _capture_revocation_usage(token, revoked_emails, eligible, diagnosis,
-                                         allow_absent=allow_missing_revoked_stats):
-            return False, set(), diagnosis
+    if (revoke_legacy or to_remove) and not _enable_usage_ledger(token, diagnosis):
+        return False, set(), diagnosis
+    ok = True
+    for ep in ENDPOINTS:
+        tag = ep["tag"]
+        keys = sorted(s for s in desired if s[0] == tag)
+        uses_slots = mode == "slots" or tag in converted or tag in transition_tags
+        if uses_slots:
+            for key in keys:
+                cred = old_creds.get(key) or ensure_slot_credential(token, ep, key[1], key[2])
+                if eligible and (tag in transition_tags or key not in old_creds):
+                    if not _adu(ep, cred["secret"], cred["email"]): ok = False
+        elif tag in desired_tags and eligible and tag not in previous_tags:
+            if not _adu(ep, secret, legacy_email(token, tag)): ok = False
+    if not ok: return False, set(), diagnosis
     cut = set()
-    # For a changed index, remove its old credential before allocating a new
-    # one. Retaining the row until RMU succeeds makes retries crash-safe.
-    for key, cred in sorted(stale_emissions.items()):
-        if not _rmu_email(key[0], cred["email"]): return False, cut, diagnosis
-        c = db(); c.execute("DELETE FROM emission_credentials WHERE email=?", (cred["email"],)); c.commit(); c.close()
-        cut.add(key[0])
-    for spec in specs:
-        if spec["tag"] not in uses_emissions: continue
-        key = (spec["tag"], spec["index"])
-        cred = ensure_emission_credential(token, spec)
-        needs_adu = (migration or register_all or spec["tag"] in transition_tags or previous_map.get(key) != spec["signature"]
-                     or key not in old_emissions)
-        if not cred or (eligible and register and needs_adu
-                        and not _adu(spec["ep"], cred["secret"], cred["email"])):
-            return False, cut, diagnosis
-    # The shared legacy or port identity is retired only after each surviving
-    # emission was registered. A failed RMU leaves the snapshot old, so no new
-    # subscription is published and the pending retry can finish the migration.
     for ep in ENDPOINTS:
         tag = ep["tag"]
         if tag in revoke_legacy:
-            if not _rmu(token, tag): return False, cut, diagnosis
-            cut.add(tag)
-    for key, cred in sorted(stale_slots.items()):
-        if not _rmu_email(key[0], cred["email"]): return False, cut, diagnosis
+            removed_ok = _rmu(token, tag)
+            if not removed_ok: ok = False
+            else:
+                _mark_slot_mode_tag(token, tag)
+                cut.add(tag)
+    for key in sorted(to_remove):
+        cred = old_creds[key]
+        if not _rmu_email(key[0], cred["email"]): ok = False; continue
         c = db(); c.execute("DELETE FROM slot_credentials WHERE email=?", (cred["email"],)); c.commit(); c.close()
         cut.add(key[0])
-    for tag in transition_tags:
-        _mark_emission_mode_tag(token, tag)
-    # Newly enabled untouched endpoints still use their existing mode.
-    for ep in ENDPOINTS:
-        tag = ep["tag"]
-        if tag in uses_emissions or tag not in desired_tags or not eligible: continue
-        if mode == "slots" or tag in slot_tags:
-            for key in sorted(s for s in desired if s[0] == tag):
-                cred = old_slots.get(key) or ensure_slot_credential(token, ep, key[1], key[2])
-                if register and (register_all or key not in old_slots or tag in rolled_back_tags) and not _adu(ep, cred["secret"], cred["email"]):
-                    return False, cut, diagnosis
-        elif register and (register_all or tag not in previous_tags or tag in rolled_back_tags) and not _adu(ep, secret, legacy_email(token, tag)):
-            return False, cut, diagnosis
-    _set_auth_state(token, mode, desired, specs, migrated=migration)
-    if publish:
-        try:
-            if write_sub(token, secret, u["label"]) is False: return False, cut, diagnosis
-        except OSError as exc:
-            print("subscription write pending:", token, exc, flush=True)
-            return False, cut, diagnosis
-    return True, cut, diagnosis
+    if ok: _set_auth_state(token, mode, desired)
+    write_sub(token, secret, u["label"])
+    return ok, cut, diagnosis
 
 def _eligible_for_membership(u):
     return not (u["disabled_ts"] or u["frozen"] or u["pending_delete"] or exhaust_reason(u))
@@ -985,13 +789,13 @@ def xr_reconcile_user_endpoints(token, secret, before_recipe=None, before_settin
     """Update a link after settings change, including live sessions on removed tags."""
     c = db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone(); c.close()
     if not u: return False
-    ok, cut, diagnosis = _reconcile_user_membership(u, before_recipe, before_settings)
+    ok, cut, _ = _reconcile_user_membership(u, before_recipe, before_settings)
     if cut: force_disconnect(cut)
     if not ok:
         meta_set("membership_sync_pending", "1")
         # A successful restart clears any legacy credential the API could not
         # revoke. resync_all restores only the desired, eligible identities.
-        if not diagnosis.get("stats_unavailable") and _emergency_clear_dynamic_users():
+        if _emergency_clear_dynamic_users():
             ok = meta_get("membership_sync_pending") != "1"
     return ok
 
@@ -1001,15 +805,14 @@ def xr_reconcile_all_users(before_recipe=None, before_settings=None, tokens=None
     selected = set(tokens) if tokens is not None else None
     rows = [u for u in rows if selected is None or u["token"] in selected]
     if not rows: return True
-    ok = True; cut = set(); stats_unavailable = False
+    ok = True; cut = set()
     for u in rows:
-        user_ok, user_cut, diagnosis = _reconcile_user_membership(u, before_recipe, before_settings)
+        user_ok, user_cut, _ = _reconcile_user_membership(u, before_recipe, before_settings)
         ok = user_ok and ok; cut.update(user_cut)
-        stats_unavailable = stats_unavailable or bool(diagnosis.get("stats_unavailable"))
     if cut: force_disconnect(cut)
     if not ok:
         meta_set("membership_sync_pending", "1")
-        if not stats_unavailable and _emergency_clear_dynamic_users():
+        if _emergency_clear_dynamic_users():
             ok = meta_get("membership_sync_pending") != "1"
     return ok
 
@@ -1411,33 +1214,27 @@ def test_outbound(tag):
     return "IP خروجی: %s · %s" % (ip, " · ".join(marks))
 
 def write_sub(token, secret, label):
-    specs = emitted_configs(token)
-    desired = _emission_map(specs)
-    c = db(); user = c.execute("SELECT active_emissions FROM users WHERE token=?", (token,)).fetchone(); c.close()
-    # Settings may already be committed while Xray reconciliation is pending.
-    # Keep the prior subscription rather than issue an unregistered identity.
-    if user and user["active_emissions"] is not None and _decode_emissions(user["active_emissions"]) != desired:
-        return False
-    mode = credential_mode(token)
-    slot_tags = slot_mode_tags(token); emission_tags = emission_mode_tags(token)
-    slots = _slot_credential_map(token); emissions = _emission_credential_map(token)
-    links = []
-    for spec in specs:
-        tag, ep = spec["tag"], spec["ep"]
-        if mode == "emissions" or tag in emission_tags:
-            cred = emissions.get((tag, spec["index"]))
-            if not cred or cred["signature"] != spec["signature"]: return False
-            identity = cred["secret"]
-        elif mode == "slots" or tag in slot_tags:
-            cred = slots.get((tag, spec["security"], spec["port"]))
-            if not cred: return False
-            identity = cred["secret"]
-        else:
-            identity = secret
-        if "reality" in ep:
-            links.append(_reality_link(ep, identity, spec["index"]))
-        else:
-            links.append(_ws_link(ep, identity, spec["ip"], spec["port"], spec["security"]))
+    ips = effective_ips(token) or DEFAULT_IPS
+    recipe = effective_recipe(token); settings = effective_endpoint_settings(token)
+    mode = credential_mode(token); converted = slot_mode_tags(token); links = []; gi = 0
+    for source in ENDPOINTS:
+        ep = _configured_ep(source, settings)
+        r = recipe.get(ep["tag"], {"enabled": True, "count": len(_ep_slots(ep))})
+        count = max(0, int(r.get("count", 0))) if r.get("enabled") else 0
+        if "reality" in ep:      # direct link: no ports/clean IPs to cycle, just `count` copies
+            if count:
+                identity = (ensure_slot_credential(token, ep, "reality", int(ep["reality"]["port"]))["secret"]
+                            if mode == "slots" or ep["tag"] in converted else secret)
+                links += [_reality_link(ep, identity, k) for k in range(count)]
+            continue
+        slots = _ep_slots(ep)
+        if not count or not slots:
+            continue
+        for k in range(count):
+            port, sec = slots[k % len(slots)]
+            identity = (ensure_slot_credential(token, ep, sec, int(port))["secret"]
+                        if mode == "slots" or ep["tag"] in converted else secret)
+            links.append(_ws_link(ep, identity, ips[gi % len(ips)], port, sec)); gi += 1
     path = sub_path(token); tmp = path + ".tmp-" + secrets.token_hex(4)
     try:
         with open(tmp, "w") as out:
@@ -1446,7 +1243,6 @@ def write_sub(token, secret, label):
     finally:
         try: os.remove(tmp)
         except FileNotFoundError: pass
-    return True
 
 def regenerate_all_subs():
     c = db(); rows = c.execute("SELECT token,uuid,label FROM users").fetchall(); c.close()
@@ -1494,21 +1290,18 @@ def create_user(vol_gb, dur_days, label=None):
     expiry_ts = int(time.time() + float(dur_days) * 86400) if dur_days and dur_days > 0 else 0
     if not xr_add_user(token, secret):
         xr_remove_user(token)
-        c = db(); c.execute("DELETE FROM slot_credentials WHERE token=?", (token,))
-        c.execute("DELETE FROM emission_credentials WHERE token=?", (token,)); c.commit(); c.close()
+        c = db(); c.execute("DELETE FROM slot_credentials WHERE token=?", (token,)); c.commit(); c.close()
         return None
-    try:
-        if write_sub(token, secret, label) is False: raise RuntimeError("subscription identities not registered")
+    try: write_sub(token, secret, label)
     except Exception:
         xr_remove_user(token)
-        c = db(); c.execute("DELETE FROM slot_credentials WHERE token=?", (token,))
-        c.execute("DELETE FROM emission_credentials WHERE token=?", (token,)); c.commit(); c.close()
+        c = db(); c.execute("DELETE FROM slot_credentials WHERE token=?", (token,)); c.commit(); c.close()
         raise
     c = db()
     c.execute("""INSERT INTO users(token,uuid,email,label,limit_bytes,expiry_ts,created_ts,base_bytes,last_raw,used_bytes,
-                 credential_mode,active_slots,active_emissions,usage_anchor) VALUES(?,?,?,?,?,?,?,0,0,0,'emissions',?,?,0)""",
+                 credential_mode,active_slots,usage_anchor) VALUES(?,?,?,?,?,?,?,0,0,0,'slots',?,0)""",
               (token, secret, "u_" + token, label, limit_bytes, expiry_ts, int(time.time()),
-               _encode_slots(active_slot_keys(token)), _encode_emissions(emitted_configs(token))))
+               _encode_slots(active_slot_keys(token))))
     c.commit(); c.close()
     return token
 
@@ -1532,15 +1325,12 @@ def delete_user(token):
               (str(retired),))
     c.execute("DELETE FROM slot_credentials WHERE token=?", (token,))
     c.execute("DELETE FROM slot_mode_tags WHERE token=?", (token,))
-    c.execute("DELETE FROM emission_credentials WHERE token=?", (token,))
-    c.execute("DELETE FROM emission_mode_tags WHERE token=?", (token,))
     c.execute("DELETE FROM legacy_emails WHERE token=?", (token,))
     c.execute("DELETE FROM usage_ledger WHERE token=?", (token,))
     c.execute("DELETE FROM users WHERE token=?", (token,)); c.commit(); c.close()
     del_sub(token)
     force_disconnect(tags)
     if custom:
-        refresh_all_usage()  # preserve other links' counters before the outbound restart
         try:
             applied, reason = apply_xray_outbounds()
         except Exception as exc:
@@ -1734,9 +1524,7 @@ def _enable_usage_ledger(token, diagnosis=None):
         if not prior: return False
         if prior["usage_anchor"] is not None: return True
         snapshot = xr_usage_all()
-        if snapshot is None or getattr(snapshot, "emails", None) is None:
-            if diagnosis is not None: diagnosis["stats_unavailable"] = True
-            return False
+        if snapshot is None or getattr(snapshot, "emails", None) is None: return False
         pid = getattr(snapshot, "epoch_pid", None)
         if not _stats_epoch_still_running(pid): continue
         c = db()
@@ -1767,38 +1555,6 @@ def _enable_usage_ledger(token, diagnosis=None):
             c.commit(); return True
         finally:
             c.close()
-    if diagnosis is not None: diagnosis["stats_unavailable"] = True
-    return False
-
-def _capture_revocation_usage(token, emails, eligible, diagnosis=None, allow_absent=False):
-    """Bank the latest per-email counters before Xray can discard a revoked ID."""
-    for _ in range(3):
-        begin_xray_counter_epoch()
-        snapshot = xr_usage_all()
-        if snapshot is None or getattr(snapshot, "emails", None) is None:
-            if diagnosis is not None: diagnosis["stats_unavailable"] = True
-            return False
-        pid = getattr(snapshot, "epoch_pid", None)
-        if not _stats_epoch_still_running(pid): continue
-        c = db()
-        try:
-            c.execute("BEGIN IMMEDIATE")
-            if not _stats_epoch_matches(c, pid): c.rollback(); continue
-            u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone()
-            if not u or u["usage_anchor"] is None: c.rollback(); return False
-            last = {r["email"]: int(r["last_raw"]) for r in c.execute(
-                "SELECT email,last_raw FROM usage_ledger WHERE token=?", (token,)).fetchall()}
-            missing = {email for email in emails if email not in snapshot.emails and last.get(email, 0) > 0}
-            if eligible and missing and not allow_absent:
-                if diagnosis is not None:
-                    diagnosis["missing_stats_pid"] = pid
-                    diagnosis["missing_stats_emails"] = sorted(missing)
-                c.rollback(); return False
-            _ledger_apply_snapshot(c, u, snapshot.emails)
-            c.commit(); return True
-        finally:
-            c.close()
-    if diagnosis is not None: diagnosis["stats_unavailable"] = True
     return False
 
 def refresh_all_usage():
@@ -1862,14 +1618,18 @@ def resync_all(allow_missing_stats_restart=True):
     c = db(); rows = c.execute("SELECT * FROM users").fetchall(); c.close()
     ok = True; cut = set(); missing_stats = {}
     for u in rows:
-        user_ok, user_cut, diagnosis = _reconcile_user_membership(
-            u, register_all=True, allow_missing_revoked_stats=not allow_missing_stats_restart)
+        user_ok, user_cut, diagnosis = _reconcile_user_membership(u)
         cut.update(user_cut)
         if not user_ok:
             ok = False
             if "missing_stats_pid" in diagnosis:
-                missing_stats[u["token"]] = diagnosis
+                missing_stats[u["token"]] = diagnosis["missing_stats_pid"]
             continue
+        if not _eligible_for_membership(u): continue  # grace, freeze, or exhausted quota -> keep out of xray
+        if not xr_add_user(u["token"], u["uuid"]):
+            ok = False
+            continue
+        write_sub(u["token"], u["uuid"], u["label"])
     if cut: force_disconnect(cut)
     meta_set("membership_sync_pending", "" if ok else "1")
     if not ok and missing_stats and allow_missing_stats_restart:
@@ -1879,12 +1639,10 @@ def resync_all(allow_missing_stats_restart=True):
         # The new PID banks last_raw and can safely anchor known lifetime usage.
         refresh_all_usage()
         pid = xray_pid()
-        if pid and pid != "0" and all(item["missing_stats_pid"] == pid for item in missing_stats.values()):
+        if pid and pid != "0" and all(seen == pid for seen in missing_stats.values()):
             snapshot = xr_usage_all()
             if (snapshot is not None and getattr(snapshot, "epoch_pid", None) == pid
-                    and all((all(email not in snapshot.emails for email in item["missing_stats_emails"])
-                             if item.get("missing_stats_emails") else token not in snapshot)
-                            for token, item in missing_stats.items())):
+                    and all(token not in snapshot for token in missing_stats)):
                 if _emergency_clear_dynamic_users():
                     return meta_get("membership_sync_pending") != "1"
     return ok
@@ -2099,24 +1857,7 @@ def handle_update(up):
         pending.pop(chat, None)
         if not valid:
             send(chat, "❌ هیچ IP معتبری پیدا نشد. مثل <code>104.16.96.1, 104.21.96.1</code> بفرست.", main_menu_kb()); return
-        before = global_settings_snapshot()
-        already_pending = meta_get("membership_sync_pending") == "1"
-        updated = {**before, "ips": valid}
-        store_global_config(updated)
-        synced = xr_reconcile_all_users(before_recipe=before["recipe"],
-                                        before_settings=before["endpoint_settings"])
-        if not synced:
-            store_global_config(before)
-            restored = xr_reconcile_all_users(before_recipe=updated["recipe"],
-                                              before_settings=updated["endpoint_settings"])
-            regenerate_all_subs()
-            if restored and not already_pending: meta_set("membership_sync_pending", "")
-            send(chat, ("❌ آی‌پی‌های قبلی بازگردانده شدند؛ کانفیگ‌هایی که شناسه‌شان در میانهٔ تغییر "
-                        "لغو شده، باید از اشتراک تازه شوند." if restored else
-                        "❌ آی‌پی‌های قبلی بازگردانده شدند؛ همگام‌سازی Xray هنوز کامل نیست و دوباره تلاش می‌شود."),
-                 main_menu_kb()); return
-        regenerate_all_subs()
-        if not already_pending: meta_set("membership_sync_pending", "")
+        set_ips(valid); regenerate_all_subs()
         send(chat, "✅ <b>%d آی‌پی</b> ذخیره و همه‌ی لینک‌ها بروز شدند:\n%s\n\nمشتری‌ها فقط کافیست Update بزنند." % (len(valid), "\n".join("• <code>%s</code>" % i for i in valid)), main_menu_kb()); return
     if st and st.get("stage") in ("addvol_custom", "addtime_custom"):
         is_vol = st["stage"] == "addvol_custom"; token = st["token"]
@@ -2634,12 +2375,12 @@ def _render_config_fields(settings, editable=True):
         head = ("<div class=row style='justify-content:space-between'>"
                 "<label class=eplabel><input type=checkbox name='en_%s'%s%s>"
                 "<span><b>%s</b><span class=eptag>%s · %s</span></span></label>"
-                "<label class=hint>تعداد <input type=number name='cnt_%s' value='%d' min=0 max=%d%s "
+                "<label class=hint>تعداد <input type=number name='cnt_%s' value='%d' min=0%s "
                 "aria-label='تعداد %s'></label></div>") % (
                     key, " checked" if r.get("enabled", True) else "", disabled,
                     name, key, "REALITY مستقیم" if is_reality else _config_html(
                         "%s / %s" % (ep.get("proto", ""), ep.get("net", ""))),
-                    key, count, MAX_CONFIGS_PER_ENDPOINT, disabled, key)
+                    key, count, disabled, key)
         label = ("<label class=hint for='label_%s'>نام کانفیگ</label>"
                  "<input type=text id='label_%s' name='label_%s' maxlength=64 value='%s'%s "
                  "style='width:100%%;max-width:100%%'>") % (
@@ -2919,7 +2660,6 @@ def _parse_config_fields(form, current):
         except (TypeError, ValueError): raise ValueError("تعداد کانفیگ «%s» نامعتبر است" % tag)
         if count < 0: raise ValueError("تعداد کانفیگ نمی‌تواند منفی باشد")
         recipe[tag] = {"enabled": ("en_" + tag) in form, "count": count}
-    validate_recipe_capacity(recipe)
     ips = parse_ips(form.get("ips", ""))
     if not ips: raise ValueError("حداقل یک آی‌پی تمیز معتبر وارد کنید")
     options = current["endpoint_settings"]
@@ -3106,9 +2846,6 @@ def route_admin_post(method, path, query, csrf, body, now, sid):
             return _redirect("/a/user-config?token=%s&msg=%s" % (
                 urllib.parse.quote(token), urllib.parse.quote("خطا: " + detail)))
         if routing_changed:
-            # An outbound rewrite restarts Xray and clears every user's live
-            # counters, including links unrelated to this settings edit.
-            refresh_all_usage()
             ok, reason = apply_xray_outbounds()
             if not ok:
                 # Credential revocation cannot be undone by restoring an old
