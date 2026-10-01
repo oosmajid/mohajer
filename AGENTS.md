@@ -44,11 +44,11 @@ framework, no DB server. Everything is configured through one env file (`bot.env
 4. Quota/expiry are enforced by the **enforcer thread**, not by xray. xray just
    counts bytes; the bot reads the counters and deletes the user when over limit.
 
-## 3. Production servers (verified 2026-09-29)
+## 3. Production servers (verified 2026-10-01)
 
 There are **five active Mohajer instances**. Keep this inventory when planning
 changes or deployments; each has its own users, `bot.env`, Xray, and cloudflared.
-All five running bot/sub files matched repository commit `2297d9d` when checked.
+All five running bot/sub files were verified after the 2026-10-01 UI deployment.
 
 | Public hostname | SSH target | Bot/env/DB | Bot/sub services |
 |-----------------|------------|------------|------------------|
@@ -133,7 +133,7 @@ On all five hosts, the active `xray.service` reads
   enforcer pass reconciles and revokes hidden protocols/ports without requiring
   an Xray restart. Affected legacy clients need to refresh the same subscription
   URL when an endpoint moves to per-port credentials.
-- **Outbounds / clean egress (`/a/outbounds`, `meta.outbounds`):** paste a
+- **Outbounds / clean egress (`/a/config#outbounds`, `meta.outbounds`):** paste a
   `vless/trojan/ss/socks/http` link → it becomes an xray outbound tagged **`mj-<name>`**.
   Per outbound you list domains; **an empty list makes it the catch-all** (it is written
   as xray's FIRST outbound, which is where unmatched traffic goes) and only the first
@@ -144,15 +144,18 @@ On all five hosts, the active `xray.service` reads
   `mj-`/`mjtest-` prefixes, so deleting an outbound removes exactly its own rules. The
   new config is validated with `xray -test` and never written if invalid (timestamped
   `.bak` kept). Each outbound also gets a **loopback-only** SOCKS inbound on
-  `OB_TEST_PORT_BASE+i` (10810+) that the panel's 🔎 test dials through — that is how we
+  `OB_TEST_PORT_BASE+i` (10810+) that the panel's test action dials through — that is how we
   test egress **without spawning a second xray** (see the golden rule above).
   `XRAY_CONF` **must** point at the config the Mohajer xray unit actually runs. On
   cdn2, both `bot.env` and the active `xray.service` use
   `/usr/local/etc/xray/config.json` (verified 2026-09-29). The previously recorded
   `/opt/mohajer/xray.json` path does not exist on that host.
-  The page is AJAX: every action posts `ajax=1` and gets JSON back (`ok/msg/list`), so
-  nothing reloads; the same routes still answer with redirects when JS is off.
-- **Subscriber page extras:** `subserver.py` shows a quick-connect card: a Happ deep-link
+  The outbound section is included below the global settings form on `/a/config`.
+  `/a/outbounds` still renders that page for existing links. Outbound actions use AJAX:
+  every action posts `ajax=1` and gets JSON back (`ok/msg/list`), so nothing reloads;
+  the same routes still answer with redirects when JS is off.
+- **Subscriber page extras:** `subserver.py` shows the customer's saved link label as
+  the heading (escaped for HTML), then a quick-connect card: a Happ deep-link
   button (`happ://add/<sub url>`), Happ downloads (`HAPP_APPS`, GitHub
   `releases/latest/download/...` so they never go stale; iOS = App Store) and a QR of the
   sub URL. The QR encoder is vendored (`sub/qrcode.js`, qrcode-generator 2.0.4, MIT) and
@@ -160,11 +163,11 @@ On all five hosts, the active `xray.service` reads
   routes `/sub-*` to the sub server; a CDN script tag may be blocked in Iran).
 - **Bot "new link" menu** starts with a one-tap test link (`TEST_LINK`: 500MB, 1 day, "Test").
 - **Light/dark theme:** both the admin panel (`ADMIN_CSS`/`_page`) and the subscriber
-  page (`subserver.py` `PAGE`) ship an icon-only toggle (🌙/☀️) at the top. Themes are
+  page (`subserver.py` `PAGE`) ship an SVG icon-only toggle at the top. Themes are
   driven by `data-theme` on `<html>`; an early head script sets it from `localStorage`
   (`mj-theme`), falling back to the OS `prefers-color-scheme` (no FOUC). The dark palette
   is a `:root[data-theme=dark]{…}` override of the same tokens. The admin panel uses
-  blue action and chart tokens; the subscriber page retains its yellow theme. Charts
+  blue action and chart tokens; the subscriber page uses the same blue palette. Charts
   use `currentColor` so bars follow the theme. Use palette tokens on themeable surfaces.
 - **Edit bot logic:** it's one file, stdlib only. After editing, copy to the server
   path (see table) and `systemctl restart dpbot` (live) / `mohajer-bot` (fresh).

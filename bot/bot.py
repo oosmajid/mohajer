@@ -2082,10 +2082,32 @@ def users_overview():
         d["today"] = daily.get(r["token"], 0); out.append(d)
     return out
 
+ADMIN_ICONS = """<svg xmlns="http://www.w3.org/2000/svg" class="icon-sprite" aria-hidden="true">
+<symbol id="ico-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+<symbol id="ico-sliders" viewBox="0 0 24 24"><path d="M4 7h9m4 0h3M4 17h3m4 0h9"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/></symbol>
+<symbol id="ico-route" viewBox="0 0 24 24"><circle cx="5" cy="6" r="2"/><circle cx="19" cy="18" r="2"/><path d="M7 6h7a4 4 0 0 1 0 8h-4a4 4 0 0 0 0 8h7"/></symbol>
+<symbol id="ico-search" viewBox="0 0 24 24"><circle cx="10.8" cy="10.8" r="6.3"/><path d="m16 16 4.5 4.5"/></symbol>
+<symbol id="ico-check" viewBox="0 0 24 24"><path d="m5 12 4.5 4.5L19 7"/></symbol>
+<symbol id="ico-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3m3 0-1 13H7L6 7m4 4v6m4-6v6"/></symbol>
+<symbol id="ico-refresh" viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5M6 9a7 7 0 0 1 12-2l2 5M4 12l2 5a7 7 0 0 0 12-2"/></symbol>
+<symbol id="ico-back" viewBox="0 0 24 24"><path d="m9 5 7 7-7 7M16 12H4"/></symbol>
+<symbol id="ico-logout" viewBox="0 0 24 24"><path d="M10 4H5v16h5m5-4 4-4-4-4m4 4H9"/></symbol>
+<symbol id="ico-moon" viewBox="0 0 24 24"><path d="M20 15.5A8 8 0 0 1 8.5 4 8 8 0 1 0 20 15.5Z"/></symbol>
+<symbol id="ico-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M2 12h2m16 0h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></symbol>
+</svg>"""
+
+def _icon(name):
+    return '<svg class="icon" aria-hidden="true"><use href="#ico-%s"></use></svg>' % name
+
 ADMIN_CSS = """
 :root{--paper:#F4F7FB;--card:#FFFFFF;--ink:#17253D;--accent:#256BD1;--accent-text:#FFFFFF;--ok:#179773;--warn:#BD7A17;--dng:#D4545C;--frz:#568BBF;--mut:#68788F;--line:#DCE5F0;--soft:#EAF1FA;--hero:#EAF3FF;--shadow:0 12px 36px rgba(33,60,99,.06);--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;--sans:"Vazirmatn","Segoe UI",Tahoma,system-ui,sans-serif;--display:"Estedad","Vazirmatn","Segoe UI",Tahoma,system-ui,sans-serif}
 :root[data-theme=dark]{--paper:#101827;--card:#182438;--ink:#EDF3FC;--accent:#83B4FB;--accent-text:#10213A;--ok:#55D3A5;--warn:#F2BC69;--dng:#FF929C;--frz:#8BBCEB;--mut:#A7B5C8;--line:#31425A;--soft:#203149;--hero:#192F4B;--shadow:0 12px 36px rgba(0,0,0,.13)}
 *{box-sizing:border-box}
+.icon-sprite{position:absolute;width:0;height:0;overflow:hidden}
+.icon{width:17px;height:17px;flex:0 0 17px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+:root .theme-sun{display:none}
+:root[data-theme=dark] .theme-moon{display:none}
+:root[data-theme=dark] .theme-sun{display:block}
 html,body{margin:0;max-width:100%}
 body{min-height:100vh;background:var(--paper);color:var(--ink);font-family:var(--sans);line-height:1.65;padding:0 24px 64px;-webkit-font-smoothing:antialiased}
 .wrap{max-width:1120px;margin:0 auto}
@@ -2100,6 +2122,8 @@ a:hover{color:var(--accent)}
 .dot-sig{position:relative;width:34px;height:34px;flex:0 0 34px;border-radius:10px;background:var(--accent)}
 .dot-sig:before{content:"";position:absolute;inset:9px 9px 9px 10px;background:linear-gradient(to top,var(--accent-text) 0 35%,transparent 35% 100%) left bottom/3px 100% no-repeat,linear-gradient(to top,var(--accent-text) 0 65%,transparent 65% 100%) center bottom/3px 100% no-repeat,linear-gradient(to top,var(--accent-text) 0 100%,transparent 100% 100%) right bottom/3px 100% no-repeat}
 .crumb{font-size:13px;font-weight:650;color:var(--mut)}
+.crumb a{display:inline-flex;align-items:center;gap:5px}
+.crumb .icon{width:15px;height:15px;flex-basis:15px}
 .crumb a:hover{color:var(--accent)}
 .rightnav{margin-inline-start:auto;display:flex;align-items:center;gap:10px}
 .pagehead{display:flex;align-items:flex-end;justify-content:space-between;gap:20px;margin:0 0 22px}
@@ -2138,6 +2162,7 @@ a:hover{color:var(--accent)}
 .chart{margin-top:20px}
 .chart>.eyebrow{color:var(--mut);margin-bottom:12px}
 svg{display:block;width:100%;color:var(--accent)}
+.btn .icon{color:inherit}
 .bar{cursor:pointer}
 .tt{position:fixed;display:none;background:var(--ink);color:var(--card);border-radius:9px;padding:6px 10px;font-family:var(--mono);font-size:12px;pointer-events:none;z-index:60;box-shadow:var(--shadow)}
 .u{display:grid;grid-template-columns:10px minmax(0,1fr) minmax(100px,160px) minmax(105px,142px);align-items:center;gap:16px;padding:15px 6px;border-top:1px solid var(--line);color:var(--ink);min-width:0}
@@ -2217,14 +2242,13 @@ def _page(title, inner):
             "<link rel=icon href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect x='2' y='2' width='28' height='28' rx='8' fill='%%23256BD1'/><path d='M10 22v-6m6 6V11m6 11V7' stroke='%%23fff' stroke-width='3' stroke-linecap='round'/></svg>\">"
             "<title>%s</title>"
             "<script>(function(){try{var t=localStorage.getItem('mj-theme')||((window.matchMedia&&matchMedia('(prefers-color-scheme:dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>"
-            "<style>%s</style></head><body><div class=wrap>%s</div><div id=tt class=tt></div>"
-            "<script>function toggleTheme(){var h=document.documentElement,d=h.getAttribute('data-theme')==='dark'?'light':'dark';h.setAttribute('data-theme',d);try{localStorage.setItem('mj-theme',d);}catch(e){}_syncTheme();}"
-            "function _syncTheme(){var b=document.getElementById('themebtn');if(b)b.textContent=document.documentElement.getAttribute('data-theme')==='dark'?'☀️':'🌙';}_syncTheme();"
+            "<style>%s</style></head><body>%s<div class=wrap>%s</div><div id=tt class=tt></div>"
+            "<script>function toggleTheme(){var h=document.documentElement,d=h.getAttribute('data-theme')==='dark'?'light':'dark';h.setAttribute('data-theme',d);try{localStorage.setItem('mj-theme',d);}catch(e){}}"
             "(function(){var t=document.getElementById('tt');document.addEventListener('click',function(e){"
             "var b=e.target.closest&&e.target.closest('.bar');if(b){t.textContent=b.getAttribute('data-t')+' — '+b.getAttribute('data-v');"
             "t.style.display='block';var w=t.offsetWidth;t.style.left=Math.max(6,Math.min(e.clientX-w/2,window.innerWidth-w-6))+'px';"
             "t.style.top=Math.max(6,e.clientY-40)+'px';}else{t.style.display='none';}});})();</script>"
-            "</body></html>" % (html.escape(title), ADMIN_CSS, inner))
+            "</body></html>" % (html.escape(title), ADMIN_CSS, ADMIN_ICONS, inner))
 
 def _html(page):
     return 200, {"Content-Type": "text/html; charset=utf-8"}, page.encode("utf-8")
@@ -2234,9 +2258,11 @@ def _top(crumb="", csrf=None):
     if csrf:
         right += ("<form method=post action='/a/logout' style='margin:0'>"
                   "<input type=hidden name=csrf value='%s'>"
-                  "<button class='btn ghost'>خروج</button></form>") % csrf
+                  "<button class='btn ghost'>%s خروج</button></form>") % (csrf, _icon("logout"))
     right += ("<button id=themebtn type=button class=tbtn onclick=\"toggleTheme()\" "
-              "aria-label='تغییر تم' title='تغییر تم'>🌙</button>")
+              "aria-label='تغییر تم' title='تغییر تم'>"
+              "<span class=theme-moon>%s</span><span class=theme-sun>%s</span></button>") % (
+                  _icon("moon"), _icon("sun"))
     return ("<header class=top><a class=brand href='/a/'><span class=dot-sig aria-hidden=true></span>Mohajer</a>"
             "<span class=rightnav>%s</span></header>" % right)
 
@@ -2244,6 +2270,9 @@ def _page_heading(title, detail="", action=""):
     return ("<div class=pagehead><div><span class=eyebrow>پنل مدیریت مهاجر</span>"
             "<h1>%s</h1><p>%s</p></div>%s</div>" %
             (html.escape(title), html.escape(detail), action))
+
+def _back(url, label):
+    return "<a href='%s'>%s %s</a>" % (html.escape(url, quote=True), _icon("back"), html.escape(label))
 
 def _metric_big(b):
     s = fmt_bytes(b); p = s.rsplit(" ", 1)
@@ -2309,15 +2338,14 @@ def render_dashboard(csrf):
              "<h2 style='margin:0'>لینک‌ها</h2>"
              "<input id=linksearch type=search placeholder='جست‌وجوی لینک' aria-label='جست‌وجوی لینک'>"
              "<span class=row>"
-             "<a class='btn ghost' href='/a/config'>⚙ پیکربندی</a>"
-             "<a class='btn ghost' href='/a/outbounds'>🌍 خروجی‌ها</a>"
+             "<a class='btn ghost' href='/a/config'>%s پیکربندی</a>"
              "</span></div>%s<p id=search-empty class=hint hidden>لینکی با این نام پیدا نشد.</p></div>"
              "<script>(function(){var q=document.getElementById('linksearch'),e=document.getElementById('search-empty');"
              "if(!q)return;q.addEventListener('input',function(){var term=q.value.trim().toLocaleLowerCase(),seen=0;"
              "document.querySelectorAll('a.u').forEach(function(row){var hit=row.textContent.toLocaleLowerCase().includes(term);"
-             "row.hidden=!hit;if(hit)seen++;});e.hidden=seen!==0;});})();</script>") % rows
+             "row.hidden=!hit;if(hit)seen++;});e.hidden=seen!==0;});})();</script>") % (_icon("sliders"), rows)
     heading = _page_heading("نمای کلی", "مصرف و وضعیت لینک‌ها در یک نگاه",
-                            "<a class=btn href='/a/new'>+ لینک جدید</a>")
+                            "<a class=btn href='/a/new'>%s لینک جدید</a>" % _icon("plus"))
     return _page("پنل", _top("", csrf) + heading + hero + users)
 
 def _form(action, fields, csrf, btn, cls="btn"):
@@ -2327,7 +2355,7 @@ def _form(action, fields, csrf, btn, cls="btn"):
 def render_user(token, csrf, msg=""):
     c = db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone(); c.close()
     if not u:
-        return _page("یافت نشد", _top("<a href='/a/'>← داشبورد</a>", csrf) + "<div class=card>لینکی با این شناسه پیدا نشد.</div>")
+        return _page("یافت نشد", _top(_back("/a/", "داشبورد"), csrf) + "<div class=card>لینکی با این شناسه پیدا نشد.</div>")
     today_u = daily_series(1, token=token)[-1][1]
     chart = svg_bars(daily_series(30, token=token))
     dis = bool(u["disabled_ts"]); frz = bool(u["frozen"])
@@ -2351,8 +2379,8 @@ def render_user(token, csrf, msg=""):
         _form("/a/rename", [tk, "<input type=text name=name placeholder='نام تازه'>"], csrf, "تغییر نام") +
         _form("/a/unlimit", [tk, "<input type=hidden name=field value=limit_bytes>"], csrf, "حجم نامحدود", "btn ghost") +
         _form("/a/unlimit", [tk, "<input type=hidden name=field value=expiry_ts>"], csrf, "زمان نامحدود", "btn ghost"))
-    reset = "<a class='btn ghost' href='/a/reset?token=%s'>♻️ ریست مصرف</a>" % token
-    dele = "<a class='btn danger' href='/a/del?token=%s'>حذف لینک</a>" % token
+    reset = "<a class='btn ghost' href='/a/reset?token=%s'>%s ریست مصرف</a>" % (token, _icon("refresh"))
+    dele = "<a class='btn danger' href='/a/del?token=%s'>%s حذف لینک</a>" % (token, _icon("trash"))
     hero = ("<div class='card hero'><div class=eyebrow><span class='st %s' style='display:inline-block;margin-inline-start:6px;vertical-align:middle'></span>%s</div>"
             "<h1 class=title>%s</h1>"
             "<div class=metrics><div class=metric><div class=k>مصرف</div><div class=v><span class=n>%s / %s</span></div></div>"
@@ -2363,10 +2391,10 @@ def render_user(token, csrf, msg=""):
         fmt_bytes(current_usage(u)), human_limit(u["limit_bytes"]), fmt_bytes(today_u),
         human_expiry(u["expiry_ts"]), chart)
     link = "<div class=card><h2>لینک اشتراک</h2><code>%s</code></div>" % sub_url(token)
-    config_link = "<a class='btn ghost' href='/a/user-config?token=%s'>⚙ تنظیمات لینک</a>" % token
+    config_link = "<a class='btn ghost' href='/a/user-config?token=%s'>%s تنظیمات لینک</a>" % (token, _icon("sliders"))
     actions = "<div class=card><h2>مدیریت</h2><div class=grid>%s</div><div class=row style='margin-top:10px'>%s%s%s</div></div>" % (forms, config_link, reset, dele)
     notice = ("<div class=card role=alert>%s</div>" % html.escape(msg)) if msg else ""
-    return _page("کاربر", _top("<a href='/a/'>← داشبورد</a>", csrf) + notice + hero + frz_card + link + actions)
+    return _page("کاربر", _top(_back("/a/", "داشبورد"), csrf) + notice + hero + frz_card + link + actions)
 
 def render_new(csrf):
     f = ("<form method=post action='/a/new' class=grid>"
@@ -2377,15 +2405,15 @@ def render_new(csrf):
          "<label class=field><span>مدت (روز)</span><input type=number name=days step=any min=0 "
          "placeholder='۰ = نامحدود' required></label></div>"
          "<input type=hidden name=csrf value='%s'>"
-         "<div class=row><button class=btn>ساخت لینک</button></div></form>") % _config_html(csrf)
-    return _page("لینک جدید", _top("<a href='/a/'>← داشبورد</a>", csrf) +
+         "<div class=row><button class=btn>%s ساخت لینک</button></div></form>") % (_config_html(csrf), _icon("plus"))
+    return _page("لینک جدید", _top(_back("/a/", "داشبورد"), csrf) +
                  _page_heading("لینک جدید", "حجم، مدت و نام مشتری را تعیین کنید.") +
                  "<div class=card>%s</div>" % f)
 
 def render_delconfirm(token, csrf):
     f = _form("/a/delete", ["<input type=hidden name=token value='%s'>" % token,
                             "<input type=hidden name=confirm value=yes>"], csrf, "بله، حذف کن", "btn danger")
-    return _page("حذف", _top("<a href='/a/user?token=%s'>← بازگشت</a>" % token, csrf) +
+    return _page("حذف", _top(_back("/a/user?token=%s" % token, "بازگشت"), csrf) +
                  "<div class=card><h2>حذف لینک</h2><p style='color:var(--mut);margin:0 0 12px'>"
                  "این کار برگشت‌ناپذیر است؛ لینک و کانفیگ‌های این مشتری حذف می‌شوند.</p>"
                  "<div class=row>%s<a class='btn ghost' href='/a/user?token=%s'>انصراف</a></div></div>" % (f, token))
@@ -2393,10 +2421,10 @@ def render_delconfirm(token, csrf):
 def render_resetconfirm(token, csrf):
     c = db(); u = c.execute("SELECT label FROM users WHERE token=?", (token,)).fetchone(); c.close()
     if not u:
-        return _page("یافت نشد", _top("<a href='/a/'>← داشبورد</a>", csrf) + "<div class=card>لینک پیدا نشد.</div>")
+        return _page("یافت نشد", _top(_back("/a/", "داشبورد"), csrf) + "<div class=card>لینک پیدا نشد.</div>")
     f = _form("/a/reset", ["<input type=hidden name=token value='%s'>" % token,
                            "<input type=hidden name=confirm value=yes>"], csrf, "بله، ریست کن")
-    return _page("ریست مصرف", _top("<a href='/a/user?token=%s'>← بازگشت</a>" % token, csrf) +
+    return _page("ریست مصرف", _top(_back("/a/user?token=%s" % token, "بازگشت"), csrf) +
                  "<div class=card><h2>ریست مصرف «%s»</h2><p style='color:var(--mut);margin:0 0 12px'>"
                  "مصرف دورهٔ جاری صفر می‌شود؛ آمار مصرف کل حذف نخواهد شد.</p>"
                  "<div class=row>%s<a class='btn ghost' href='/a/user?token=%s'>انصراف</a></div></div>" %
@@ -2451,7 +2479,6 @@ def _render_config_fields(settings, editable=True):
         if is_reality:
             ports = "<p class=hint>پورت مستقیمِ آماده‌شده: <span class=n>%s</span></p>" % _config_html(ep.get("port", ""))
             host = "<p class=hint>Host و SNI کلادفلر برای REALITY کاربرد ندارد.</p>"
-            path = "<p class=hint>این پروتکل مسیر Cloudflare ندارد.</p>"
             fragment = "<p class=hint>Fragment برای این کانفیگ کاربرد ندارد.</p>"
         else:
             port_items = []
@@ -2475,16 +2502,14 @@ def _render_config_fields(settings, editable=True):
             host = ("<label class=hint for='hostidx_%s'>جفت Host / SNI آماده‌شده</label>"
                     "<select id='hostidx_%s' name='hostidx_%s'%s>%s</select>") % (
                         key, key, key, disabled, options)
-            path = "<div><span class=hint>مسیر ثابتِ آماده‌شده برای این endpoint</span><code dir=ltr>%s</code></div>" % (
-                _config_html(ep.get("path", "")))
             if ep.get("proto") == "vmess":
                 fragment = "<p class=hint>Fragment در لینک VMess پشتیبانی نمی‌شود.</p>"
             else:
                 fragment = ("<label class=hint for='fm_%s'>Fragment JSON (خالی = غیرفعال)</label>"
                             "<textarea id='fm_%s' name='fm_%s' rows=3 dir=ltr%s>%s</textarea>") % (
                                 key, key, key, disabled, _config_html(cfg.get("fragment_fm", "")))
-        rows.append("<div class=eprow style='display:block'><div class=grid>%s%s%s%s%s%s</div></div>" % (
-            head, label, ports, host, path, fragment))
+        rows.append("<div class=eprow style='display:block'><div class=grid>%s%s%s%s%s</div></div>" % (
+            head, label, ports, host, fragment))
     return ("<h2>نوع و تعداد کانفیگ‌ها</h2>"
             "<p class=hint>فقط پورت‌ها، مسیرها و جفت‌های Host / SNI آماده‌شده روی سرور قابل انتخاب‌اند. "
             "تعداد سقفی ندارد؛ تعداد بیشتر روی پورت‌ها و آدرس‌های اتصال پخش می‌شود. "
@@ -2536,20 +2561,21 @@ def render_config(csrf, msg=""):
     body = ("<form method=post action='/a/config' class=grid>%s"
             "<input type=hidden name=endpoint_fields value=1>"
             "<input type=hidden name=csrf value='%s'>"
-            "<button class=btn style='margin-top:12px'>ذخیره و بازتولید همهٔ لینک‌های پیش‌فرض</button>"
-            "</form>") % (fields, _config_html(csrf))
-    return _page("پیکربندی", _top("<a href='/a/'>← داشبورد</a>", csrf) +
+            "<button class=btn style='margin-top:12px'>%s ذخیره و بازتولید همهٔ لینک‌های پیش‌فرض</button>"
+            "</form>") % (fields, _config_html(csrf), _icon("check"))
+    return _page("پیکربندی", _top(_back("/a/", "داشبورد"), csrf) +
                  _page_heading("پیکربندی عمومی", "تغییرات این صفحه برای لینک‌های پیش‌فرض اعمال می‌شود.") +
-                 _config_message(msg) + _sync_notice() + "<div class=card>%s</div>" % body)
+                 _config_message(msg) + _sync_notice() + "<div class=card>%s</div>" % body +
+                 _render_outbounds_section(csrf))
 
 def render_user_config(token, csrf, msg=""):
     c = db(); user = c.execute("SELECT label FROM users WHERE token=?", (token,)).fetchone(); c.close()
     if not user:
-        return _page("یافت نشد", _top("<a href='/a/'>← داشبورد</a>", csrf) +
+        return _page("یافت نشد", _top(_back("/a/", "داشبورد"), csrf) +
                      "<div class=card>لینکی با این شناسه پیدا نشد.</div>")
     token_attr = _config_html(token)
-    back = "<a href='/a/user?token=%s'>← %s</a>" % (
-        _config_html(urllib.parse.quote(token, safe="")), _config_html(user["label"]))
+    back = _back("/a/user?token=%s" % _config_html(urllib.parse.quote(token, safe="")),
+                 user["label"])
     custom = get_link_override(token)
     if custom is None:
         snapshot = global_settings_snapshot()
@@ -2607,11 +2633,11 @@ function obRecalc(){var first=null,n=document.querySelectorAll('#oblist textarea
   var b=document.getElementById('all-'+t.dataset.tag);if(!b)return;
   if(t.value.trim()){b.style.display='none';return;}
   b.style.display='inline-flex';
-  if(first===null){first=t.dataset.tag;b.className='pill oball';b.textContent='🌐 همهٔ ترافیک از این خروجی رد می‌شود';}
-  else{b.className='pill obwarn';b.textContent='⚠️ بی‌اثر: خروجیِ بالاتر همهٔ ترافیک را گرفته';}});}
+  if(first===null){first=t.dataset.tag;b.className='pill oball';b.textContent='همهٔ ترافیک از این خروجی رد می‌شود';}
+  else{b.className='pill obwarn';b.textContent='بی‌اثر: خروجیِ بالاتر همهٔ ترافیک را گرفته';}});}
 function obDirty(on){var s=document.getElementById('obsavebtn');if(!s)return;
  s.classList.toggle('warnpulse',!!on);
- s.textContent=on?'💾 ذخیره و اعمال (تغییرِ ذخیره‌نشده)':'💾 ذخیره و اعمال روی xray';}
+ s.textContent=on?'ذخیره و اعمال (تغییرِ ذخیره‌نشده)':'ذخیره و اعمال روی Xray';}
 document.addEventListener('input',function(e){var t=e.target;
  if(t&&t.matches&&t.matches('textarea[data-tag]')){obRecalc();obDirty(true);}});
 document.addEventListener('submit',function(e){var f=e.target;if(!f||!f.dataset||!f.dataset.act)return;
@@ -2628,7 +2654,7 @@ def _ob_card(i, o, csrf):
     try:
         kind = parse_outbound_link(o["link"], o["tag"])["protocol"]
     except ValueError as e:
-        kind = "⚠️ " + str(e)
+        kind = str(e)
     res = meta_get("ob_test_" + o["tag"], "")
     tag = html.escape(o["tag"])
     return (
@@ -2645,14 +2671,14 @@ def _ob_card(i, o, csrf):
         "<div class=row style='margin-top:10px'>"
         "<form data-act=test method=post action='/a/obtest' style='margin:0'>"
         "<input type=hidden name=csrf value='%s'><input type=hidden name=tag value='%s'>"
-        "<button type=submit class='btn ghost'>🔎 تست این خروجی</button></form>"
+        "<button type=submit class='btn ghost'>%s تست این خروجی</button></form>"
         "<form data-act=del method=post action='/a/obdel' style='margin:0'>"
         "<input type=hidden name=csrf value='%s'><input type=hidden name=tag value='%s'>"
         "<button type=submit class='btn ghost'>حذف</button></form></div></div>"
     ) % (tag, html.escape(kind), ob_test_port(i), html.escape(o["link"]), tag,
          tag, tag, html.escape("\n".join(o.get("domains") or [])),
          tag, ("" if res else " style='display:none'"), html.escape(res),
-         csrf, tag, csrf, tag)
+         csrf, tag, _icon("search"), csrf, tag)
 
 def render_ob_list(csrf):
     """Just the cards — re-rendered on its own and swapped in without a page reload."""
@@ -2662,7 +2688,7 @@ def render_ob_list(csrf):
                 "همهٔ ترافیک مستقیم از IP همین سرور می‌رود.</p></div>")
     return "".join(_ob_card(i, o, csrf) for i, o in enumerate(obs))
 
-def render_outbounds(csrf, msg=""):
+def _render_outbounds_section(csrf):
     obs = get_outbounds()
     add = ("<div class=card><h2>افزودن خروجی</h2>"
            "<p class=hint>لینک را همان‌طور که هست بچسبانید: "
@@ -2672,23 +2698,25 @@ def render_outbounds(csrf, msg=""):
            "<input name=tag placeholder='یک نام کوتاه، مثلاً clean-ai' maxlength=24 required>"
            "<textarea name=link rows=3 placeholder='vless://…  یا  socks://user:pass@1.2.3.4:1080' required></textarea>"
            "<input type=hidden name=csrf value='%s'>"
-           "<button type=submit class=btn style='margin-top:10px'>افزودن</button></form></div>") % csrf
+           "<button type=submit class=btn style='margin-top:10px'>%s افزودن</button></form></div>") % (csrf, _icon("plus"))
 
     save = ("<div id=obsavewrap%s>"
             "<form data-act=save method=post action='/a/obsave' id=obform>"
             "<input type=hidden name=csrf value='%s'>"
-            "<button type=submit id=obsavebtn class=btn style='width:100%%'>💾 ذخیره و اعمال روی xray</button></form>"
+            "<button type=submit id=obsavebtn class=btn style='width:100%%'>ذخیره و اعمال روی Xray</button></form>"
             "<p class=hint style='margin-top:8px'>اعمال، کانفیگ را با <code>xray -test</code> اعتبارسنجی می‌کند؛ "
             "اگر خراب باشد چیزی تغییر نمی‌کند. بعد xray ری‌استارت می‌شود و کاربران خودکار resync می‌شوند "
             "(لینک کسی عوض نمی‌شود).</p></div>") % (("" if obs else " style='display:none'"), csrf)
 
-    body = ("<div id=obmsg class='card obmsg'%s>%s</div>" % (
-                ("" if msg else " style='display:none'"), ("<b>%s</b>" % html.escape(msg)) if msg else "") +
-            add + "<h2 style='margin:18px 0 8px'>خروجی‌ها</h2>" +
+    body = ("<section id=outbounds><div id=obmsg class='card obmsg' style='display:none'></div>" +
+            _page_heading("خروجی‌ها", "مسیر خروج ترافیک از سرور را مدیریت کنید.") + add +
+            "<h2 style='margin:18px 0 8px'>خروجی‌های تعریف‌شده</h2>" +
             "<div id=oblist>%s</div>" % render_ob_list(csrf) + save +
-            "<script>%s\nOB.csrf=%s;obRecalc();</script>" % (OB_JS, json.dumps(csrf)))
-    return _page("خروجی‌ها", _top("<a href='/a/'>← داشبورد</a>", csrf) +
-                 _page_heading("خروجی‌ها", "مسیر خروج ترافیک از سرور را مدیریت کنید.") + body)
+            "<script>%s\nOB.csrf=%s;obRecalc();</script></section>" % (OB_JS, json.dumps(csrf)))
+    return body
+
+def render_outbounds(csrf, msg=""):
+    return render_config(csrf, msg)
 
 def route_admin(method, path, query, cookie_header, body, now=None):
     now = now or int(time.time())

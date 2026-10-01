@@ -51,6 +51,14 @@ class TestSubscriberThemeToggle(unittest.TestCase):
         self.assertIn("var(--ink)", h)
         self.assertNotIn("#111111", h)
 
+    def test_customer_label_is_the_page_heading(self):
+        info = {"used_bytes": 0, "limit_bytes": 0, "expiry_ts": 0,
+                "created_ts": 0, "label": "علی <همراه>"}
+        b64 = base64.b64encode(b"vless://id@1.2.3.4:443#N").decode()
+        page = s.build_response("u_x", b64, info, "Mozilla/5.0", False)[2].decode()
+        self.assertIn("<h1>علی &lt;همراه&gt;</h1>", page)
+        self.assertNotIn("اتصال شما آماده است", page)
+
 
 if __name__ == "__main__":
     unittest.main()

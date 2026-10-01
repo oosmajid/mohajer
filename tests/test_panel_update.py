@@ -61,6 +61,9 @@ class TestRealityEndpoint(DbCase):
         page = bot.render_config("csrf")
         self.assertIn("cnt_vless-reality", page)
         self.assertIn("پورت مستقیمِ آماده‌شده", page)
+        self.assertNotIn("مسیر ثابتِ آماده‌شده برای این endpoint", page)
+        self.assertIn('id=outbounds', page)
+        self.assertIn('id=obform', page)
 
 
 class TestBotMessages(DbCase):
