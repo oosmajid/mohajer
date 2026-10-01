@@ -17,6 +17,9 @@ SAFE = re.compile(r"^sub-[A-Za-z0-9_.-]+$")
 # the Cloudflare tunnel only forwards /sub-* here, and a CDN <script> may be blocked in Iran.
 QR_JS_NAME = "sub-qr.js"
 QR_JS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qrcode.js")
+# Same-origin font for both panels, using the existing /sub-* tunnel route.
+FONT_NAME = "sub-font-vazirmatn-v33.003.woff2"
+FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "Vazirmatn-variable.woff2")
 # Happ download links. GitHub's releases/latest/download/<asset> always resolves to the
 # newest release; iOS ships only through the App Store.
 HAPP_APPS = [
@@ -179,10 +182,12 @@ def decorate(links, info):
 PAGE = """<!doctype html><html lang="fa" dir="rtl"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 <meta name="color-scheme" content="light dark">
+<link rel="preload" href="/sub-font-vazirmatn-v33.003.woff2" as="font" type="font/woff2" crossorigin>
 <title>%TITLE%</title>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect x='2' y='2' width='28' height='28' rx='8' fill='%23256BD1'/><path d='M10 22v-6m6 6V11m6 11V7' stroke='%23fff' stroke-width='3' stroke-linecap='round'/></svg>">
 <script>(function(){try{var t=localStorage.getItem('mj-theme')||((window.matchMedia&&matchMedia('(prefers-color-scheme:dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>
 <style>
+@font-face{font-family:"Vazirmatn";src:url("/sub-font-vazirmatn-v33.003.woff2") format("woff2");font-weight:100 900;font-style:normal;font-display:swap}
 :root{--paper:#F4F7FB;--card:#FFFFFF;--ink:#17253D;--accent:#256BD1;--accent-text:#FFFFFF;--ok:#179773;--warn:#BD7A17;--dng:#D4545C;--mut:#68788F;--line:#DCE5F0;--soft:#EAF1FA;--hero:#EAF3FF;--shadow:0 12px 36px rgba(33,60,99,.06);--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;--sans:"Vazirmatn","Segoe UI",Tahoma,system-ui,sans-serif}
 :root[data-theme=dark]{--paper:#101827;--card:#182438;--ink:#EDF3FC;--accent:#83B4FB;--accent-text:#10213A;--ok:#55D3A5;--warn:#F2BC69;--dng:#FF929C;--mut:#A7B5C8;--line:#31425A;--soft:#203149;--hero:#192F4B;--shadow:0 12px 36px rgba(0,0,0,.13)}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
@@ -205,7 +210,7 @@ p{margin:0}
 .stats{background:var(--hero);box-shadow:none;border-color:transparent}
 .stat+.stat{margin-top:17px}
 .lbl{display:flex;justify-content:space-between;align-items:center;gap:10px;font-size:12.5px;font-weight:700;margin-bottom:8px}
-.lbl .v{direction:ltr;unicode-bidi:isolate;white-space:nowrap;font-family:var(--mono);font-size:12px}
+.lbl .v{direction:ltr;unicode-bidi:isolate;white-space:nowrap;font-variant-numeric:tabular-nums;font-size:12px}
 .track{height:8px;background:var(--line);border-radius:99px;overflow:hidden}
 .fill{height:100%;border-radius:99px}
 .quickhead{display:flex;align-items:flex-start;gap:11px;margin-bottom:16px}
@@ -228,7 +233,7 @@ p{margin:0}
 .bar button:first-child{background:var(--accent);color:var(--accent-text);border-color:var(--accent)}
 .bar button.ok,.copy.ok{border-color:var(--ok);color:var(--ok);background:var(--soft)}
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin-bottom:8px;display:flex;align-items:center;gap:12px}
-.meta{flex:1 1 auto;min-width:0}.name{font-weight:750;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;direction:ltr;text-align:right;font-family:var(--mono)}
+.meta{flex:1 1 auto;min-width:0}.name{font-weight:750;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;direction:ltr;text-align:right}
 .proto{font-size:11px;color:var(--mut);font-weight:650;margin-top:2px;text-transform:uppercase;letter-spacing:.03em}
 .copy{display:inline-flex;align-items:center;gap:6px;flex:0 0 auto;background:var(--soft);color:var(--accent);border:1px solid var(--line);border-radius:9px;padding:7px 10px}
 .foot{color:var(--mut);font-size:12px;text-align:center;margin-top:20px}
@@ -322,6 +327,11 @@ class H(BaseHTTPRequestHandler):
 
     def do_GET(self):
         u = urllib.parse.urlparse(self.path); name = u.path.lstrip("/")
+        if name == FONT_NAME:
+            try:
+                with open(FONT_PATH, "rb") as f: body = f.read()
+            except OSError: self._send(404, "text/plain", b"not found"); return
+            self._send(200, "font/woff2", body, {"Cache-Control": "public, max-age=31536000, immutable"}); return
         if name == QR_JS_NAME:
             try: body = open(QR_JS_PATH, "rb").read()
             except Exception: self._send(404, "text/plain", b"not found"); return

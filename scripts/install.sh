@@ -11,6 +11,8 @@ echo "[*] creating $ROOT ..."
 mkdir -p "$ROOT/bot" "$ROOT/sub" "$ROOT/sub"
 install -m 644 "$REPO_DIR/bot/bot.py"        "$ROOT/bot/bot.py"
 install -m 644 "$REPO_DIR/sub/subserver.py"  "$ROOT/sub/subserver.py"
+install -d "$ROOT/sub/fonts"
+install -m 644 "$REPO_DIR/sub/fonts/Vazirmatn-variable.woff2" "$REPO_DIR/sub/fonts/OFL.txt" "$ROOT/sub/fonts/"
 
 if [ ! -f "$ROOT/bot.env" ]; then
   install -m 600 "$REPO_DIR/config/bot.env.example" "$ROOT/bot.env"

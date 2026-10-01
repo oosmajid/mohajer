@@ -2138,7 +2138,8 @@ def _icon(name):
     return '<svg class="icon" aria-hidden="true"><use href="#ico-%s"></use></svg>' % name
 
 ADMIN_CSS = """
-:root{--paper:#F4F7FB;--card:#FFFFFF;--ink:#17253D;--accent:#256BD1;--accent-text:#FFFFFF;--ok:#179773;--warn:#BD7A17;--dng:#D4545C;--frz:#568BBF;--mut:#68788F;--line:#DCE5F0;--soft:#EAF1FA;--hero:#EAF3FF;--shadow:0 12px 36px rgba(33,60,99,.06);--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;--sans:"Vazirmatn","Segoe UI",Tahoma,system-ui,sans-serif;--display:"Estedad","Vazirmatn","Segoe UI",Tahoma,system-ui,sans-serif}
+@font-face{font-family:"Vazirmatn";src:url("/sub-font-vazirmatn-v33.003.woff2") format("woff2");font-weight:100 900;font-style:normal;font-display:swap}
+:root{--paper:#F4F7FB;--card:#FFFFFF;--ink:#17253D;--accent:#256BD1;--accent-text:#FFFFFF;--ok:#179773;--warn:#BD7A17;--dng:#D4545C;--frz:#568BBF;--mut:#68788F;--line:#DCE5F0;--soft:#EAF1FA;--hero:#EAF3FF;--shadow:0 12px 36px rgba(33,60,99,.06);--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;--sans:"Vazirmatn","Segoe UI",Tahoma,system-ui,sans-serif;--display:var(--sans)}
 :root[data-theme=dark]{--paper:#101827;--card:#182438;--ink:#EDF3FC;--accent:#83B4FB;--accent-text:#10213A;--ok:#55D3A5;--warn:#F2BC69;--dng:#FF929C;--frz:#8BBCEB;--mut:#A7B5C8;--line:#31425A;--soft:#203149;--hero:#192F4B;--shadow:0 12px 36px rgba(0,0,0,.13)}
 *{box-sizing:border-box}
 .icon-sprite{position:absolute;width:0;height:0;overflow:hidden}
@@ -2180,7 +2181,7 @@ a:hover{color:var(--accent)}
 .dashboard-hero>.chart{grid-column:2;grid-row:1/5;display:flex;flex-direction:column;justify-content:flex-end;margin:0;border-inline-start:1px solid var(--line);padding-inline-start:28px}
 .dashboard-hero .chart svg{height:130px}
 .big{font-family:var(--display);font-size:clamp(38px,5vw,58px);font-weight:800;line-height:1.15;letter-spacing:-.035em}
-.big .n{font-family:var(--mono);letter-spacing:-.07em}
+.big .n{font-family:var(--sans);letter-spacing:-.035em}
 .big small{font-family:var(--sans);font-size:16px;font-weight:650;margin-inline-start:6px;letter-spacing:0}
 .title{font-family:var(--display);font-size:clamp(24px,3vw,34px);font-weight:800;line-height:1.3;margin:5px 0}
 .metrics{display:flex;gap:26px;flex-wrap:wrap;margin-top:10px}
@@ -2277,6 +2278,7 @@ def _page(title, inner):
     return ("<!doctype html><html lang=fa dir=rtl><head><meta charset=utf-8>"
             "<meta name=viewport content='width=device-width,initial-scale=1'>"
             "<meta name=color-scheme content='light dark'>"
+            "<link rel=preload href='/sub-font-vazirmatn-v33.003.woff2' as=font type='font/woff2' crossorigin>"
             "<link rel=icon href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect x='2' y='2' width='28' height='28' rx='8' fill='%%23256BD1'/><path d='M10 22v-6m6 6V11m6 11V7' stroke='%%23fff' stroke-width='3' stroke-linecap='round'/></svg>\">"
             "<title>%s</title>"
             "<script>(function(){try{var t=localStorage.getItem('mj-theme')||((window.matchMedia&&matchMedia('(prefers-color-scheme:dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>"

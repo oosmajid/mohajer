@@ -170,6 +170,10 @@ On all five hosts, the active `xray.service` reads
   served at `/sub-qr.js` — keep it next to `subserver.py` when deploying (the tunnel only
   routes `/sub-*` to the sub server; a CDN script tag may be blocked in Iran).
 - **Bot "new link" menu** starts with a one-tap test link (`TEST_LINK`: 500MB, 1 day, "Test").
+- **Panel font:** both panels load the vendored Vazirmatn v33.003 variable WOFF2
+  from `/sub-font-vazirmatn-v33.003.woff2`, served by the sub server through the
+  existing `/sub-*` tunnel route. Deploy `sub/fonts/` (font + SIL OFL license)
+  next to `subserver.py` on every host; no external font service is required.
 - **Light/dark theme:** both the admin panel (`ADMIN_CSS`/`_page`) and the subscriber
   page (`subserver.py` `PAGE`) ship an SVG icon-only toggle at the top. Themes are
   driven by `data-theme` on `<html>`; an early head script sets it from `localStorage`

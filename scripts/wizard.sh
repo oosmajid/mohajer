@@ -207,6 +207,8 @@ ok "bot.env written (chmod 600)"
 say "Installing code and systemd units ..."
 install -m 644 "$REPO_DIR/bot/bot.py"       "$ROOT/bot/bot.py"
 install -m 644 "$REPO_DIR/sub/subserver.py" "$ROOT/sub/subserver.py"
+install -d "$ROOT/sub/fonts"
+install -m 644 "$REPO_DIR/sub/fonts/Vazirmatn-variable.woff2" "$REPO_DIR/sub/fonts/OFL.txt" "$ROOT/sub/fonts/"
 # subserver reads SUB_DIR/DB from the env file (loaded by the unit) — no patching needed.
 
 install -m 644 "$REPO_DIR/systemd/mohajer-bot.service" /etc/systemd/system/mohajer-bot.service
