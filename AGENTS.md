@@ -134,6 +134,16 @@ On all five hosts, the active `xray.service` reads
   the snapshot, so later global changes apply again. Port and protocol removals
   revoke old Xray credentials; older links migrate the affected endpoint to slot
   credentials the first time its ports change.
+- **TLS client settings:** public and custom endpoint settings store independent
+  `fingerprint` (default `chrome`), `fragment_fm`, and `ech_enabled` (default false).
+  Removing Fragment does not remove fingerprint or ALPN. ECH only applies to CDN
+  TLS; no-TLS and REALITY do not receive it. `ech=` queries the actual SNI's HTTPS
+  record via `ECH_DOH_URL` (default `https://sky.rethinkdns.com/dns-query`). The
+  resolver and CDN must be reachable from the client. VMess keeps legacy base64
+  JSON when ECH is off; opting into ECH emits the standard VMess URI because
+  v2rayN/NG's legacy JSON parsers drop ECH. This needs an updated client. Credentials,
+  ports, paths, and subscription URLs stay unchanged. The `tls_fields=1` form
+  marker permits explicit ECH off; older open forms preserve saved TLS options.
 - **First boot after the per-link migration:** existing legacy rows have no
   `active_slots`. `init_db()` snapshots *every provisioned port* for those rows,
   because the old bot had registered their shared secret on every endpoint even

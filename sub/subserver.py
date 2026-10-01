@@ -117,7 +117,7 @@ def bars_html(info):
 def parse_label(link):
     link = link.strip()
     try:
-        if link.startswith("vmess://"):
+        if link.startswith("vmess://") and "@" not in link:
             raw = link[8:]
             j = json.loads(base64.b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8", "ignore"))
             return (j.get("ps") or "VMess"), "vmess"
@@ -129,7 +129,7 @@ def parse_label(link):
 
 def relabel(link, name):
     link = link.strip()
-    if link.startswith("vmess://"):
+    if link.startswith("vmess://") and "@" not in link:
         raw = link[8:]
         j = json.loads(base64.b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8", "ignore"))
         j["ps"] = name

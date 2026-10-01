@@ -44,8 +44,9 @@ class TestFragmentParam(unittest.TestCase):
     def test_empty_disables(self):
         bot.FRAGMENT_FM = ""
         q = self._qs(bot._ws_link(EP, "sec", "1.1.1.1", 443, "tls"))
-        for k in ("fm", "fp", "alpn"):
-            self.assertNotIn(k, q)
+        self.assertNotIn("fm", q)
+        self.assertEqual(q["fp"], ["chrome"])
+        self.assertEqual(q["alpn"], ["http/1.1"])
 
     def test_vmess_unchanged(self):
         link = bot._ws_link(dict(EP, proto="vmess"), "sec", "1.1.1.1", 443, "tls")

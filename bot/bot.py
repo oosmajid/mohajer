@@ -60,6 +60,8 @@ if _REALITY_EP and not any(ep.get("tag") == _REALITY_EP["tag"] for ep in ENDPOIN
 FRAGMENT_FM = ENV.get("FRAGMENT_FM", json.dumps(
     {"tcp": [{"type": "fragment", "settings": {"packets": "1-3", "length": "100-200", "delay": "10-20"}}]},
     separators=(",", ":")))
+TLS_FINGERPRINTS = ("chrome", "firefox", "safari", "edge", "ios", "android", "randomized")
+ECH_DOH_URL = ENV.get("ECH_DOH_URL", "https://sky.rethinkdns.com/dns-query")
 DEFAULT_IPS = [x.strip() for x in ENV.get("IPS", "104.16.96.1,104.21.96.1,104.19.96.1").split(",") if x.strip()]
 GB = 1024 ** 3
 IRAN_OFFSET = 3 * 3600 + 30 * 60  # UTC+03:30; Iran has no DST since 2022
@@ -462,9 +464,14 @@ def _ws_link(ep, secret, address, port, sec):
     base = ep["label"] if tls_on else (ep["label"].replace("-WS", "").replace("-XHTTP", "") + "-noTLS")
     nm = urllib.parse.quote("%s · %s" % (base, address))
     sni = ("&sni=%s" % urllib.parse.quote(sni_host, safe="")) if tls_on else ""
-    if tls_on and fragment_fm:
+    if tls_on:
         alpn = "http/1.1" if net == "ws" else "h2,http/1.1"  # CF only upgrades WebSocket over HTTP/1.1
-        sni += "&fp=chrome&alpn=%s&fm=%s" % (urllib.parse.quote(alpn, safe=""), urllib.parse.quote(fragment_fm, safe=""))
+        sni += "&fp=%s&alpn=%s" % (urllib.parse.quote(ep.get("fingerprint", "chrome"), safe=""), urllib.parse.quote(alpn, safe=""))
+        if fragment_fm and proto != "vmess":
+            sni += "&fm=%s" % urllib.parse.quote(fragment_fm, safe="")
+        if ep.get("ech_enabled", False):
+            # Query the actual SNI's HTTPS record, including when dialing a pinned IP.
+            sni += "&ech=%s" % urllib.parse.quote(sni_host + "+" + ECH_DOH_URL, safe="")
     secp = "tls" if tls_on else "none"
     if proto == "vless":
         extra = "&mode=auto" if net == "xhttp" else ""
@@ -472,8 +479,14 @@ def _ws_link(ep, secret, address, port, sec):
     if proto == "trojan":
         return "trojan://%s@%s:%s?security=%s%s&type=%s&host=%s&path=%s#%s" % (secret, address, port, secp, sni, net, H, qp, nm)
     if proto == "vmess":
+        if tls_on and ep.get("ech_enabled", False):
+            # Legacy base64 VMess JSON drops ECH in v2rayN/NG. Opt-in URI
+            # format preserves it without changing the endpoint or credential.
+            extra = "&mode=auto" if net == "xhttp" else ""
+            return "vmess://%s@%s:%s?encryption=auto&security=tls&type=%s&host=%s%s&path=%s%s#%s" % (secret, address, port, net, H, sni, qp, extra, nm)
         j = {"v": "2", "ps": "%s · %s" % (base, address), "add": address, "port": str(port), "id": secret, "aid": "0", "scy": "auto",
              "net": net, "type": "none", "host": H, "path": ep["path"], "tls": ("tls" if tls_on else ""), "sni": (sni_host if tls_on else "")}
+        if tls_on: j.update(fp=ep.get("fingerprint", "chrome"), alpn=alpn)
         return "vmess://" + base64.b64encode(json.dumps(j).encode()).decode()
     return ""
 
@@ -482,7 +495,7 @@ def _reality_link(ep, secret, n=0):
     nm = urllib.parse.quote(ep.get("label", "REALITY") + " · مستقیم" + (" %d" % (n + 1) if n else ""))
     flow = ("&flow=%s" % r["flow"]) if r.get("flow") else ""
     return ("vless://%s@%s:%s?encryption=none&security=reality&pbk=%s&sni=%s&fp=%s&sid=%s&type=tcp%s#%s"
-            % (secret, r["addr"], r["port"], r["pbk"], r["sni"], r["fp"], r["sid"], flow, nm))
+            % (secret, r["addr"], r["port"], r["pbk"], r["sni"], ep.get("fingerprint", r["fp"]), r["sid"], flow, nm))
 
 def get_ips():
     v = meta_get("clean_ips")
@@ -565,6 +578,7 @@ def _endpoint_defaults(ep):
             "notls_ports": list(ep.get("notls_ports", [])),
             "label": ep.get("label", ep["tag"]), "path": ep.get("path", ""),
             "host": DOMAIN, "sni": DOMAIN,
+            "fingerprint": ep.get("reality", {}).get("fp", "chrome"), "ech_enabled": False,
             "fragment_fm": "" if "reality" in ep or ep.get("proto") == "vmess" else FRAGMENT_FM}
 
 def _normal_endpoint_settings(stored):
@@ -583,6 +597,8 @@ def _normal_endpoint_settings(stored):
         if label: base["label"] = label[:64]
         pair = {"host": str(raw.get("host", "")), "sni": str(raw.get("sni", ""))}
         if pair in hosts: base.update(pair)
+        if raw.get("fingerprint") in TLS_FINGERPRINTS: base["fingerprint"] = raw["fingerprint"]
+        if "reality" not in ep: base["ech_enabled"] = raw.get("ech_enabled") is True
         fm = raw.get("fragment_fm")
         if isinstance(fm, str):
             try:
@@ -947,6 +963,10 @@ def parse_outbound_link(link, tag):
             if _q1(qs, "allowInsecure") in ("1", "true"): t["allowInsecure"] = True
             fp = _q1(qs, "fp")
             if fp: t["fingerprint"] = fp
+            alpn = _q1(qs, "alpn")
+            if alpn: t["alpn"] = alpn.split(",")
+            ech = _q1(qs, "ech")
+            if ech and sec == "tls": t["echConfigList"] = ech
             stream["tlsSettings"] = t
         if net == "ws":
             stream["wsSettings"] = {"path": _q1(qs, "path", default="/") or "/",
@@ -2122,6 +2142,10 @@ def users_overview():
 
 ADMIN_ICONS = """<svg xmlns="http://www.w3.org/2000/svg" class="icon-sprite" aria-hidden="true">
 <symbol id="ico-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+<symbol id="ico-infinity" viewBox="0 0 24 24"><path d="M12 12c-3-5-8-5-8 0s5 5 8 0 8-5 8 0-5 5-8 0Z"/></symbol>
+<symbol id="ico-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M12 7v5l3 2"/></symbol>
+<symbol id="ico-data" viewBox="0 0 24 24"><path d="M5 4h14v16H5zM8 8h8M8 12h8M8 16h4"/></symbol>
+<symbol id="ico-edit" viewBox="0 0 24 24"><path d="m15 4 5 5-11 11H4v-5ZM13 6l5 5"/></symbol>
 <symbol id="ico-sliders" viewBox="0 0 24 24"><path d="M4 7h9m4 0h3M4 17h3m4 0h9"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/></symbol>
 <symbol id="ico-route" viewBox="0 0 24 24"><circle cx="5" cy="6" r="2"/><circle cx="19" cy="18" r="2"/><path d="M7 6h7a4 4 0 0 1 0 8h-4a4 4 0 0 0 0 8h7"/></symbol>
 <symbol id="ico-search" viewBox="0 0 24 24"><circle cx="10.8" cy="10.8" r="6.3"/><path d="m16 16 4.5 4.5"/></symbol>
@@ -2238,6 +2262,23 @@ form.row{margin:0 0 8px}
 .field{display:grid;gap:6px;min-width:0}
 .field>span{font-size:12px;font-weight:700;color:var(--mut)}
 .field input{width:100%;max-width:none}
+.tls-controls{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:18px;align-items:center;padding:14px;background:var(--soft);border-radius:10px}
+.manage-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;margin-bottom:18px}
+.manage-grid>.card{margin:0}
+.manage-head{display:flex;align-items:center;gap:9px;margin-bottom:10px}
+.manage-head h2{margin:0}
+.manage-value{font-size:22px;font-weight:800;line-height:1.5;margin:0 0 3px}
+.manage-form{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:end;gap:10px;margin:15px 0 12px}
+.manage-form input{width:100%;max-width:none}
+.manage-foot{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;border-top:1px solid var(--line);padding-top:12px}
+.manage-foot form{margin:0}
+.manage-foot .hint{margin:0}
+.account-row{display:flex;align-items:center;justify-content:space-between;gap:20px;flex-wrap:wrap}
+.account-row .manage-form{flex:1;margin:0;min-width:260px;max-width:540px}
+.account-row+.account-row{border-top:1px solid var(--line);padding-top:18px;margin-top:18px}
+.user-hero .metrics{margin-top:16px}
+.danger-zone{display:flex;align-items:center;justify-content:space-between;gap:15px;flex-wrap:wrap;box-shadow:none}
+.danger-zone h2{margin-bottom:4px}
 .toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:10px}
 .toolbar .row{margin-inline-start:auto}
 #linksearch{width:220px;max-width:100%}
@@ -2272,6 +2313,7 @@ button[disabled]{opacity:.65;cursor:progress}
 @media (max-width:820px){.dashboard-hero{grid-template-columns:1fr;grid-template-rows:auto;gap:6px}.dashboard-hero>.eyebrow,.dashboard-hero>.big,.dashboard-hero>.metrics,.dashboard-hero>.pills,.dashboard-hero>.chart{grid-column:1;grid-row:auto}.dashboard-hero>.chart{border-inline-start:0;border-top:1px solid var(--line);padding:17px 0 0;margin-top:12px}.dashboard-hero .chart svg{height:100px}}
 @media (max-width:620px){body{padding:0 14px 40px}.top{min-height:66px;margin-bottom:25px;gap:12px}.brand{font-size:17px}.crumb{display:none}.rightnav{gap:6px}.rightnav .btn{padding:8px 10px}.pagehead{align-items:stretch;flex-direction:column}.pagehead .btn{align-self:flex-start}.card{padding:17px;border-radius:15px}.dashboard-hero{padding:21px}.metrics{gap:16px}.create-grid{grid-template-columns:1fr}.toolbar .row{margin-inline-start:0}.toolbar #linksearch{width:100%}.u{grid-template-columns:10px minmax(0,1fr) auto;gap:8px 12px;padding:13px 4px}.u .st{grid-column:1;grid-row:1}.u .nm{grid-column:2;grid-row:1}.u .rt{grid-column:3;grid-row:1}.u .meter{grid-column:2/4;grid-row:2}.rt{font-size:11px}.row>.btn{flex:1 1 auto}.btn{min-height:42px}.eprow{padding:12px}.eprow .row{align-items:flex-start}}
 @media (prefers-reduced-motion:reduce){*,*:before,*:after{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
+@media (max-width:620px){.manage-grid{grid-template-columns:1fr;gap:14px}.tls-controls{grid-template-columns:1fr}.manage-form{grid-template-columns:minmax(0,1fr) auto}.manage-form .btn{padding:10px 12px}.account-row .manage-form{min-width:0;max-width:none;flex-basis:100%}.manage-foot .hint{flex:1}.switch .swsub{margin-top:4px}}
 """
 
 def _page(title, inner):
@@ -2402,39 +2444,65 @@ def render_user(token, csrf, msg=""):
     st = "frz" if frz else ("dng" if dis else "ok")
     stlabel = "فریز موقت" if frz else ("غیرفعال" if dis else "فعال")
     tk = "<input type=hidden name=token value='%s'>" % token
-    frz_card = (
-        "<div class=card><form method=post action='/a/freeze' id=frzf style='margin:0'>%s"
+    freeze = (
+        "<form method=post action='/a/freeze' id=frzf style='margin:0'>%s"
         "<input type=hidden name=csrf value='%s'>"
-        "<label class='switch%s'>"
-        "<input type=checkbox name=on onchange=\"document.getElementById('frzf').submit()\"%s>"
-        "<span class=knob></span>"
-        "<span class=swtxt><b>فریز موقت</b><span class=swsub>%s</span></span></label>"
-        "</form></div>") % (
-        tk, csrf, (" on" if frz else ""), (" checked" if frz else ""),
-        ("اتصال قطع است — برای فعال‌سازیِ دوباره تیک را بردار" if frz
-         else "با زدنِ تیک، این کانفیگ فوراً قطع و تا برداشتنِ تیک غیرفعال می‌ماند"))
-    forms = (
-        _form("/a/addvol", [tk, "<input type=number name=gb step=any min=0 placeholder='حجم (گیگ)'>"], csrf, "افزودن حجم") +
-        _form("/a/addtime", [tk, "<input type=number name=days step=any min=0 placeholder='مدت (روز)'>"], csrf, "افزودن زمان") +
-        _form("/a/rename", [tk, "<input type=text name=name placeholder='نام تازه'>"], csrf, "تغییر نام") +
-        _form("/a/unlimit", [tk, "<input type=hidden name=field value=limit_bytes>"], csrf, "حجم نامحدود", "btn ghost") +
-        _form("/a/unlimit", [tk, "<input type=hidden name=field value=expiry_ts>"], csrf, "زمان نامحدود", "btn ghost"))
+        "<label class='switch%s'><input type=checkbox name=on "
+        "onchange=\"document.getElementById('frzf').submit()\"%s>"
+        "<span class=knob></span><span class=swtxt><b>فریز موقت</b>"
+        "<span class=swsub>%s</span></span></label></form>") % (
+            tk, csrf, " on" if frz else "", " checked" if frz else "",
+            "اتصال متوقف است؛ برای وصل‌شدن، فریز را خاموش کنید." if frz
+            else "اتصال را موقتاً متوقف می‌کند؛ زمان اشتراک همچنان می‌گذرد.")
+    hero = ("<div class='card hero user-hero'><div class=eyebrow>"
+            "<span class='st %s'></span> %s</div><h1 class=title>%s</h1>"
+            "<div class=metrics><div class=metric><div class=k>مصرف دوره</div>"
+            "<div class=v><span class=n>%s</span></div></div>"
+            "<div class=metric><div class=k>مصرف امروز</div><div class=v><span class=n>%s</span></div></div>"
+            "<div class=metric><div class=k>پیکربندی</div><div class=v>%s</div></div></div></div>") % (
+                st, stlabel, html.escape(u["label"]), fmt_bytes(current_usage(u)), fmt_bytes(today_u),
+                "اختصاصی" if u["config_override"] is not None else "عمومی")
+    def allowance(kind, title, value, hint, action, field, unit, unlimited_field, unlimited_label):
+        add = ("<form class=manage-form method=post action='%s'>%s"
+               "<input type=hidden name=csrf value='%s'>"
+               "<label class=field><span>%s (%s)</span>"
+               "<input type=number name='%s' step=any min=0 placeholder='مثلاً ۱۰' required></label>"
+               "<button class=btn>%s %s</button></form>") % (
+                   action, tk, csrf, "حجم اضافه" if field == "gb" else "مدت اضافه", unit,
+                   field, _icon("plus"), "افزودن حجم" if field == "gb" else "افزودن زمان")
+        unlimit = _form("/a/unlimit", [tk, "<input type=hidden name=field value='%s'>" % unlimited_field],
+                        csrf, _icon("infinity") + " " + unlimited_label, "btn ghost")
+        foot = "بدون سقف" if not u[unlimited_field] else "حذف محدودیت " + ("حجم" if field == "gb" else "زمان")
+        return ("<section class=card aria-label='%s'><div class=manage-head>%s<h2>%s</h2></div>"
+                "<div class=manage-value>%s</div><p class=hint>%s</p>%s"
+                "<div class=manage-foot><span class=hint>%s</span>%s</div></section>") % (
+                    title, _icon(kind), title, value, hint, add, foot, unlimit)
+    used = current_usage(u)
+    volume_hint = ("باقی‌مانده: %s" % fmt_bytes(max(0, u["limit_bytes"] - used)) if u["limit_bytes"]
+                   else "افزودن حجم، سقف جدیدی برای این اشتراک تعیین می‌کند.")
+    time_hint = ("مدت به زمان باقی‌مانده اضافه می‌شود؛ برای اشتراک منقضی از امروز حساب می‌شود."
+                 if u["expiry_ts"] else "افزودن زمان، انقضای اشتراک را از امروز تعیین می‌کند.")
+    limits = "<div class=manage-grid>%s%s</div>" % (
+        allowance("data", "حجم اشتراک", "<span class=n>%s</span>" % human_limit(u["limit_bytes"]),
+                  volume_hint, "/a/addvol", "gb", "گیگابایت", "limit_bytes", "حجم نامحدود"),
+        allowance("clock", "زمان اشتراک", human_expiry(u["expiry_ts"]), time_hint,
+                  "/a/addtime", "days", "روز", "expiry_ts", "زمان نامحدود"))
+    rename = ("<form class=manage-form method=post action='/a/rename'>%s"
+              "<input type=hidden name=csrf value='%s'><label class=field><span>نام مشتری</span>"
+              "<input type=text name=name maxlength=40 value='%s' required></label>"
+              "<button class='btn ghost'>%s ذخیره نام</button></form>") % (
+                  tk, csrf, _config_html(u["label"]), _icon("edit"))
+    config_link = "<a class='btn ghost' href='/a/user-config?token=%s'>%s تنظیمات لینک</a>" % (token, _icon("sliders"))
+    account = ("<div class=card><h2>نام و دسترسی</h2><div class=account-row>%s</div>"
+               "<div class=account-row>%s%s</div></div>") % (rename, freeze, config_link)
+    link = "<div class=card><h2>لینک اشتراک</h2><code>%s</code></div>" % html.escape(sub_url(token))
+    history = "<div class=card><h2>مصرف ۳۰ روز اخیر</h2>%s</div>" % chart
     reset = "<a class='btn ghost' href='/a/reset?token=%s'>%s ریست مصرف</a>" % (token, _icon("refresh"))
     dele = "<a class='btn danger' href='/a/del?token=%s'>%s حذف لینک</a>" % (token, _icon("trash"))
-    hero = ("<div class='card hero'><div class=eyebrow><span class='st %s' style='display:inline-block;margin-inline-start:6px;vertical-align:middle'></span>%s</div>"
-            "<h1 class=title>%s</h1>"
-            "<div class=metrics><div class=metric><div class=k>مصرف</div><div class=v><span class=n>%s / %s</span></div></div>"
-            "<div class=metric><div class=k>امروز</div><div class='v mono'><span class=n>%s</span></div></div>"
-            "<div class=metric><div class=k>انقضا</div><div class=v>%s</div></div></div>"
-            "<div class=chart><div class=eyebrow>۳۰ روز اخیر</div>%s</div></div>") % (
-        st, stlabel, html.escape(u["label"]),
-        fmt_bytes(current_usage(u)), human_limit(u["limit_bytes"]), fmt_bytes(today_u),
-        human_expiry(u["expiry_ts"]), chart)
-    link = "<div class=card><h2>لینک اشتراک</h2><code>%s</code></div>" % sub_url(token)
-    config_link = "<a class='btn ghost' href='/a/user-config?token=%s'>%s تنظیمات لینک</a>" % (token, _icon("sliders"))
-    actions = "<div class=card><h2>مدیریت</h2><div class=grid>%s</div><div class=row style='margin-top:10px'>%s%s%s</div></div>" % (forms, config_link, reset, dele)
-    notice = ("<div class=card role=alert>%s</div>" % html.escape(msg)) if msg else ""
-    return _page("کاربر", _top(_back("/a/", "داشبورد"), csrf) + notice + hero + frz_card + link + actions)
+    actions = ("<div class='card danger-zone'><div><h2>ریست یا حذف</h2>"
+               "<p class=hint>پیش از انجام، تأیید گرفته می‌شود.</p></div><div class=row>%s%s</div></div>") % (reset, dele)
+    notice = _config_message(msg)
+    return _page("مدیریت کاربر", _top(_back("/a/", "داشبورد"), csrf) + notice + hero + limits + account + link + history + actions)
 
 def render_new(csrf):
     f = ("<form method=post action='/a/new' class=grid>"
@@ -2516,6 +2584,20 @@ def _render_config_fields(settings, editable=True):
                  "<input type=text id='label_%s' name='label_%s' maxlength=64 value='%s'%s "
                  "style='width:100%%;max-width:100%%'>") % (
                      key, key, key, _config_html(cfg.get("label", ep.get("label", tag))), disabled)
+        fp_options = "".join("<option value='%s'%s>%s</option>" % (
+            fp, " selected" if fp == cfg.get("fingerprint", "chrome") else "", fp)
+            for fp in TLS_FINGERPRINTS)
+        tls_controls = ("<div class=tls-controls><label class=field><span>Fingerprint</span>"
+                        "<select name='fp_%s' aria-label='Fingerprint %s'%s>%s</select></label>") % (
+                            key, key, disabled, fp_options)
+        if is_reality:
+            tls_controls += "<p class=hint>ECH برای REALITY کاربرد ندارد.</p>"
+        else:
+            tls_controls += ("<label class=switch><input type=checkbox name='ech_%s'%s%s>"
+                             "<span class=knob></span><span class=swtxt><b>ECH</b>"
+                             "<span class=swsub>رمزکردن SNI در اتصال TLS</span></span></label>") % (
+                                 key, " checked" if cfg.get("ech_enabled") else "", disabled)
+        tls_controls += "</div>"
         if is_reality:
             ports = "<p class=hint>پورت مستقیمِ آماده‌شده: <span class=n>%s</span></p>" % _config_html(ep.get("port", ""))
             host = "<p class=hint>Host و SNI کلادفلر برای REALITY کاربرد ندارد.</p>"
@@ -2548,12 +2630,14 @@ def _render_config_fields(settings, editable=True):
                 fragment = ("<label class=hint for='fm_%s'>Fragment JSON (خالی = غیرفعال)</label>"
                             "<textarea id='fm_%s' name='fm_%s' rows=3 dir=ltr%s>%s</textarea>") % (
                                 key, key, key, disabled, _config_html(cfg.get("fragment_fm", "")))
-        rows.append("<div class=eprow style='display:block'><div class=grid>%s%s%s%s%s</div></div>" % (
-            head, label, ports, host, fragment))
-    return ("<h2>نوع و تعداد کانفیگ‌ها</h2>"
+        rows.append("<div class=eprow style='display:block'><div class=grid>%s%s%s%s%s%s</div></div>" % (
+            head, label, ports, host, tls_controls, fragment))
+    return ("<input type=hidden name=tls_fields value=1><h2>نوع و تعداد کانفیگ‌ها</h2>"
             "<p class=hint>فقط پورت‌ها، مسیرها و جفت‌های Host / SNI آماده‌شده روی سرور قابل انتخاب‌اند. "
             "تعداد سقفی ندارد؛ تعداد بیشتر روی پورت‌ها و آدرس‌های اتصال پخش می‌شود. "
-            "با حذف پورت یا غیرفعال‌کردن پروتکل، کانفیگ قدیمی آن قطع می‌شود و برنامهٔ کاربر باید اشتراک را تازه کند.</p>%s"
+            "با حذف پورت یا غیرفعال‌کردن پروتکل، کانفیگ قدیمی آن قطع می‌شود و برنامهٔ کاربر باید اشتراک را تازه کند.</p>"
+            "<p class=hint>Fingerprint و Fragment مستقل‌اند. ECH فقط روی TLS اعمال می‌شود و به پشتیبانی دامنه و برنامهٔ به‌روز نیاز دارد؛ "
+            "اگر دریافت کلید ECH یا اتصال مشکل داشت، آن را خاموش کنید. VMess با ECH روشن به فرمت URI ارائه می‌شود.</p>%s"
             "<h2 style='margin-top:16px'>آدرس‌های اتصال CDN (IP تمیز و دامنه)</h2>"
             "<p class=hint>IPها و دامنه‌ها را با هم وارد کنید. کانفیگ‌های IP فعلی حفظ می‌شوند. برای هر دامنهٔ "
             "آماده‌شده، یک کانفیگ دامنه‌ای و یک کانفیگ با آخرین IP فهرست و Host/SNI همان دامنه "
@@ -2804,6 +2888,14 @@ def _parse_config_fields(form, current):
         hosts = approved_hosts()
         for ep in ENDPOINTS:
             tag = ep["tag"]; base = _endpoint_defaults(ep)
+            # Older open forms have no TLS marker: preserve their stored TLS
+            # options; new forms can explicitly turn an unchecked ECH off.
+            previous = _normal_endpoint_settings(current["endpoint_settings"])[tag]
+            base.update(fingerprint=previous["fingerprint"], ech_enabled=previous["ech_enabled"])
+            if form.get("tls_fields") == "1":
+                fp = form.get("fp_" + tag, previous["fingerprint"])
+                if fp not in TLS_FINGERPRINTS: raise ValueError("Fingerprint نامعتبر است")
+                base.update(fingerprint=fp, ech_enabled="reality" not in ep and ("ech_" + tag) in form)
             if "reality" in ep:
                 label = (form.get("label_" + tag) or "").strip()
                 if not label or len(label) > 64:
