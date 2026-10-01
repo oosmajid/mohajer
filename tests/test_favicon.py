@@ -2,6 +2,8 @@ import os, sys, unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bot"))
 os.environ.setdefault("DPBOT_ENV", "/nonexistent-dpbot-env")
 import bot  # noqa: E402
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "sub"))
+import subserver  # noqa: E402
 
 
 class FaviconTests(unittest.TestCase):
@@ -13,6 +15,11 @@ class FaviconTests(unittest.TestCase):
         self.assertIn('%23256BD1', h)
         self.assertIn('%23fff', h)
         self.assertNotIn('%%23', h)   # regression guard: the %-escape leaked
+
+    def test_subscriber_page_has_favicon(self):
+        self.assertIn('rel="icon"', subserver.PAGE)
+        self.assertIn('data:image/svg+xml', subserver.PAGE)
+        self.assertIn('%23256BD1', subserver.PAGE)
 
 
 if __name__ == "__main__":

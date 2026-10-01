@@ -494,6 +494,13 @@ def get_ips():
 def set_ips(ips):
     meta_set("clean_ips", ",".join(ips))
 
+def _is_ipv4(address):
+    try:
+        ipaddress.IPv4Address(address)
+        return True
+    except ipaddress.AddressValueError:
+        return False
+
 def parse_ips(text):
     # Kept under its old name for stored settings and callers; CDN dial addresses
     # may now be IPv4 or DNS names. Host/SNI still come from each endpoint.
@@ -659,6 +666,13 @@ def _configured_ep(ep, settings):
     merged = dict(ep)
     merged.update((settings or {}).get(ep["tag"], {}))
     return merged
+
+def _dial_ep(ep, address):
+    """Use a provisioned hostname's own Host/SNI while keeping IP profiles intact."""
+    for pair in approved_hosts():
+        if address.lower() == pair["host"].lower():
+            return {**ep, **pair}
+    return ep
 
 def active_slot_keys(token, recipe=None, settings=None):
     """The distinct external-port identities emitted by this link's recipe."""
@@ -1233,6 +1247,9 @@ def test_outbound(tag):
 
 def write_sub(token, secret, label):
     ips = effective_ips(token) or DEFAULT_IPS
+    ipv4 = [address for address in ips if _is_ipv4(address)]
+    names = list(dict.fromkeys(address for address in ips if not _is_ipv4(address)))
+    primary = ipv4 or names
     recipe = effective_recipe(token); settings = effective_endpoint_settings(token)
     mode = credential_mode(token); converted = slot_mode_tags(token); links = []; gi = 0
     for source in ENDPOINTS:
@@ -1248,11 +1265,32 @@ def write_sub(token, secret, label):
         slots = _ep_slots(ep)
         if not count or not slots:
             continue
+        selected = []
+        emitted_names = set()
         for k in range(count):
             port, sec = slots[k % len(slots)]
             identity = (ensure_slot_credential(token, ep, sec, int(port))["secret"]
                         if mode == "slots" or ep["tag"] in converted else secret)
-            links.append(_ws_link(ep, identity, ips[gi % len(ips)], port, sec)); gi += 1
+            address = primary[gi % len(primary)]
+            links.append(_ws_link(_dial_ep(ep, address), identity, address, port, sec))
+            selected.append((port, sec))
+            emitted_names.add(address)
+            gi += 1
+        # A long clean-IP list must not crowd the DNS route out of the subscription.
+        # Reuse an already active port identity so this adds no Xray users or revocation.
+        companion_port, companion_sec = next((slot for slot in selected if slot[1] == "tls"), selected[0])
+        for address in names:
+            if address in emitted_names:
+                continue
+            identity = (ensure_slot_credential(token, ep, companion_sec, int(companion_port))["secret"]
+                        if mode == "slots" or ep["tag"] in converted else secret)
+            profile_ep = _dial_ep(ep, address)
+            links.append(_ws_link(profile_ep, identity, address, companion_port, companion_sec))
+            # Keep the original IP/SNI configurations; add one IP route with this
+            # hostname's SNI as a fallback when DNS is blocked but the edge IP works.
+            if ipv4 and (profile_ep.get("host"), profile_ep.get("sni")) != (ep.get("host"), ep.get("sni")):
+                ip_profile = {**profile_ep, "label": ep["label"] + " · " + address}
+                links.append(_ws_link(ip_profile, identity, ipv4[-1], companion_port, companion_sec))
     path = sub_path(token); tmp = path + ".tmp-" + secrets.token_hex(4)
     try:
         with open(tmp, "w") as out:
@@ -2514,8 +2552,10 @@ def _render_config_fields(settings, editable=True):
             "<p class=hint>فقط پورت‌ها، مسیرها و جفت‌های Host / SNI آماده‌شده روی سرور قابل انتخاب‌اند. "
             "تعداد سقفی ندارد؛ تعداد بیشتر روی پورت‌ها و آدرس‌های اتصال پخش می‌شود. "
             "با حذف پورت یا غیرفعال‌کردن پروتکل، کانفیگ قدیمی آن قطع می‌شود و برنامهٔ کاربر باید اشتراک را تازه کند.</p>%s"
-            "<h2 style='margin-top:16px'>آدرس‌های اتصال CDN (دامنه یا IPv4)</h2>"
-            "<p class=hint>دامنه باید در Cloudflare فعال و به همین مسیر متصل باشد. Host و SNI را از بالا انتخاب کنید.</p>"
+            "<h2 style='margin-top:16px'>آدرس‌های اتصال CDN (IP تمیز و دامنه)</h2>"
+            "<p class=hint>IPها و دامنه‌ها را با هم وارد کنید. کانفیگ‌های IP فعلی حفظ می‌شوند. برای هر دامنهٔ "
+            "آماده‌شده، یک کانفیگ دامنه‌ای و یک کانفیگ با آخرین IP فهرست و Host/SNI همان دامنه "
+            "به هر نوع اتصال فعال اضافه می‌شود.</p>"
             "<textarea name=ips rows=4 dir=ltr placeholder='cdn.example.com, 104.16.96.1'%s>%s</textarea>") % (
                 "".join(rows), disabled, _config_html("\n".join(ips)))
 

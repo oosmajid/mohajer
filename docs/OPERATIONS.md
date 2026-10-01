@@ -16,12 +16,15 @@ Production server: `ssh -p 49531 root@23.94.29.30` (512MB RAM). Live unit names 
 | Memory check | `free -m` (watch for low "available") |
 | Bot RSS | `ps -o rss= -C python3` (≈25MB, flat — audited, no leak) |
 
-## Clean-IP workflow (the recurring one)
+## Optional clean-IP workflow
 1. From the operator's laptop on the target ISP (NO proxy):
    `bash scripts/cf-clean-ip-scan.sh cdn.delplayer.ir`
 2. Take the top 3 IPs (ranked by TLS-handshake time).
 3. Bot → 🌐 آدرس‌های CDN → ✏️ → paste a working Cloudflare hostname or clean IPv4 addresses.
-4. All links rewrite instantly; customers press **Update** in their client.
+4. All links rewrite instantly; customers press **Update** in their client. Keep
+   the matching `cdn[2-5].windertop.cfd` hostname in the same list, so a DNS
+   route remains in each subscription. The final IPv4 gets an additional config
+   with the new hostname as Host/SNI; retain the old IPs if you want old URIs to stay.
 
 ## ⚠️ Memory pressure / SSH "banner exchange timeout"
 Symptom: `ssh` hangs then `Connection timed out during banner exchange`, but the TCP

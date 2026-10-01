@@ -39,8 +39,10 @@ framework, no DB server. Everything is configured through one env file (`bot.env
    by clean IP, they share that slot credential.
 3. Clients connect to a **Cloudflare-proxied hostname or clean edge IPv4 address**
    (the link's dial address; the provisioned hostname rides in SNI/`host=`).
-   The bot can rewrite these addresses from "🌐 آدرس‌های CDN" without changing
-   anyone's subscription URL. Existing installs keep saved IPs until changed.
+   When the address list mixes IPv4 and a hostname from `HOST_PROFILES`, `write_sub`
+   keeps every old IP URI, adds a DNS URI per enabled CDN endpoint, and adds one
+   URI using the final listed IPv4 with the new hostname as Host/SNI. Adding a
+   hostname never changes `DOMAIN` or `SUB_BASE_URL`; old subscription URLs stay.
 4. Quota/expiry are enforced by the **enforcer thread**, not by xray. xray just
    counts bytes; the bot reads the counters and deletes the user when over limit.
 
@@ -65,8 +67,11 @@ SSH from the operator's laptop may require SOCKS5 `127.0.0.1:10808`:
 `-o "ProxyCommand=nc -x 127.0.0.1:10808 -X 5 %h %p"`.
 Verify host keys; cdn4 uses port **40273**, not the default port 22.
 `cdn.delplayer.ir` is a 512 MB VPS; avoid spawning extra Xray processes there.
-Each server currently has one provisioned domain and one path per endpoint; cdn,
-cdn2 and cdn3 have REALITY, while cdn4 and cdn5 do not.
+All five servers have parallel old `cdn[2-5].delplayer.ir` and new
+`cdn[2-5].windertop.cfd` Cloudflare Tunnel routes, with the old hostname retained
+as `DOMAIN` and `SUB_BASE_URL`. (For the first box the hostname is `cdn`.)
+`HOST_PROFILES` permits the matching new hostname on each bot. cdn, cdn2 and
+cdn3 have REALITY provisioned, while cdn4 and cdn5 do not.
 On all five hosts, the active `xray.service` reads
 `/usr/local/etc/xray/config.json` (verified 2026-09-29). Always recheck
 `bot.env` and the unit's `ExecStart` before a future deployment.
@@ -110,9 +115,12 @@ On all five hosts, the active `xray.service` reads
 - **Change CDN dial addresses:** use the bot panel or the web panel's `/a/config`
   page (both live, no restart) or set `IPS=` in `bot.env` as the default. Entries
   can be a Cloudflare-proxied hostname or IPv4. Stored override lives in the
-  legacy `meta.clean_ips` key. Use `scripts/cf-clean-ip-scan.sh <host>` only for
-  manually pinned IPv4 addresses. Do not switch a live subscription to a filtered
-  hostname; provision and test the new hostname and matching Host/SNI first.
+  legacy `meta.clean_ips` key. Put the provisioned `cdn[2-5].windertop.cfd`
+  alongside the existing IPv4 addresses; the code emits old IP URIs plus DNS and
+  new-SNI IP companions. The last IPv4 in the list is used for that companion.
+  Keep the new hostname in `HOST_PROFILES` and in Cloudflare Tunnel ingress.
+  Use `scripts/cf-clean-ip-scan.sh <host>` only for manually pinned IPv4 addresses.
+  Test a new hostname and matching Host/SNI before adding it to live subscriptions.
 - **Config recipe (types & counts):** the web panel's `/a/config` page (stored in
   `meta.config_recipe` JSON) sets, per endpoint, `enabled` + `count` = how many
   configs of that type to emit. Default (no override) = one per TLS/no-TLS port, i.e.

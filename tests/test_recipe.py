@@ -48,21 +48,63 @@ class TestRecipeModel(RecipeBase):
 
 
 class TestWriteSubHonorsRecipe(RecipeBase):
-    def test_dns_address_preserves_host_sni_and_ipv4_fallback(self):
-        addresses = bot.parse_ips("CDN.Example.ir, 104.16.96.1, bad/name, 999.999.999.999")
-        self.assertEqual(addresses, ["cdn.example.ir", "104.16.96.1"])
-        bot.set_ips(addresses)
-        bot.write_sub("dns", "11111111-1111-1111-1111-111111111111", "D")
-        links = self._links("dns")
-        vless = urllib.parse.urlsplit(links[0])
-        self.assertEqual(vless.hostname, "cdn.example.ir")
-        self.assertEqual(urllib.parse.parse_qs(vless.query)["sni"], ["cdn.example.ir"])
-        self.assertEqual(urllib.parse.parse_qs(vless.query)["host"], ["cdn.example.ir"])
-        self.assertEqual(urllib.parse.urlsplit(links[1]).hostname, "104.16.96.1")
-        vmess = json.loads(base64.b64decode(links[4][8:]))
-        self.assertEqual((vmess["add"], vmess["host"], vmess["sni"]),
-                         ("cdn.example.ir", "cdn.example.ir", "cdn.example.ir"))
-        self.assertEqual(urllib.parse.urlsplit(links[6]).hostname, "cdn.example.ir")
+    def test_ip_and_dns_are_both_emitted_with_their_own_host_sni(self):
+        old_profiles = bot.ENV.get("HOST_PROFILES")
+        bot.ENV["HOST_PROFILES"] = json.dumps([{"host": "cdn.windertop.cfd", "sni": "cdn.windertop.cfd"}])
+        try:
+            addresses = bot.parse_ips("CDN.windertop.cfd, 104.16.96.1, bad/name, 999.999.999.999")
+            self.assertEqual(addresses, ["cdn.windertop.cfd", "104.16.96.1"])
+            bot.set_ips(addresses)
+            bot.write_sub("dns", "11111111-1111-1111-1111-111111111111", "D")
+            links = self._links("dns")
+        finally:
+            if old_profiles is None: bot.ENV.pop("HOST_PROFILES", None)
+            else: bot.ENV["HOST_PROFILES"] = old_profiles
+        self.assertEqual(len(links), 14)  # original eight plus DNS and new-SNI IP per endpoint
+        vless = [urllib.parse.urlsplit(l) for l in links if l.startswith("vless://")]
+        self.assertEqual({l.hostname for l in vless}, {"104.16.96.1", "cdn.windertop.cfd"})
+        ip_link = next(l for l in vless if l.hostname == "104.16.96.1")
+        dns_link = next(l for l in vless if l.hostname == "cdn.windertop.cfd")
+        self.assertEqual(urllib.parse.parse_qs(ip_link.query)["sni"], ["cdn.example.ir"])
+        self.assertEqual(urllib.parse.parse_qs(ip_link.query)["host"], ["cdn.example.ir"])
+        self.assertEqual(urllib.parse.parse_qs(dns_link.query)["sni"], ["cdn.windertop.cfd"])
+        self.assertEqual(urllib.parse.parse_qs(dns_link.query)["host"], ["cdn.windertop.cfd"])
+        new_ip = [l for l in vless if l.hostname == "104.16.96.1" and
+                  urllib.parse.parse_qs(l.query).get("sni") == ["cdn.windertop.cfd"]]
+        self.assertEqual(len(new_ip), 1)
+        self.assertEqual(urllib.parse.parse_qs(new_ip[0].query)["host"], ["cdn.windertop.cfd"])
+        vmess = [json.loads(base64.b64decode(l[8:])) for l in links if l.startswith("vmess://")]
+        self.assertTrue(any((x["add"], x["host"], x["sni"]) ==
+                            ("cdn.windertop.cfd", "cdn.windertop.cfd", "cdn.windertop.cfd") for x in vmess))
+        self.assertTrue(any((x["add"], x["host"], x["sni"]) ==
+                            ("104.16.96.1", "cdn.windertop.cfd", "cdn.windertop.cfd") for x in vmess))
+
+    def test_many_clean_ips_cannot_hide_dns_companion(self):
+        bot.set_ips(["104.16.0.%d" % i for i in range(1, 18)] + ["cdn.example.ir"])
+        bot.set_recipe({"vless-ws": {"enabled": True, "count": 1},
+                        "vmess-ws": {"enabled": False, "count": 0},
+                        "trojan-ws": {"enabled": False, "count": 0}})
+        bot.write_sub("long", "11111111-1111-1111-1111-111111111111", "L")
+        links = [urllib.parse.urlsplit(l) for l in self._links("long")]
+        self.assertEqual([l.hostname for l in links], ["104.16.0.1", "cdn.example.ir"])
+        self.assertEqual([l.port for l in links], [443, 443])
+
+    def test_adding_new_domain_keeps_existing_ip_uris(self):
+        bot.set_ips(["104.16.0.1", "104.16.0.2"])
+        bot.write_sub("keep", "11111111-1111-1111-1111-111111111111", "K")
+        old_links = self._links("keep")
+        old_profiles = bot.ENV.get("HOST_PROFILES")
+        bot.ENV["HOST_PROFILES"] = json.dumps([{"host": "cdn.windertop.cfd", "sni": "cdn.windertop.cfd"}])
+        try:
+            bot.set_ips(["104.16.0.1", "104.16.0.2", "cdn.windertop.cfd"])
+            bot.write_sub("keep", "11111111-1111-1111-1111-111111111111", "K")
+            new_links = self._links("keep")
+        finally:
+            if old_profiles is None: bot.ENV.pop("HOST_PROFILES", None)
+            else: bot.ENV["HOST_PROFILES"] = old_profiles
+        self.assertTrue(set(old_links).issubset(new_links))
+        self.assertTrue(any(urllib.parse.urlsplit(l).hostname == "104.16.0.2" and
+                            "sni=cdn.windertop.cfd" in l for l in new_links if not l.startswith("vmess://")))
 
     def test_default_emits_one_per_slot(self):
         bot.write_sub("aa", "11111111-1111-1111-1111-111111111111", "A")
