@@ -80,3 +80,23 @@ which sets a 24h HttpOnly session cookie scoped to `/a`. All mutations are
 CSRF-protected; delete needs a second confirm. A bot restart clears all
 sessions/login-links — just send `/admin` again. The panel binds `127.0.0.1`
 only, so it is unreachable except through this ingress.
+
+
+## Relay ingresses
+
+In public Configuration or a link’s custom Configuration, open **ورودی‌های واسط**.
+Add a label, the relay’s IP/domain and public port, choose a prepared REALITY
+backend, then set its enabled switch and count. Save and refresh the subscription.
+A custom link changes independently of public defaults. Count 0 or disabled emits
+no relay profiles; changing address/port retains the backend credential.
+
+The relay server must already forward to the selected local inbound. This form
+creates dial routes and manages user authorization; it does not install software
+on another server. The current provisioned relay is CDN3: public 8443 forwards to
+CDN2 loopback 10443. It is stored as an optional route, disabled by default.
+Imported CDN3 links keep their original profiles and subscription URLs; managing
+one of them does not require changing the public relay setting.
+
+CDN3 has no active Mohajer panel. All 26 imported users are managed in CDN2.
+`cloudflared-cdn3` on CDN2 serves the old CDN3 URLs without DNS replacement.
+CDN3’s `mohajer-relay` must stay enabled. Keep its nginx and other applications.

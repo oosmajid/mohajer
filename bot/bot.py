@@ -452,7 +452,9 @@ def _stats_epoch_still_running(pid):
 
 # ---------------- sub links ----------------
 def sub_path(token): return os.path.join(SUB_DIR, "sub-u-%s" % token)
-def sub_url(token):  return "%s/sub-u-%s" % (SUB_BASE, token)
+def sub_url(token):
+    # Imported links retain their public URL when instances are consolidated.
+    return "%s/sub-u-%s" % (meta_get("sub_base_" + token) or SUB_BASE, token)
 
 def _ws_link(ep, secret, address, port, sec):
     proto, net = ep["proto"], ep["net"]
@@ -492,10 +494,49 @@ def _ws_link(ep, secret, address, port, sec):
 
 def _reality_link(ep, secret, n=0):
     r = ep["reality"]
-    nm = urllib.parse.quote(ep.get("label", "REALITY") + " · مستقیم" + (" %d" % (n + 1) if n else ""))
+    nm = urllib.parse.quote(ep.get("label", "REALITY") + (" · واسط" if ep.get("via_relay") else " · مستقیم") + (" %d" % (n + 1) if n else ""))
+    address = r["addr"] if ":" not in r["addr"] else "[" + r["addr"] + "]"
     flow = ("&flow=%s" % r["flow"]) if r.get("flow") else ""
     return ("vless://%s@%s:%s?encryption=none&security=reality&pbk=%s&sni=%s&fp=%s&sid=%s&type=tcp%s#%s"
-            % (secret, r["addr"], r["port"], r["pbk"], r["sni"], ep.get("fingerprint", r["fp"]), r["sid"], flow, nm))
+            % (secret, address, r["port"], r["pbk"], r["sni"], ep.get("fingerprint", r["fp"]), r["sid"], flow, nm))
+
+def _ingress_address(value):
+    value = str(value or "").strip()
+    try:
+        return str(ipaddress.ip_address(value))
+    except ValueError:
+        if (len(value) <= 253 and "." in value and not re.fullmatch(r"[0-9.]+", value)
+                and all(re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", part)
+                        for part in value.split("."))):
+            return value.lower()
+    raise ValueError("آدرس ورودی واسط باید IP یا نام دامنهٔ معتبر باشد")
+
+def _normal_ingresses(items):
+    """Relay dial routes share a provisioned backend's keys and authorization."""
+    backends = {ep["tag"] for ep in ENDPOINTS if "reality" in ep}
+    result = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict) or item.get("backend") not in backends:
+            raise ValueError("ورودی REALITY مقصد روی این سرور آماده نیست")
+        label = str(item.get("label", "")).strip()
+        if not 1 <= len(label) <= 64: raise ValueError("نام ورودی باید بین ۱ تا ۶۴ نویسه باشد")
+        try: port, count = int(item.get("port", 0)), int(item.get("count", 0))
+        except (ValueError, TypeError): raise ValueError("پورت یا تعداد ورودی نامعتبر است")
+        if not 1 <= port <= 65535 or count < 0: raise ValueError("پورت یا تعداد ورودی نامعتبر است")
+        result.append({"label": label, "address": _ingress_address(item.get("address")),
+                       "port": port, "backend": item["backend"],
+                       "enabled": item.get("enabled") is True, "count": count})
+    return result
+
+def get_ingresses():
+    try: return _normal_ingresses(json.loads(meta_get("relay_ingresses") or "[]"))
+    except (ValueError, TypeError): return []
+
+def effective_ingresses(token):
+    custom = get_link_override(token)
+    if custom is None: return get_ingresses()
+    try: return _normal_ingresses(custom.get("ingresses", []))
+    except (ValueError, TypeError): return []
 
 def get_ips():
     v = meta_get("clean_ips")
@@ -577,7 +618,7 @@ def _endpoint_defaults(ep):
     return {"tls_ports": list(ep.get("tls_ports", [])),
             "notls_ports": list(ep.get("notls_ports", [])),
             "label": ep.get("label", ep["tag"]), "path": ep.get("path", ""),
-            "host": DOMAIN, "sni": DOMAIN,
+            "host": ep.get("host") or DOMAIN, "sni": ep.get("sni") or ep.get("host") or DOMAIN,
             "fingerprint": ep.get("reality", {}).get("fp", "chrome"), "ech_enabled": False,
             "fragment_fm": "" if "reality" in ep or ep.get("proto") == "vmess" else FRAGMENT_FM}
 
@@ -639,7 +680,8 @@ def set_link_override(token, settings, queue_sync=False, queue_outbound=False):
 
 def global_settings_snapshot():
     return {"recipe": get_recipe(), "ips": get_ips(),
-            "endpoint_settings": get_endpoint_settings(), "outbounds": get_outbounds()}
+            "endpoint_settings": get_endpoint_settings(), "outbounds": get_outbounds(),
+            "ingresses": get_ingresses()}
 
 def store_global_config(settings):
     """Commit all public endpoint settings with a durable reconciliation marker."""
@@ -648,6 +690,7 @@ def store_global_config(settings):
         ("config_recipe", json.dumps(settings["recipe"])),
         ("clean_ips", ",".join(settings["ips"])),
         ("endpoint_settings", json.dumps(_normal_endpoint_settings(settings["endpoint_settings"]), ensure_ascii=False)),
+        ("relay_ingresses", json.dumps(_normal_ingresses(settings.get("ingresses", get_ingresses())), ensure_ascii=False)),
         ("membership_sync_pending", "1"),
     ):
         c.execute("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (key, value))
@@ -690,7 +733,7 @@ def _dial_ep(ep, address):
             return {**ep, **pair}
     return ep
 
-def active_slot_keys(token, recipe=None, settings=None):
+def active_slot_keys(token, recipe=None, settings=None, ingresses=None):
     """The distinct external-port identities emitted by this link's recipe."""
     recipe = effective_recipe(token) if recipe is None else recipe
     settings = effective_endpoint_settings(token) if settings is None else settings
@@ -705,6 +748,13 @@ def active_slot_keys(token, recipe=None, settings=None):
         slots = [(int(ep["reality"]["port"]), "reality")] if "reality" in ep else _ep_slots(ep)
         for port, security in slots[:min(count, len(slots))]:
             active.add((tag, security, int(port)))
+    # The relay's public port is a dial route, not a new backend identity. Editing
+    # it must not rotate the existing direct/relay credentials for this inbound.
+    ep_by_tag = {ep["tag"]: ep for ep in ENDPOINTS}
+    for ingress in effective_ingresses(token) if ingresses is None else ingresses:
+        if ingress.get("enabled") and ingress.get("count", 0) > 0:
+            ep = ep_by_tag[ingress["backend"]]
+            active.add((ep["tag"], "reality", int(ep["reality"]["port"])))
     return active
 
 def _encode_slots(slots):
@@ -1311,6 +1361,16 @@ def write_sub(token, secret, label):
             if ipv4 and (profile_ep.get("host"), profile_ep.get("sni")) != (ep.get("host"), ep.get("sni")):
                 ip_profile = {**profile_ep, "label": ep["label"] + " · " + address}
                 links.append(_ws_link(ip_profile, identity, ipv4[-1], companion_port, companion_sec))
+    ep_by_tag = {ep["tag"]: ep for ep in ENDPOINTS}
+    for ingress in effective_ingresses(token):
+        if not ingress["enabled"] or not ingress["count"]: continue
+        source = ep_by_tag[ingress["backend"]]
+        ep = _configured_ep(source, settings)
+        identity = (ensure_slot_credential(token, source, "reality", int(source["reality"]["port"]))["secret"]
+                    if mode == "slots" or source["tag"] in converted else secret)
+        ep = {**ep, "via_relay": True, "label": ingress["label"],
+              "reality": {**source["reality"], "addr": ingress["address"], "port": ingress["port"]}}
+        links += [_reality_link(ep, identity, k) for k in range(ingress["count"])]
     path = sub_path(token); tmp = path + ".tmp-" + secrets.token_hex(4)
     try:
         with open(tmp, "w") as out:
@@ -2285,6 +2345,26 @@ form.row{margin:0 0 8px}
 .eprow{display:flex;align-items:center;gap:12px;justify-content:space-between;border:1px solid var(--line);border-radius:13px;padding:16px;background:var(--card)}
 .eplabel{display:flex;align-items:center;gap:10px;flex:1;min-width:0;cursor:pointer}
 .eplabel b{font-weight:750}
+.config-nav{display:flex;gap:8px;flex-wrap:wrap;padding:0 0 8px;border-bottom:1px solid var(--line)}
+.config-nav a{display:block;padding:9px 14px;border-radius:9px;background:var(--soft);font-size:13px;font-weight:650;color:var(--ink);text-decoration:none}
+.config-nav a:hover{background:var(--line)}
+.config-section{display:grid;gap:12px;padding:18px 0;scroll-margin-top:20px}
+.config-section h2,.config-section p{margin:0}
+.config-route{border:1px solid var(--line);border-radius:13px;background:var(--card);overflow:hidden}
+.config-route-head{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:16px}
+.config-route-head input[type=number]{width:76px;margin-inline-start:8px}
+.config-route-head .eptag{display:block;font-size:11px;color:var(--mut);margin-top:3px}
+.config-route summary,.config-help summary{padding:12px 16px;cursor:pointer;font-size:13px;font-weight:650;color:var(--mut)}
+.config-route details{border-top:1px solid var(--line)}
+.config-body{padding:16px;border-top:1px solid var(--line);background:var(--soft)}
+.config-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
+.config-grid .field{min-width:0}.config-grid input,.config-grid select{width:100%;max-width:100%}
+.ingress-actions{display:flex;align-items:center;gap:22px;flex-wrap:wrap;margin-top:18px}
+.ingress-actions input[type=number]{width:90px}
+.config-help{border-inline-start:2px solid var(--line)}.config-help p{padding:0 16px 12px}
+.config-save{display:flex;justify-content:flex-end;padding:12px;background:var(--card);border:1px solid var(--line);border-radius:12px}
+.config-add>summary,.config-ob>summary{cursor:pointer;font-size:14px;font-weight:700}.config-ob>summary .eptag{font-family:var(--sans)}
+@media(max-width:620px){.config-route-head{gap:10px;padding:12px;align-items:flex-start}.config-route-head .eplabel{align-items:flex-start}.config-route-head input[type=number]{width:58px}.config-grid{grid-template-columns:1fr}.config-nav a{flex:1;text-align:center;padding:8px}.config-save .btn{width:100%}.config-body{padding:12px}.ingress-actions{gap:14px}}
 .eptag{display:block;font-size:11px;color:var(--mut);font-family:var(--mono);margin-top:2px}
 .hint{font-size:12px;color:var(--mut);font-weight:550;margin:0 0 7px}
 code{display:block;font-family:var(--mono);background:var(--soft);border:1px solid var(--line);border-radius:9px;padding:8px 10px;word-break:break-all;font-size:12px;color:var(--ink);unicode-bidi:plaintext}
@@ -2555,6 +2635,52 @@ def _sync_notice():
         notes.append("تغییر خروجی‌ها هنوز در Xray اعمال نشده است؛ پنل دوباره تلاش می‌کند.")
     return _config_message("خطا: " + " ".join(notes)) if notes else ""
 
+def _render_ingresses(settings, editable):
+    disabled = "" if editable else " disabled"
+    backends = [ep for ep in ENDPOINTS if "reality" in ep]
+    if not backends:
+        return "<section id=ingresses class=config-section><h2>ورودی‌های واسط</h2><p class=hint>برای افزودن واسط، ابتدا یک ورودی REALITY روی این سرور آماده کنید.</p></section>"
+    rows = []
+    items = settings.get("ingresses") or []
+    for i, item in enumerate(items + ([{}] if editable else [])):
+        new = i == len(items)
+        prefix = "new_ingress_" if new else "ingress_%d_" % i
+        options = "".join("<option value='%s'%s>%s</option>" % (
+            _config_html(ep["tag"]), " selected" if ep["tag"] == item.get("backend") else "",
+            _config_html((settings.get("endpoint_settings") or {}).get(ep["tag"], {}).get("label") or ep.get("label", "REALITY"))) for ep in backends)
+        fields = ("<label class=field><span>نام دلخواه</span><input name='%slabel' maxlength=64 value='%s'%s></label>"
+                  "<label class=field><span>آدرس سرور واسط</span><input name='%saddress' value='%s' dir=ltr placeholder='relay.example.com'%s></label>"
+                  "<label class=field><span>پورت اتصال به واسط</span><input type=number name='%sport' value='%s' min=1 max=65535%s></label>"
+                  "<label class=field><span>ورودی REALITY روی سرور فعلی</span><select name='%sbackend'%s>%s</select></label>") % (
+                      prefix, _config_html(item.get("label", "")), disabled,
+                      prefix, _config_html(item.get("address", "")), disabled,
+                      prefix, item.get("port", 443), disabled, prefix, disabled, options)
+        controls = ("<label class=switch><input type=checkbox name='%senabled'%s%s><span class=knob></span>فعال</label>"
+                    "<label class=field><span>تعداد کانفیگ</span><input type=number name='%scount' value='%s' min=0%s></label>") % (
+                        prefix, " checked" if item.get("enabled") else "", disabled, prefix, item.get("count", 0), disabled)
+        if not new and editable:
+            controls += "<label class=hint><input type=checkbox name='%sdelete'> حذف این ورودی</label>" % prefix
+        title = "افزودن ورودی واسط" if new else _config_html(item.get("label", "ورودی واسط"))
+        rows.append("<details class=config-route%s><summary>%s</summary><div class=config-body><div class=config-grid>%s</div><div class=ingress-actions>%s</div></div></details>" % (
+            " open" if item.get("enabled") else "", title, fields, controls))
+    return ("<section id=ingresses class=config-section><input type=hidden name=ingress_fields value=1>"
+            "<h2>ورودی‌های واسط</h2><p class=hint>کاربر با REALITY به سرور واسط وصل می‌شود و ترافیک از آنجا به این سرور می‌رسد. "
+            "آدرس، نام، تعداد و فعال‌سازی هر مسیر را خودتان تعیین می‌کنید.</p>"
+            "<p class=hint>سرور واسط باید از قبل به ورودی REALITY انتخاب‌شده متصل شده باشد.</p>%s</section>") % "".join(rows)
+
+def _parse_ingresses(form, current):
+    if form.get("ingress_fields") != "1": return current.get("ingresses", [])
+    indexes = sorted({int(m.group(1)) for key in form for m in [re.fullmatch(r"ingress_(\d+)_label", key)] if m})
+    prefixes = ["ingress_%d_" % i for i in indexes]
+    if str(form.get("new_ingress_address", "")).strip() or str(form.get("new_ingress_label", "")).strip():
+        prefixes.append("new_ingress_")
+    items = []
+    for prefix in prefixes:
+        if form.get(prefix + "delete"): continue
+        items.append({key: form.get(prefix + key, "") for key in ("label", "address", "port", "backend", "count")} |
+                     {"enabled": prefix + "enabled" in form})
+    return _normal_ingresses(items)
+
 def _render_config_fields(settings, editable=True):
     """The same provisioned endpoint controls for the global and per-link pages."""
     recipe = settings.get("recipe") or {}
@@ -2562,22 +2688,25 @@ def _render_config_fields(settings, editable=True):
     ips = settings.get("ips") or []
     hosts = approved_hosts()
     disabled = "" if editable else " disabled"
-    rows = []
+    rows = []; preserved = []
     for ep in ENDPOINTS:
         tag = ep["tag"]; key = _config_html(tag)
         r = recipe.get(tag) or {}
+        if ep.get("compatibility") and not (r.get("enabled") and r.get("count", 0)):
+            preserved.append("<input type=hidden name='preserve_%s' value=1>" % key)
+            continue
         cfg = endpoint_settings.get(tag) or _endpoint_defaults(ep)
-        name = _config_html(ep.get("label", tag))
+        name = _config_html(cfg.get("label") or ep.get("label", "کانفیگ"))
         is_reality = "reality" in ep
         try: count = max(0, int(r.get("count", 0)))
         except (TypeError, ValueError): count = 0
-        head = ("<div class=row style='justify-content:space-between'>"
+        head = ("<div class=config-route-head>"
                 "<label class=eplabel><input type=checkbox name='en_%s'%s%s>"
-                "<span><b>%s</b><span class=eptag>%s · %s</span></span></label>"
+                "<span><b>%s</b><span class=eptag>%s</span></span></label>"
                 "<label class=hint>تعداد <input type=number name='cnt_%s' value='%d' min=0%s "
                 "aria-label='تعداد %s'></label></div>") % (
                     key, " checked" if r.get("enabled", True) else "", disabled,
-                    name, key, "REALITY مستقیم" if is_reality else _config_html(
+                    name, "REALITY" if is_reality else _config_html(
                         "%s / %s" % (ep.get("proto", ""), ep.get("net", ""))),
                     key, count, disabled, key)
         label = ("<label class=hint for='label_%s'>نام کانفیگ</label>"
@@ -2599,9 +2728,7 @@ def _render_config_fields(settings, editable=True):
                                  key, " checked" if cfg.get("ech_enabled") else "", disabled)
         tls_controls += "</div>"
         if is_reality:
-            ports = "<p class=hint>پورت مستقیمِ آماده‌شده: <span class=n>%s</span></p>" % _config_html(ep.get("port", ""))
-            host = "<p class=hint>Host و SNI کلادفلر برای REALITY کاربرد ندارد.</p>"
-            fragment = "<p class=hint>Fragment برای این کانفیگ کاربرد ندارد.</p>"
+            ports = host = fragment = ""
         else:
             port_items = []
             for field, title in (("tls", "TLS"), ("notls", "بدون TLS")):
@@ -2630,20 +2757,20 @@ def _render_config_fields(settings, editable=True):
                 fragment = ("<label class=hint for='fm_%s'>Fragment JSON (خالی = غیرفعال)</label>"
                             "<textarea id='fm_%s' name='fm_%s' rows=3 dir=ltr%s>%s</textarea>") % (
                                 key, key, key, disabled, _config_html(cfg.get("fragment_fm", "")))
-        rows.append("<div class=eprow style='display:block'><div class=grid>%s%s%s%s%s%s</div></div>" % (
+        rows.append("<div class=config-route>%s<details><summary>تنظیمات اتصال</summary><div class='config-body grid'>%s%s%s%s%s</div></details></div>" % (
             head, label, ports, host, tls_controls, fragment))
-    return ("<input type=hidden name=tls_fields value=1><h2>نوع و تعداد کانفیگ‌ها</h2>"
-            "<p class=hint>فقط پورت‌ها، مسیرها و جفت‌های Host / SNI آماده‌شده روی سرور قابل انتخاب‌اند. "
-            "تعداد سقفی ندارد؛ تعداد بیشتر روی پورت‌ها و آدرس‌های اتصال پخش می‌شود. "
-            "با حذف پورت یا غیرفعال‌کردن پروتکل، کانفیگ قدیمی آن قطع می‌شود و برنامهٔ کاربر باید اشتراک را تازه کند.</p>"
-            "<p class=hint>Fingerprint و Fragment مستقل‌اند. ECH فقط روی TLS اعمال می‌شود و به پشتیبانی دامنه و برنامهٔ به‌روز نیاز دارد؛ "
-            "اگر دریافت کلید ECH یا اتصال مشکل داشت، آن را خاموش کنید. VMess با ECH روشن به فرمت URI ارائه می‌شود.</p>%s"
-            "<h2 style='margin-top:16px'>آدرس‌های اتصال CDN (IP تمیز و دامنه)</h2>"
+    return ("<input type=hidden name=tls_fields value=1>%s"
+            "<nav class=config-nav aria-label='بخش‌های پیکربندی'><a href='#protocols'>کانفیگ‌ها</a><a href='#ingresses'>ورودی‌های واسط</a><a href='#cdn-addresses'>آدرس‌های CDN</a><a href='#outbounds'>خروجی‌ها</a></nav>"
+            "<section id=protocols class=config-section><h2>کانفیگ‌ها</h2>"
+            "<p class=hint>فعال‌سازی و تعداد را اینجا تنظیم کنید؛ جزئیات اتصال داخل هر کارت است.</p>%s"
+            "<details class=config-help><summary>راهنمای تنظیمات اتصال</summary><p class=hint>پورت و Host/SNI باید روی سرور آماده باشند. "
+            "حذف پورت یا خاموش‌کردن پروتکل، اتصال‌های قبلی آن را لغو می‌کند. Fingerprint و Fragment مستقل‌اند؛ ECH فقط برای TLS است و به دامنه و برنامهٔ سازگار نیاز دارد.</p></details></section>%s"
+            "<section id=cdn-addresses class=config-section><h2>آدرس‌های اتصال CDN</h2>"
             "<p class=hint>IPها و دامنه‌ها را با هم وارد کنید. کانفیگ‌های IP فعلی حفظ می‌شوند. برای هر دامنهٔ "
             "آماده‌شده، یک کانفیگ دامنه‌ای و یک کانفیگ با آخرین IP فهرست و Host/SNI همان دامنه "
             "به هر نوع اتصال فعال اضافه می‌شود.</p>"
-            "<textarea name=ips rows=4 dir=ltr placeholder='cdn.example.com, 104.16.96.1'%s>%s</textarea>") % (
-                "".join(rows), disabled, _config_html("\n".join(ips)))
+            "<textarea name=ips rows=4 dir=ltr placeholder='cdn.example.com, 104.16.96.1'%s>%s</textarea></section>") % (
+                "".join(preserved), "".join(rows), _render_ingresses(settings, editable), disabled, _config_html("\n".join(ips)))
 
 def _render_link_outbounds(obs, editable):
     rows = []
@@ -2680,14 +2807,14 @@ def _render_link_outbounds(obs, editable):
                     "</div></div>")
     elif not rows:
         rows.append("<p class=hint>خروجی‌ای تعریف نشده؛ ترافیک مستقیم می‌رود.</p>")
-    return "<h2 style='margin-top:16px'>خروجی‌ها و دامنه‌ها</h2>%s" % "".join(rows)
+    return "<section id=outbounds class=config-section><h2>خروجی‌ها و دامنه‌ها</h2>%s</section>" % "".join(rows)
 
 def render_config(csrf, msg=""):
     fields = _render_config_fields(global_settings_snapshot())
     body = ("<form method=post action='/a/config' class=grid>%s"
             "<input type=hidden name=endpoint_fields value=1>"
             "<input type=hidden name=csrf value='%s'>"
-            "<button class=btn style='margin-top:12px'>%s ذخیره و بازتولید همهٔ لینک‌های پیش‌فرض</button>"
+            "<div class=config-save><button class=btn>%s ذخیرهٔ پیکربندی عمومی</button></div>"
             "</form>") % (fields, _config_html(csrf), _icon("check"))
     return _page("پیکربندی", _top(_back("/a/", "داشبورد"), csrf) +
                  _page_heading("پیکربندی عمومی", "تغییرات این صفحه برای لینک‌های پیش‌فرض اعمال می‌شود.") +
@@ -2723,7 +2850,7 @@ def render_user_config(token, csrf, msg=""):
                 "<input type=hidden name=csrf value='%s'>"
                 "<input type=hidden name=endpoint_fields value=1>"
                 "<input type=hidden name=outbound_fields value=1>%s%s"
-                "<button class=btn name=action value=save>ذخیره و بازتولید این لینک</button>"
+                "<div class=config-save><button class=btn name=action value=save>ذخیرهٔ پیکربندی این لینک</button></div>"
                 "</form>") % (token_attr, _config_html(csrf), fields, outbounds)
         reset = ("<form method=post action='/a/user-config' style='margin-top:14px'>"
                  "<input type=hidden name=token value='%s'>"
@@ -2784,10 +2911,9 @@ def _ob_card(i, o, csrf):
     res = meta_get("ob_test_" + o["tag"], "")
     tag = html.escape(o["tag"])
     return (
-        "<div class=card>"
-        "<div class=row style='justify-content:space-between;align-items:center'>"
-        "<b>%s</b><span class=eptag>%s · تست: 127.0.0.1:%d</span></div>"
-        "<p class=hint dir=ltr style='word-break:break-all;text-align:left'>%s</p>"
+        "<details class='card config-ob'>"
+        "<summary><b>%s</b><span class=eptag>%s · %s</span></summary><div class=grid style='margin-top:16px'>"
+        "<details><summary class=hint>نمایش لینک اتصال</summary><p class=hint dir=ltr style='word-break:break-all;text-align:left'>%s</p></details>"
         "<span class='pill oball' id='all-%s' style='display:none'></span>"
         "<label class=hint style='margin-top:8px'>دامنه‌هایی که از این خروجی بروند "
         "(هر خط یکی) — <b>خالی بگذارید تا همهٔ ترافیک از اینجا برود</b>:</label>"
@@ -2800,8 +2926,8 @@ def _ob_card(i, o, csrf):
         "<button type=submit class='btn ghost'>%s تست این خروجی</button></form>"
         "<form data-act=del method=post action='/a/obdel' style='margin:0'>"
         "<input type=hidden name=csrf value='%s'><input type=hidden name=tag value='%s'>"
-        "<button type=submit class='btn ghost'>حذف</button></form></div></div>"
-    ) % (tag, html.escape(kind), ob_test_port(i), html.escape(o["link"]), tag,
+        "<button type=submit class='btn ghost'>حذف</button></form></div></div></details>"
+    ) % (tag, html.escape(kind), "همهٔ ترافیک" if not o.get("domains") else "دامنه‌های انتخاب‌شده", html.escape(o["link"]), tag,
          tag, tag, html.escape("\n".join(o.get("domains") or [])),
          tag, ("" if res else " style='display:none'"), html.escape(res),
          csrf, tag, _icon("search"), csrf, tag)
@@ -2816,7 +2942,7 @@ def render_ob_list(csrf):
 
 def _render_outbounds_section(csrf):
     obs = get_outbounds()
-    add = ("<div class=card><h2>افزودن خروجی</h2>"
+    add = ("<details class='card config-add'><summary>افزودن خروجی</summary><div class=grid style='margin-top:16px'>"
            "<p class=hint>لینک را همان‌طور که هست بچسبانید: "
            "<code>vless://</code> · <code>trojan://</code> · <code>ss://</code> · "
            "<code>socks://user:pass@host:port</code> · <code>http://…</code></p>"
@@ -2824,15 +2950,13 @@ def _render_outbounds_section(csrf):
            "<input name=tag placeholder='یک نام کوتاه، مثلاً clean-ai' maxlength=24 required>"
            "<textarea name=link rows=3 placeholder='vless://…  یا  socks://user:pass@1.2.3.4:1080' required></textarea>"
            "<input type=hidden name=csrf value='%s'>"
-           "<button type=submit class=btn style='margin-top:10px'>%s افزودن</button></form></div>") % (csrf, _icon("plus"))
+           "<button type=submit class=btn style='margin-top:10px'>%s افزودن</button></form></div></details>") % (csrf, _icon("plus"))
 
     save = ("<div id=obsavewrap%s>"
             "<form data-act=save method=post action='/a/obsave' id=obform>"
             "<input type=hidden name=csrf value='%s'>"
             "<button type=submit id=obsavebtn class=btn style='width:100%%'>ذخیره و اعمال روی Xray</button></form>"
-            "<p class=hint style='margin-top:8px'>اعمال، کانفیگ را با <code>xray -test</code> اعتبارسنجی می‌کند؛ "
-            "اگر خراب باشد چیزی تغییر نمی‌کند. بعد xray ری‌استارت می‌شود و کاربران خودکار resync می‌شوند "
-            "(لینک کسی عوض نمی‌شود).</p></div>") % (("" if obs else " style='display:none'"), csrf)
+            "<p class=hint style='margin-top:8px'>اعمال خروجی‌ها ممکن است اتصال‌ها را موقتاً قطع کند؛ آدرس اشتراک کاربران حفظ می‌شود.</p></div>") % (("" if obs else " style='display:none'"), csrf)
 
     body = ("<section id=outbounds><div id=obmsg class='card obmsg' style='display:none'></div>" +
             _page_heading("خروجی‌ها", "مسیر خروج ترافیک از سرور را مدیریت کنید.") + add +
@@ -2876,6 +3000,9 @@ def _parse_config_fields(form, current):
     recipe = {}
     for ep in ENDPOINTS:
         tag = ep["tag"]
+        if ep.get("compatibility") and form.get("preserve_" + tag) == "1":
+            recipe[tag] = current.get("recipe", {}).get(tag, {"enabled": False, "count": 0})
+            continue
         try: count = int(form.get("cnt_" + tag, "0"))
         except (TypeError, ValueError): raise ValueError("تعداد کانفیگ «%s» نامعتبر است" % tag)
         if count < 0: raise ValueError("تعداد کانفیگ نمی‌تواند منفی باشد")
@@ -2888,6 +3015,9 @@ def _parse_config_fields(form, current):
         hosts = approved_hosts()
         for ep in ENDPOINTS:
             tag = ep["tag"]; base = _endpoint_defaults(ep)
+            if ep.get("compatibility") and form.get("preserve_" + tag) == "1":
+                options[tag] = current["endpoint_settings"].get(tag, base)
+                continue
             # Older open forms have no TLS marker: preserve their stored TLS
             # options; new forms can explicitly turn an unchecked ECH off.
             previous = _normal_endpoint_settings(current["endpoint_settings"])[tag]
@@ -2917,7 +3047,8 @@ def _parse_config_fields(form, current):
                 "notls_ports": [p for p in ep.get("notls_ports", []) if ("notls_%s_%s" % (tag, p)) in form],
                 "label": label, "host": hosts[host_index]["host"], "sni": hosts[host_index]["sni"],
                 "fragment_fm": fragment}
-    return {"recipe": recipe, "ips": ips, "endpoint_settings": _normal_endpoint_settings(options)}
+    return {"recipe": recipe, "ips": ips, "endpoint_settings": _normal_endpoint_settings(options),
+            "ingresses": _parse_ingresses(form, current)}
 
 def _parse_custom_outbounds(form, previous):
     if form.get("outbound_fields") != "1": return previous

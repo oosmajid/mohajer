@@ -48,15 +48,16 @@ framework, no DB server. Everything is configured through one env file (`bot.env
 
 ## 3. Production servers (verified 2026-10-01)
 
-There are **five active Mohajer instances**. Keep this inventory when planning
-changes or deployments; each has its own users, `bot.env`, Xray, and cloudflared.
-All five running bot/sub files were verified after the 2026-10-01 UI deployment.
+There are **four active Mohajer panels**. CDN3 users were merged into CDN2 on
+2026-10-01 (50 total links). CDN3 now runs only a relay for this service; its
+panel and proxy units were retired into a root-only recoverable backup. Other
+applications on CDN3, including nginx and SSH, must remain intact.
 
 | Public hostname | SSH target | Bot/env/DB | Bot/sub services |
 |-----------------|------------|------------|------------------|
 | `cdn.delplayer.ir` | `delplayer` (`root@23.94.29.30:49531`) | `/opt/dpbot/{bot.py,bot.env,dpbot.db}` | `dpbot` / `dpsub` (`/opt/dpsub`) |
 | `cdn2.delplayer.ir` | `ubuntu@130.185.122.107` (sudo) | `/opt/mohajer/{bot/bot.py,bot.env,dpbot.db}` | `mohajer-bot` / `mohajer-sub` |
-| `cdn3.delplayer.ir` | `ubuntu@130.185.121.65` (sudo) | `/opt/mohajer/{bot/bot.py,bot.env,dpbot.db}` | `mohajer-bot` / `mohajer-sub` |
+| `cdn3.delplayer.ir` | `ubuntu@130.185.121.65` (sudo) | Users/subscriptions served by CDN2 | `mohajer-relay` only; no panel |
 | `cdn4.delplayer.ir` | `root@149.112.84.49:40273` | `/opt/mohajer/{bot/bot.py,bot.env,dpbot.db}` | `mohajer-bot` / `mohajer-sub` |
 | `cdn5.delplayer.ir` | `root@23.94.29.30:50035` | `/opt/mohajer/{bot/bot.py,bot.env,dpbot.db}` | `mohajer-bot` / `mohajer-sub` |
 
@@ -67,14 +68,48 @@ SSH from the operator's laptop may require SOCKS5 `127.0.0.1:10808`:
 `-o "ProxyCommand=nc -x 127.0.0.1:10808 -X 5 %h %p"`.
 Verify host keys; cdn4 uses port **40273**, not the default port 22.
 `cdn.delplayer.ir` is a 512 MB VPS; avoid spawning extra Xray processes there.
-All five servers have parallel old `cdn[2-5].delplayer.ir` and new
+All original public hostnames retain parallel old `cdn[2-5].delplayer.ir` and new
 `cdn[2-5].windertop.cfd` Cloudflare Tunnel routes, with the old hostname retained
 as `DOMAIN` and `SUB_BASE_URL`. (For the first box the hostname is `cdn`.)
-`HOST_PROFILES` permits the matching new hostname on each bot. cdn, cdn2 and
-cdn3 have REALITY provisioned, while cdn4 and cdn5 do not.
+`HOST_PROFILES` permits the matching new hostname on each bot. CDN2 also has
+the imported CDN3 Host/SNI pairs and inbounds. cdn and cdn2 have REALITY
+provisioned; cdn4/cdn5 do not. CDN3 forwards native REALITY to CDN2.
 On all five hosts, the active `xray.service` reads
 `/usr/local/etc/xray/config.json` (verified 2026-09-29). Always recheck
 `bot.env` and the unit's `ExecStart` before a future deployment.
+
+### Consolidated CDN3 and configurable relay ingress
+
+- Old `cdn3.delplayer.ir/sub-u-<token>` URLs remain unchanged. Imported users have
+  `meta.sub_base_<token>` and complete custom snapshots; `sub_url()` honors the
+  per-link base. Never replace the old hostname or automatically add relay
+  configs for all users.
+- CDN2 runs `cloudflared-cdn3.service` alongside its original connector, using the
+  same old tunnel and hostnames; imported paths terminate on ports 10200–10203.
+  Imported REALITY terminates on loopback 10443 with its original keys.
+- CDN3 `mohajer-relay.service` forwards public TCP 8443 over a pinned, restricted
+  SSH connection to CDN2 loopback 10443. Its target key only permits that forward.
+  Source IP/name belong to deployment settings, never product code constants.
+- `/a/config` and custom `/a/user-config` contain generic **relay ingresses**:
+  label, address (IP or DNS), external port, prepared REALITY backend, on/off,
+  and uncapped count. Multiple relays may share one backend. Public state is
+  `meta.relay_ingresses`; custom snapshots use `ingresses`. Old custom snapshots
+  without this key inherit no new routes. Default is off/count 0.
+- Relay routes add authorization for the selected backend even when its ordinary
+  profile is off. Backend identity uses the original REALITY port, not the relay
+  external port; editing the dial address/port must not rotate credentials.
+  Removing the final emitted route revokes that backend identity normally.
+- The form configures client dial routes; another server must already forward
+  to the selected backend. Entering an address alone does not provision a server.
+- Imported endpoints use an environment `compatibility: true` flag. Unused ones
+  are hidden in the form and preserved on save; active historical custom profiles
+  remain editable. Internal Xray tags are never displayed as card captions.
+- Source backup: `/var/backups/mohajer-relay-20261001-144949/retired-panel`.
+  Target pre-migration and before-relay backups:
+  `/var/backups/mohajer-relay-20261001-144950`; correction backup:
+  `/var/backups/mohajer-ingress-20261001-155029`.
+- Xray on CDN2 runs as `nobody`. Its active config must remain readable by that
+  user (root:nogroup 0640); validate as the service user before declaring boot safe.
 
 ## 4. Golden rules / constraints (do NOT relearn these the hard way)
 
@@ -129,7 +164,7 @@ On all five hosts, the active `xray.service` reads
   regenerates every sub. `get_recipe()`/`set_recipe()` live next to `get_ips()`.
 - **Per-link settings:** `/a/user-config?token=<token>` selects the public default
   or stores a full settings snapshot in `users.config_override`. A custom link has
-  its own recipe, clean IP list, prepared endpoint options, and outbound routing;
+  its own recipe, clean IP list, prepared endpoint options, relay ingress routes, and outbound routing;
   it shows an `اختصاصی` badge in the dashboard. Switching back to default deletes
   the snapshot, so later global changes apply again. Port and protocol removals
   revoke old Xray credentials; older links migrate the affected endpoint to slot
@@ -231,7 +266,7 @@ slot_mode_tags(token, tag)         -- legacy endpoints migrated to per-port cred
 legacy_emails(token, tag, email)   -- rotated stats identity after freeze/disable
 usage_ledger(email, token, last_raw, total_bytes)
 meta(k TEXT PRIMARY KEY, v TEXT)   -- includes clean_ips, config_recipe,
-                                   -- endpoint_settings, outbounds, xray_pid,
+                                   -- endpoint_settings, relay_ingresses, outbounds, xray_pid,
                                    -- membership_sync_pending, outbound_sync_pending
 ```
 

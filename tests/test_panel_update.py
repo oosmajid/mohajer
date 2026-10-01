@@ -60,7 +60,8 @@ class TestRealityEndpoint(DbCase):
     def test_config_page_lists_reality(self):
         page = bot.render_config("csrf")
         self.assertIn("cnt_vless-reality", page)
-        self.assertIn("پورت مستقیمِ آماده‌شده", page)
+        self.assertIn("ورودی‌های واسط", page)
+        self.assertNotIn("پورت مستقیمِ آماده‌شده", page)
         self.assertNotIn("مسیر ثابتِ آماده‌شده برای این endpoint", page)
         self.assertIn('id=outbounds', page)
         self.assertIn('id=obform', page)
