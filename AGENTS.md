@@ -74,7 +74,7 @@ as `DOMAIN` and `SUB_BASE_URL`. (For the first box the hostname is `cdn`.)
 `HOST_PROFILES` permits the matching new hostname on each bot. CDN2 also has
 the imported CDN3 Host/SNI pairs and inbounds. cdn and cdn2 have REALITY
 provisioned; cdn4/cdn5 do not. CDN3 forwards native REALITY to CDN2.
-On all five hosts, the active `xray.service` reads
+On all four panel hosts, the active `xray.service` reads
 `/usr/local/etc/xray/config.json` (verified 2026-09-29). Always recheck
 `bot.env` and the unit's `ExecStart` before a future deployment.
 
@@ -208,8 +208,11 @@ On all five hosts, the active `xray.service` reads
   every action posts `ajax=1` and gets JSON back (`ok/msg/list`), so nothing reloads;
   the same routes still answer with redirects when JS is off.
 - **Subscriber page extras:** `subserver.py` shows the customer's saved link label as
-  the heading (escaped for HTML), then a quick-connect card: a Happ deep-link
-  button (`happ://add/<sub url>`), Happ downloads (`HAPP_APPS`, GitHub
+  the heading (escaped for HTML), then a quick-connect card: Happ and v2rayNG import
+  buttons. Happ uses `happ://add/<sub url>`; v2rayNG uses
+  `v2rayng://install-config?url=<encoded sub url>#<encoded label>`. Both derive
+  the URL from the opened page, preserving old CDN3 links. Buttons share SVG
+  icons and stack on mobile. Happ downloads (`HAPP_APPS`, GitHub
   `releases/latest/download/...` so they never go stale; iOS = App Store) and a QR of the
   sub URL. The QR encoder is vendored (`sub/qrcode.js`, qrcode-generator 2.0.4, MIT) and
   served at `/sub-qr.js` — keep it next to `subserver.py` when deploying (the tunnel only

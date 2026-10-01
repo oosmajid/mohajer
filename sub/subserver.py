@@ -29,6 +29,8 @@ HAPP_APPS = [
     ("مک", "https://github.com/Happ-proxy/happ-desktop/releases/latest/download/Happ.macOS.universal.dmg"),
 ]
 HAPP_ADD = "happ://add/"   # Happ deep link: happ://add/<subscription url>
+# v2rayNG UrlSchemeActivity accepts an encoded subscription URL in `url`.
+V2RAYNG_ADD = "v2rayng://install-config?url="
 GB = 1024 ** 3
 
 def user_info(name):
@@ -220,6 +222,9 @@ p{margin:0}
 .btn{display:flex;align-items:center;justify-content:center;gap:8px;border:1px solid transparent;border-radius:11px;padding:11px 16px;background:var(--accent);color:var(--accent-text);text-decoration:none;text-align:center}
 .btn:hover,button:hover{transform:translateY(-1px)}
 .btn:active,button:active{transform:translateY(1px)}
+.quick-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}
+.quick-actions .btn{min-width:0}
+.btn.secondary{background:var(--soft);border-color:var(--line);color:var(--ink)}
 .apps{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin:16px 0 8px}
 .apps a{display:block;text-align:center;text-decoration:none;font-weight:700;font-size:12px;color:var(--ink);background:var(--soft);border:1px solid var(--line);border-radius:10px;padding:10px 4px}
 .apps a:hover{color:var(--accent);border-color:var(--accent)}
@@ -238,7 +243,7 @@ p{margin:0}
 .copy{display:inline-flex;align-items:center;gap:6px;flex:0 0 auto;background:var(--soft);color:var(--accent);border:1px solid var(--line);border-radius:9px;padding:7px 10px}
 .foot{color:var(--mut);font-size:12px;text-align:center;margin-top:20px}
 #buf{position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;border:0;padding:0}
-@media(max-width:440px){body{padding:16px 12px 34px}.panel{padding:17px}.apps{grid-template-columns:repeat(2,1fr)}.qrbox{gap:11px}.qr svg{width:98px;height:98px}}
+@media(max-width:440px){body{padding:16px 12px 34px}.panel{padding:17px}.quick-actions{grid-template-columns:1fr}.apps{grid-template-columns:repeat(2,1fr)}.qrbox{gap:11px}.qr svg{width:98px;height:98px}}
  </style></head><body>
 <svg xmlns="http://www.w3.org/2000/svg" class="icon-sprite" aria-hidden="true">
 <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.1 0l3-3A5 5 0 0 0 13 3l-2 2M14 11a5 5 0 0 0-7.1 0l-3 3A5 5 0 0 0 11 21l2-2"/></symbol>
@@ -253,8 +258,11 @@ p{margin:0}
 <h1>%TITLE%</h1><p class="intro">کانفیگ‌ها و وضعیت اشتراک را از این صفحه ببینید.</p>
 %STATS%
 <div class="panel quick">
-<div class="quickhead"><svg class="icon"><use href="#i-link"/></svg><div><h2>اتصال سریع با Happ</h2><p class="hint2">ابتدا برنامه را نصب کنید، سپس اشتراک را مستقیم به آن اضافه کنید.</p></div></div>
+<div class="quickhead"><svg class="icon"><use href="#i-link"/></svg><div><h2>افزودن اشتراک به برنامه</h2><p class="hint2">ابتدا برنامه را نصب کنید، سپس دکمهٔ همان برنامه را بزنید. v2rayNG برای اندروید است.</p></div></div>
+<div class="quick-actions">
 <a class="btn" id="happadd" href="#"><svg class="icon"><use href="#i-plus"/></svg>افزودن خودکار به Happ</a>
+<a class="btn secondary" id="v2rayngadd" href="#"><svg class="icon"><use href="#i-plus"/></svg>افزودن خودکار به <span dir="ltr">v2rayNG</span></a>
+</div>
 <div class="apps">%APPS%</div>
 <div class="qrbox"><div class="qr" id="qr"></div><p>برای افزودن اشتراک روی دستگاه دیگر، این کد را با Happ یا v2rayNG اسکن کنید.</p></div>
 </div>
@@ -272,6 +280,7 @@ p{margin:0}
 var CFG=%CONFIGS%;
 var SUBURL=location.origin+location.pathname;
 (function(){var a=document.getElementById('happadd');if(a)a.href='%HAPPADD%'+SUBURL;
+var ng=document.getElementById('v2rayngadd');if(ng)ng.href='%V2RAYNGADD%'+encodeURIComponent(SUBURL)+'#'+encodeURIComponent(document.querySelector('h1').textContent);
 try{var q=qrcode(0,'M');q.addData(SUBURL);q.make();document.getElementById('qr').innerHTML=q.createSvgTag({cellSize:5,margin:2,scalable:true});}catch(e){}})();
 function flash(b){if(!b)return;var o=b.innerHTML;b.textContent='کپی شد';b.classList.add('ok');setTimeout(function(){b.innerHTML=o;b.classList.remove('ok')},1100);}
 function fb(t,b){var x=document.getElementById('buf');x.value=t;x.focus();x.setSelectionRange(0,t.length);try{document.execCommand('copy')}catch(e){}window.getSelection&&window.getSelection().removeAllRanges();flash(b);}
@@ -313,6 +322,7 @@ def build_response(name, b64, info, ua, wants_raw):
                 .replace("%APPS%", "".join('<a href="%s" target="_blank" rel="noopener">%s</a>' % (html.escape(u), html.escape(n))
                                            for n, u in HAPP_APPS))
                 .replace("%HAPPADD%", HAPP_ADD)
+                .replace("%V2RAYNGADD%", V2RAYNG_ADD)
                 .replace("%CONFIGS%", json.dumps(links).replace("</", "<\\/")))
     return 200, "text/html; charset=utf-8", page.encode("utf-8"), {}
 
