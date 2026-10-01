@@ -58,7 +58,7 @@ BOT_TOKEN="$(ask "Telegram bot token (@BotFather)")"
 [ -n "$BOT_TOKEN" ] || die "bot token is required"
 ADMIN_IDS="$(ask "Your numeric admin id(s), comma-separated (@userinfobot)")"
 [ -n "$ADMIN_IDS" ] || die "admin id is required"
-CLEAN_IPS="$(ask "Default clean Cloudflare IPs (comma-separated)" "104.16.96.1,104.21.96.1,104.19.96.1")"
+CLEAN_IPS="$(ask "CDN dial addresses (hostname or IPv4, comma-separated)" "$DOMAIN")"
 TUNNEL_NAME="$(ask "Cloudflare tunnel name" "mohajer")"
 
 # ---------- 2. source of truth: endpoints ----------

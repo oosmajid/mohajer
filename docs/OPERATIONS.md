@@ -11,7 +11,7 @@ Production server: `ssh -p 49531 root@23.94.29.30` (512MB RAM). Live unit names 
 | Restart bot | `systemctl restart dpbot` (safe; users unaffected) |
 | Restart xray | `systemctl restart xray` (users auto-resync on next poll) |
 | List links | bot → 📋 لیست لینک‌ها, or `sqlite3 /opt/dpbot/dpbot.db "SELECT label,used_bytes,max(used_bytes-usage_reset_bytes,0) AS current_used,limit_bytes,expiry_ts FROM users"` |
-| Change clean IPs | bot → 🌐 آی‌پی‌های تمیز → ✏️ ویرایش (live, no restart) |
+| Change CDN dial addresses | bot → 🌐 آدرس‌های CDN → ✏️ ویرایش (live, no restart) |
 | Find fast IPs | run `scripts/cf-clean-ip-scan.sh cdn.delplayer.ir` from a client network |
 | Memory check | `free -m` (watch for low "available") |
 | Bot RSS | `ps -o rss= -C python3` (≈25MB, flat — audited, no leak) |
@@ -20,7 +20,7 @@ Production server: `ssh -p 49531 root@23.94.29.30` (512MB RAM). Live unit names 
 1. From the operator's laptop on the target ISP (NO proxy):
    `bash scripts/cf-clean-ip-scan.sh cdn.delplayer.ir`
 2. Take the top 3 IPs (ranked by TLS-handshake time).
-3. Bot → 🌐 آی‌پی‌های تمیز → ✏️ → paste `ip1, ip2, ip3`.
+3. Bot → 🌐 آدرس‌های CDN → ✏️ → paste a working Cloudflare hostname or clean IPv4 addresses.
 4. All links rewrite instantly; customers press **Update** in their client.
 
 ## ⚠️ Memory pressure / SSH "banner exchange timeout"

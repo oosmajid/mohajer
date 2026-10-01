@@ -51,19 +51,21 @@
 `create_user(vol_gb, dur_days, label)`:
 1. `token = secrets.token_hex(8)`, `secret = uuid4()`.
 2. `xr_add_user` → `adu` to every endpoint inbound (email `u_<token>.<tag>`).
-3. `write_sub` → base64 file of one config per endpoint × TLS/no-TLS port, IPs
-   round-robined from `get_ips()`.
+3. `write_sub` → base64 file of one config per endpoint × TLS/no-TLS port, CDN
+   dial addresses (hostname or IPv4) round-robined from `get_ips()`.
 4. Insert the `users` row.
 
 ### Mint configs (`write_sub` → `_ws_link`)
 For each endpoint: for each `tls_ports` emit a TLS config, for each `notls_ports` emit a
 no-TLS config. `_ws_link` builds protocol-correct URIs:
-- vless: `vless://<uuid>@<ip>:<port>?encryption=none&security=<tls|none>&type=<ws|xhttp>&host=<DOMAIN>[&sni=<DOMAIN>]&path=<path>[&mode=auto]#<label>`
-- trojan: `trojan://<password>@<ip>:<port>?security=…&type=ws&host=<DOMAIN>&path=<path>#<label>`
-- vmess: base64 of the standard vmess JSON (`add=<ip>`, `host/sni=<DOMAIN>`, `tls` on/off).
+- vless: `vless://<uuid>@<address>:<port>?encryption=none&security=<tls|none>&type=<ws|xhttp>&host=<DOMAIN>[&sni=<DOMAIN>]&path=<path>[&mode=auto]#<label>`
+- trojan: `trojan://<password>@<address>:<port>?security=…&type=ws&host=<DOMAIN>&path=<path>#<label>`
+- vmess: base64 of the standard vmess JSON (`add=<address>`, `host/sni=<DOMAIN>`, `tls` on/off).
 
-The host the client dials is the **clean IP**; the real hostname is carried in
-`host=`/`sni=` so Cloudflare routes correctly.
+The client dials either a **Cloudflare-proxied hostname** (DNS picks the edge IP)
+or a manually selected edge IPv4 address. `host=`/`sni=` carry the provisioned
+hostname for Cloudflare routing and TLS. A working hostname must be configured
+before switching a live subscription from IPs; a filtered domain will fail.
 
 ### Usage accounting (counter-reset safe)
 xray exposes cumulative `user>>>u_<token>.<tag>>>>traffic>{up,down}link`. The bot sums
@@ -76,10 +78,12 @@ A manual usage reset never changes that lifetime value. It stores the current
 use `max(used_bytes - usage_reset_bytes, 0)`. Dashboard totals and daily history
 continue to use the lifetime counters.
 
-### Live clean-IP swap
-`set_ips()` writes `meta.clean_ips`; `regenerate_all_subs()` rewrites every sub file
-with the new IPs. The xray side is untouched (configs only differ by host IP), so no
-restart and customers' links stay valid — they just `Update` in their client.
+### Live CDN-address swap
+`set_ips()` writes the legacy `meta.clean_ips` field; it now accepts hostnames or
+IPv4 addresses. `regenerate_all_subs()` rewrites every sub file with the new dial
+addresses. The xray side is untouched, so no restart and customers' links stay valid
+after they update in their client. DNS resolution does not guarantee that the
+returned Cloudflare IP is reachable on every ISP.
 
 ## Why these choices
 - **stdlib only** → trivial to run on a tiny box, no dependency rot, easy to audit.

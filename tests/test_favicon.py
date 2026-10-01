@@ -5,13 +5,13 @@ import bot  # noqa: E402
 
 
 class FaviconTests(unittest.TestCase):
-    def test_page_has_yellow_square_favicon(self):
+    def test_page_has_blue_signal_favicon(self):
         h = bot._page("t", "<div>x</div>")
         self.assertIn('rel=icon', h)
         self.assertIn('data:image/svg+xml', h)
-        # brutalism yellow fill + ink border; '#' must survive %-formatting as %23 (not %%23)
-        self.assertIn('%23FFDD2D', h)
-        self.assertIn('%23111', h)
+        # Blue signal mark; '#' must survive %-formatting as %23 (not %%23).
+        self.assertIn('%23256BD1', h)
+        self.assertIn('%23fff', h)
         self.assertNotIn('%%23', h)   # regression guard: the %-escape leaked
 
 

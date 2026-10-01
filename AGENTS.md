@@ -37,9 +37,10 @@ framework, no DB server. Everything is configured through one env file (`bot.env
    external port slot has its own UUID/password, so removing that port invalidates
    its old imported URI. If multiple emitted configs share a slot and differ only
    by clean IP, they share that slot credential.
-3. Clients connect to **clean Cloudflare edge IPs** (the link's host is the IP; the
-   real hostname rides in SNI/`host=`). The bot can rewrite the IPs of every link at
-   once from the "🌐 آی‌پی‌های تمیز" panel without changing anyone's link.
+3. Clients connect to a **Cloudflare-proxied hostname or clean edge IPv4 address**
+   (the link's dial address; the provisioned hostname rides in SNI/`host=`).
+   The bot can rewrite these addresses from "🌐 آدرس‌های CDN" without changing
+   anyone's subscription URL. Existing installs keep saved IPs until changed.
 4. Quota/expiry are enforced by the **enforcer thread**, not by xray. xray just
    counts bytes; the bot reads the counters and deletes the user when over limit.
 
@@ -106,10 +107,12 @@ On all five hosts, the active `xray.service` reads
   matching inbound to `xray.config.json` AND the ingress rule in cloudflared. Restart
   xray + cloudflared; the enforcer re-syncs users. `write_sub` auto-emits a config per
   TLS/no-TLS port.
-- **Change clean IPs:** use the bot panel or the web panel's `/a/config` page
-  (both live, no restart) or set `IPS=` in `bot.env` as the default. Stored override
-  lives in `meta.clean_ips`. Use `scripts/cf-clean-ip-scan.sh <host>` from a client
-  network to pick them.
+- **Change CDN dial addresses:** use the bot panel or the web panel's `/a/config`
+  page (both live, no restart) or set `IPS=` in `bot.env` as the default. Entries
+  can be a Cloudflare-proxied hostname or IPv4. Stored override lives in the
+  legacy `meta.clean_ips` key. Use `scripts/cf-clean-ip-scan.sh <host>` only for
+  manually pinned IPv4 addresses. Do not switch a live subscription to a filtered
+  hostname; provision and test the new hostname and matching Host/SNI first.
 - **Config recipe (types & counts):** the web panel's `/a/config` page (stored in
   `meta.config_recipe` JSON) sets, per endpoint, `enabled` + `count` = how many
   configs of that type to emit. Default (no override) = one per TLS/no-TLS port, i.e.
@@ -160,10 +163,9 @@ On all five hosts, the active `xray.service` reads
   page (`subserver.py` `PAGE`) ship an icon-only toggle (🌙/☀️) at the top. Themes are
   driven by `data-theme` on `<html>`; an early head script sets it from `localStorage`
   (`mj-theme`), falling back to the OS `prefers-color-scheme` (no FOUC). The dark palette
-  is a `:root[data-theme=dark]{…}` override of the same tokens. Always-yellow surfaces
-  (`.hero`, primary `.btn`/`button`) pin dark ink so they stay high-contrast in dark, and
-  charts use `currentColor` so bars follow the theme. Never hardcode `#111111` on a
-  themeable surface — use `var(--ink)`.
+  is a `:root[data-theme=dark]{…}` override of the same tokens. The admin panel uses
+  blue action and chart tokens; the subscriber page retains its yellow theme. Charts
+  use `currentColor` so bars follow the theme. Use palette tokens on themeable surfaces.
 - **Edit bot logic:** it's one file, stdlib only. After editing, copy to the server
   path (see table) and `systemctl restart dpbot` (live) / `mohajer-bot` (fresh).
 - **Inspect state:** `sqlite3 <db> "SELECT label,used_bytes,max(used_bytes-usage_reset_bytes,0) AS current_used,limit_bytes,expiry_ts FROM users"`.

@@ -1,4 +1,4 @@
-import os, sys, base64, tempfile, unittest
+import os, sys, base64, json, tempfile, unittest, urllib.parse
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bot"))
 os.environ.setdefault("DPBOT_ENV", "/nonexistent-dpbot-env")
 import bot  # noqa: E402
@@ -48,6 +48,22 @@ class TestRecipeModel(RecipeBase):
 
 
 class TestWriteSubHonorsRecipe(RecipeBase):
+    def test_dns_address_preserves_host_sni_and_ipv4_fallback(self):
+        addresses = bot.parse_ips("CDN.Example.ir, 104.16.96.1, bad/name, 999.999.999.999")
+        self.assertEqual(addresses, ["cdn.example.ir", "104.16.96.1"])
+        bot.set_ips(addresses)
+        bot.write_sub("dns", "11111111-1111-1111-1111-111111111111", "D")
+        links = self._links("dns")
+        vless = urllib.parse.urlsplit(links[0])
+        self.assertEqual(vless.hostname, "cdn.example.ir")
+        self.assertEqual(urllib.parse.parse_qs(vless.query)["sni"], ["cdn.example.ir"])
+        self.assertEqual(urllib.parse.parse_qs(vless.query)["host"], ["cdn.example.ir"])
+        self.assertEqual(urllib.parse.urlsplit(links[1]).hostname, "104.16.96.1")
+        vmess = json.loads(base64.b64decode(links[4][8:]))
+        self.assertEqual((vmess["add"], vmess["host"], vmess["sni"]),
+                         ("cdn.example.ir", "cdn.example.ir", "cdn.example.ir"))
+        self.assertEqual(urllib.parse.urlsplit(links[6]).hostname, "cdn.example.ir")
+
     def test_default_emits_one_per_slot(self):
         bot.write_sub("aa", "11111111-1111-1111-1111-111111111111", "A")
         links = self._links("aa")

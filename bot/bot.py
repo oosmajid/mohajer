@@ -3,7 +3,7 @@
 # VLESS/VMess/Trojan over WebSocket (TLS + no-TLS, fronted by Cloudflare) + VLESS-XHTTP.
 # Per-user quota + expiry are enforced live via `xray api adu/rmu/statsquery` (no xray restart).
 # All config comes from bot.env (see config/bot.env.example). Single-file, runs under systemd.
-import os, re, sys, json, time, html, base64, socket, sqlite3, secrets, threading, subprocess, math, tempfile
+import os, re, sys, json, time, html, base64, socket, sqlite3, secrets, threading, subprocess, math, tempfile, ipaddress
 import uuid as uuidlib
 import urllib.request, urllib.parse, ssl
 import http.cookies
@@ -452,7 +452,7 @@ def _stats_epoch_still_running(pid):
 def sub_path(token): return os.path.join(SUB_DIR, "sub-u-%s" % token)
 def sub_url(token):  return "%s/sub-u-%s" % (SUB_BASE, token)
 
-def _ws_link(ep, secret, ip, port, sec):
+def _ws_link(ep, secret, address, port, sec):
     proto, net = ep["proto"], ep["net"]
     H = ep.get("host") or DOMAIN
     sni_host = ep.get("sni") or H
@@ -460,7 +460,7 @@ def _ws_link(ep, secret, ip, port, sec):
     qp = urllib.parse.quote(ep["path"], safe="")
     tls_on = (sec == "tls")
     base = ep["label"] if tls_on else (ep["label"].replace("-WS", "").replace("-XHTTP", "") + "-noTLS")
-    nm = urllib.parse.quote("%s · %s" % (base, ip))
+    nm = urllib.parse.quote("%s · %s" % (base, address))
     sni = ("&sni=%s" % urllib.parse.quote(sni_host, safe="")) if tls_on else ""
     if tls_on and fragment_fm:
         alpn = "http/1.1" if net == "ws" else "h2,http/1.1"  # CF only upgrades WebSocket over HTTP/1.1
@@ -468,11 +468,11 @@ def _ws_link(ep, secret, ip, port, sec):
     secp = "tls" if tls_on else "none"
     if proto == "vless":
         extra = "&mode=auto" if net == "xhttp" else ""
-        return "vless://%s@%s:%s?encryption=none&security=%s&type=%s&host=%s%s&path=%s%s#%s" % (secret, ip, port, secp, net, H, sni, qp, extra, nm)
+        return "vless://%s@%s:%s?encryption=none&security=%s&type=%s&host=%s%s&path=%s%s#%s" % (secret, address, port, secp, net, H, sni, qp, extra, nm)
     if proto == "trojan":
-        return "trojan://%s@%s:%s?security=%s%s&type=%s&host=%s&path=%s#%s" % (secret, ip, port, secp, sni, net, H, qp, nm)
+        return "trojan://%s@%s:%s?security=%s%s&type=%s&host=%s&path=%s#%s" % (secret, address, port, secp, sni, net, H, qp, nm)
     if proto == "vmess":
-        j = {"v": "2", "ps": "%s · %s" % (base, ip), "add": ip, "port": str(port), "id": secret, "aid": "0", "scy": "auto",
+        j = {"v": "2", "ps": "%s · %s" % (base, address), "add": address, "port": str(port), "id": secret, "aid": "0", "scy": "auto",
              "net": net, "type": "none", "host": H, "path": ep["path"], "tls": ("tls" if tls_on else ""), "sni": (sni_host if tls_on else "")}
         return "vmess://" + base64.b64encode(json.dumps(j).encode()).decode()
     return ""
@@ -495,9 +495,27 @@ def set_ips(ips):
     meta_set("clean_ips", ",".join(ips))
 
 def parse_ips(text):
-    # shared IP parser (Telegram + web panel): split on commas/space/newlines, drop :port, keep valid IPv4
-    toks = [t.split(":")[0].strip() for t in re.split(r"[\s,]+", (text or "").strip()) if t.strip()]
-    return [t for t in toks if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", t) and all(0 <= int(o) <= 255 for o in t.split("."))]
+    # Kept under its old name for stored settings and callers; CDN dial addresses
+    # may now be IPv4 or DNS names. Host/SNI still come from each endpoint.
+    addresses = []
+    for token in re.split(r"[\s,]+", (text or "").strip()):
+        if not token:
+            continue
+        if ":" in token:
+            token, _, port = token.rpartition(":")
+            if not port.isdigit() or not 1 <= int(port) <= 65535:
+                continue
+        try:
+            ipaddress.IPv4Address(token)
+            addresses.append(token)
+            continue
+        except ipaddress.AddressValueError:
+            pass
+        if (len(token) <= 253 and "." in token and not re.fullmatch(r"[0-9.]+", token)
+                and all(re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+                        for label in token.split("."))):
+            addresses.append(token.lower())
+    return addresses
 
 def _ep_slots(ep):
     # ordered (port, security) slots for an endpoint: TLS ports first, then no-TLS
@@ -1659,7 +1677,7 @@ pending = {}
 def main_menu_kb():
     return [[{"text": "➕ ساخت لینک جدید", "callback_data": "new"}],
             [{"text": "📋 لیست لینک‌ها", "callback_data": "list"}],
-            [{"text": "🌐 آی‌پی‌های تمیز", "callback_data": "ips"}]]
+            [{"text": "🌐 آدرس‌های CDN", "callback_data": "ips"}]]
 
 def _grid(items, cb):
     rows, r = [], []
@@ -1750,11 +1768,11 @@ def route_cb(chat, mid, data, cbid):
         pending.pop(chat, None); answer(cbid); edit(chat, mid, WELCOME, main_menu_kb()); return
     if data == "ips":
         answer(cbid); ips = get_ips()
-        txt = "🌐 <b>آی‌پی‌های تمیز کلادفلر</b>\nدر کانفیگ همه‌ی لینک‌ها استفاده می‌شوند:\n\n" + "\n".join("• <code>%s</code>" % i for i in ips)
+        txt = "🌐 <b>آدرس‌های اتصال CDN</b>\nدامنه یا IP؛ در کانفیگ همه‌ی لینک‌ها استفاده می‌شوند:\n\n" + "\n".join("• <code>%s</code>" % html.escape(i) for i in ips)
         edit(chat, mid, txt, [[{"text": "✏️ ویرایش لیست", "callback_data": "ips_edit"}], [{"text": "بازگشت", "callback_data": "menu"}]]); return
     if data == "ips_edit":
         pending[chat] = {"stage": "ips_edit"}; answer(cbid)
-        edit(chat, mid, "آی‌پی‌های تمیز را بفرست (با کاما یا هر خط یکی):\n<code>104.16.96.1, 104.21.96.1, 104.19.96.1</code>"); return
+        edit(chat, mid, "دامنهٔ فعال Cloudflare یا IP تمیز را بفرست (با کاما یا هر خط یکی):\n<code>cdn.example.com, 104.16.96.1</code>"); return
     if data == "new":
         pending[chat] = {"stage": "vol"}; answer(cbid); edit(chat, mid, "📦 حجم لینک را انتخاب کن:", vol_kb()); return
     if data.startswith("vol:"):
@@ -1856,9 +1874,9 @@ def handle_update(up):
         valid = parse_ips(text)
         pending.pop(chat, None)
         if not valid:
-            send(chat, "❌ هیچ IP معتبری پیدا نشد. مثل <code>104.16.96.1, 104.21.96.1</code> بفرست.", main_menu_kb()); return
+            send(chat, "❌ هیچ دامنه یا IPv4 معتبری پیدا نشد. مثل <code>cdn.example.com, 104.16.96.1</code> بفرست.", main_menu_kb()); return
         set_ips(valid); regenerate_all_subs()
-        send(chat, "✅ <b>%d آی‌پی</b> ذخیره و همه‌ی لینک‌ها بروز شدند:\n%s\n\nمشتری‌ها فقط کافیست Update بزنند." % (len(valid), "\n".join("• <code>%s</code>" % i for i in valid)), main_menu_kb()); return
+        send(chat, "✅ <b>%d آدرس</b> ذخیره و همه‌ی لینک‌ها بروز شدند:\n%s\n\nمشتری‌ها فقط کافیست Update بزنند." % (len(valid), "\n".join("• <code>%s</code>" % html.escape(i) for i in valid)), main_menu_kb()); return
     if st and st.get("stage") in ("addvol_custom", "addtime_custom"):
         is_vol = st["stage"] == "addvol_custom"; token = st["token"]
         try: n = float(text.replace(",", "."))
@@ -2065,113 +2083,138 @@ def users_overview():
     return out
 
 ADMIN_CSS = """
-:root{--paper:#F4F1E8;--card:#FFFFFF;--ink:#111111;--accent:#FFDD2D;--ok:#2FCB74;--warn:#FFB020;--dng:#FF5A47;--frz:#3FA9F5;--mut:#6B675C;--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;--sans:Tahoma,"Segoe UI",-apple-system,system-ui,sans-serif}
-:root[data-theme=dark]{--paper:#16150F;--card:#211F17;--ink:#F1EEE3;--mut:#9C978B}
-:root[data-theme=dark] .hero{--ink:#111111;--paper:#F4F1E8;--card:#FFFFFF;--mut:#6B675C}
-:root[data-theme=dark] .btn:not(.ghost):not(.danger){color:#111111}
+:root{--paper:#F4F7FB;--card:#FFFFFF;--ink:#17253D;--accent:#256BD1;--accent-text:#FFFFFF;--ok:#179773;--warn:#BD7A17;--dng:#D4545C;--frz:#568BBF;--mut:#68788F;--line:#DCE5F0;--soft:#EAF1FA;--hero:#EAF3FF;--shadow:0 12px 36px rgba(33,60,99,.06);--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;--sans:"Vazirmatn","Segoe UI",Tahoma,system-ui,sans-serif;--display:"Estedad","Vazirmatn","Segoe UI",Tahoma,system-ui,sans-serif}
+:root[data-theme=dark]{--paper:#101827;--card:#182438;--ink:#EDF3FC;--accent:#83B4FB;--accent-text:#10213A;--ok:#55D3A5;--warn:#F2BC69;--dng:#FF929C;--frz:#8BBCEB;--mut:#A7B5C8;--line:#31425A;--soft:#203149;--hero:#192F4B;--shadow:0 12px 36px rgba(0,0,0,.13)}
 *{box-sizing:border-box}
 html,body{margin:0;max-width:100%}
-body{background:var(--paper);color:var(--ink);font-family:var(--sans);line-height:1.55;padding:18px 14px 48px;-webkit-font-smoothing:antialiased}
-.wrap{max-width:840px;margin:0 auto}
-a{color:var(--ink);text-decoration:none}
-.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
-.bar{cursor:pointer}
-.tt{position:fixed;display:none;background:var(--ink);color:var(--paper);border:2px solid var(--ink);padding:5px 9px;font-family:var(--mono);font-size:12px;font-weight:700;pointer-events:none;z-index:60;box-shadow:3px 3px 0 rgba(0,0,0,.28)}
+body{min-height:100vh;background:var(--paper);color:var(--ink);font-family:var(--sans);line-height:1.65;padding:0 24px 64px;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1120px;margin:0 auto}
+a{color:inherit;text-decoration:none}
+a:hover{color:var(--accent)}
+.mono,.n{font-variant-numeric:tabular-nums}
+.mono{font-family:var(--mono)}
 .n{unicode-bidi:isolate;direction:ltr}
-.eyebrow{display:inline-block;font-size:11px;font-weight:800;background:var(--ink);color:var(--paper);padding:3px 8px;margin-bottom:10px}
-.top{display:flex;align-items:center;gap:10px;margin:0 2px 20px}
-.brand{display:flex;align-items:center;gap:9px;font-weight:800;font-size:19px}
-.dot-sig{width:15px;height:15px;background:var(--accent);border:2px solid var(--ink)}
-.crumb{font-size:13px;font-weight:800}
+.top{display:flex;align-items:center;gap:24px;min-height:76px;margin-bottom:34px;border-bottom:1px solid var(--line)}
+.brand{display:inline-flex;align-items:center;gap:11px;font-family:var(--display);font-size:19px;font-weight:800;letter-spacing:-.02em;white-space:nowrap}
+.brand:hover{color:var(--ink)}
+.dot-sig{position:relative;width:34px;height:34px;flex:0 0 34px;border-radius:10px;background:var(--accent)}
+.dot-sig:before{content:"";position:absolute;inset:9px 9px 9px 10px;background:linear-gradient(to top,var(--accent-text) 0 35%,transparent 35% 100%) left bottom/3px 100% no-repeat,linear-gradient(to top,var(--accent-text) 0 65%,transparent 65% 100%) center bottom/3px 100% no-repeat,linear-gradient(to top,var(--accent-text) 0 100%,transparent 100% 100%) right bottom/3px 100% no-repeat}
+.crumb{font-size:13px;font-weight:650;color:var(--mut)}
+.crumb a:hover{color:var(--accent)}
 .rightnav{margin-inline-start:auto;display:flex;align-items:center;gap:10px}
-.card{background:var(--card);border:3px solid var(--ink);box-shadow:5px 5px 0 var(--ink);padding:16px;margin:0 0 18px}
-.card h2{margin:0 0 12px;font-size:12px;color:var(--ink);font-weight:800}
-.hero{background:var(--accent);color:var(--ink)}
-.big{font-family:var(--mono);font-size:44px;font-weight:800;line-height:1.02}
-.big small{font-family:var(--sans);font-size:15px;font-weight:700;margin-inline-start:6px}
-.title{font-size:24px;font-weight:800;margin:2px 0}
-.metrics{display:flex;gap:20px;flex-wrap:wrap;margin-top:12px}
-.metric .k{font-size:11px;color:var(--ink);font-weight:800}
-.metric .v{font-size:18px;font-weight:800;margin-top:3px}
-.pills{display:flex;gap:8px;margin-top:14px}
-.pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:700;color:var(--ink);background:var(--card);border:2px solid var(--ink);padding:4px 10px}
-.linkbadge{align-self:flex-start;display:inline-flex;width:max-content;max-width:100%;white-space:nowrap;font-size:10px;font-weight:800;line-height:1.2;border:1px solid var(--ink);border-radius:999px;background:var(--accent);color:#111;padding:2px 6px;margin-top:2px}
-.d{width:9px;height:9px;border:2px solid var(--ink)}
-.d.ok{background:var(--ok)}
-.d.off{background:var(--paper)}
-.chart{margin-top:16px}
-svg{display:block;width:100%;color:var(--ink)}
-.u{display:grid;grid-template-columns:14px 1fr 72px 84px;align-items:center;gap:10px;padding:12px;border:2px solid var(--ink);background:var(--card);color:var(--ink);margin-top:10px}
-.u:first-of-type{margin-top:0}
-.u:hover{transform:translate(-2px,-2px);box-shadow:4px 4px 0 var(--ink)}
-.st{width:12px;height:12px;border:2px solid var(--ink);flex:0 0 auto}
-.st.ok{background:var(--ok);color:var(--ok)}
-.st.warn{background:var(--warn);color:var(--warn)}
-.st.dng{background:var(--dng);color:var(--dng)}
-.st.off{background:var(--paper);color:var(--mut)}
-.st.frz{background:var(--frz);color:var(--frz)}
-.st.on{filter:saturate(1.45) brightness(1.12);animation:stglow 1.5s ease-in-out infinite}
-@keyframes stglow{0%,100%{box-shadow:0 0 3px 0 currentColor}50%{box-shadow:0 0 9px 2px currentColor}}
-@media (prefers-reduced-motion:reduce){.st.on{animation:none;box-shadow:0 0 7px 1px currentColor}}
-.switch{display:flex;align-items:center;gap:12px;cursor:pointer;user-select:none}
-.switch input{position:absolute;opacity:0;width:0;height:0}
-.switch .knob{position:relative;flex:0 0 auto;width:48px;height:28px;background:var(--paper);border:2px solid var(--ink);border-radius:0;transition:background .15s}
-.switch .knob::after{content:"";position:absolute;top:2px;inset-inline-start:2px;width:20px;height:20px;background:var(--ink);transition:inset-inline-start .15s}
-.switch input:checked+.knob{background:var(--frz)}
-.switch input:checked+.knob::after{inset-inline-start:22px}
-.switch input:focus-visible+.knob{outline:2px solid var(--frz);outline-offset:2px}
-.switch .swtxt{display:flex;flex-direction:column;line-height:1.35}
-.switch .swsub{font-size:12px;color:var(--mut)}
-.switch.on .swtxt b{color:var(--frz)}
+.pagehead{display:flex;align-items:flex-end;justify-content:space-between;gap:20px;margin:0 0 22px}
+.pagehead h1{font-family:var(--display);font-size:clamp(27px,3.2vw,38px);line-height:1.3;letter-spacing:-.025em;margin:2px 0 4px;font-weight:800}
+.pagehead p{font-size:13px;color:var(--mut);margin:0}
+.eyebrow{display:inline-block;font-size:11px;font-weight:800;letter-spacing:.02em;color:var(--accent);margin-bottom:3px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);padding:22px;margin:0 0 18px;min-width:0}
+.card h2{font-family:var(--display);font-size:16px;line-height:1.4;margin:0 0 15px;font-weight:750}
+.hero{background:var(--hero);border-color:transparent;box-shadow:none}
+.dashboard-hero{display:grid;grid-template-columns:minmax(250px,.8fr) minmax(0,1.2fr);grid-template-rows:auto auto auto 1fr;column-gap:32px;row-gap:6px;padding:27px 30px}
+.dashboard-hero>.eyebrow,.dashboard-hero>.big,.dashboard-hero>.metrics,.dashboard-hero>.pills{grid-column:1}
+.dashboard-hero>.eyebrow{grid-row:1}
+.dashboard-hero>.big{grid-row:2}
+.dashboard-hero>.metrics{grid-row:3}
+.dashboard-hero>.pills{grid-row:4;align-self:end}
+.dashboard-hero>.chart{grid-column:2;grid-row:1/5;display:flex;flex-direction:column;justify-content:flex-end;margin:0;border-inline-start:1px solid var(--line);padding-inline-start:28px}
+.dashboard-hero .chart svg{height:130px}
+.big{font-family:var(--display);font-size:clamp(38px,5vw,58px);font-weight:800;line-height:1.15;letter-spacing:-.035em}
+.big .n{font-family:var(--mono);letter-spacing:-.07em}
+.big small{font-family:var(--sans);font-size:16px;font-weight:650;margin-inline-start:6px;letter-spacing:0}
+.title{font-family:var(--display);font-size:clamp(24px,3vw,34px);font-weight:800;line-height:1.3;margin:5px 0}
+.metrics{display:flex;gap:26px;flex-wrap:wrap;margin-top:10px}
+.metric .k{font-size:11px;color:var(--mut);font-weight:700}
+.metric .v{font-size:18px;font-weight:750;margin-top:2px}
+.pills{display:flex;gap:8px;flex-wrap:wrap;margin-top:20px}
+.pill{display:inline-flex;align-items:center;gap:7px;font-size:12px;font-weight:650;color:var(--ink);background:var(--card);border:1px solid var(--line);border-radius:999px;padding:5px 11px}
+.linkbadge{align-self:flex-start;display:inline-flex;width:max-content;max-width:100%;white-space:nowrap;font-size:10px;font-weight:700;line-height:1.3;border-radius:999px;background:var(--soft);color:var(--accent);padding:3px 8px;margin-top:3px}
+.d,.st{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--mut);flex:0 0 auto}
+.d.ok,.st.ok{background:var(--ok)}
+.d.off,.st.off{background:var(--mut)}
+.st{width:10px;height:10px}
+.st.warn{background:var(--warn)}
+.st.dng{background:var(--dng)}
+.st.frz{background:var(--frz)}
+.st.on{box-shadow:0 0 0 4px color-mix(in srgb,var(--ok) 18%,transparent)}
+.chart{margin-top:20px}
+.chart>.eyebrow{color:var(--mut);margin-bottom:12px}
+svg{display:block;width:100%;color:var(--accent)}
+.bar{cursor:pointer}
+.tt{position:fixed;display:none;background:var(--ink);color:var(--card);border-radius:9px;padding:6px 10px;font-family:var(--mono);font-size:12px;pointer-events:none;z-index:60;box-shadow:var(--shadow)}
+.u{display:grid;grid-template-columns:10px minmax(0,1fr) minmax(100px,160px) minmax(105px,142px);align-items:center;gap:16px;padding:15px 6px;border-top:1px solid var(--line);color:var(--ink);min-width:0}
+.u[hidden]{display:none}
+.u:hover{background:var(--soft);border-radius:9px}
+.u:first-of-type{border-top:0}
 .nm{flex:1 1 auto;min-width:0;display:flex;flex-direction:column}
-.nm b{font-weight:800;font-size:14px}
+.nm b{font-size:14px;font-weight:750;line-height:1.4}
 .nm .sub{font-size:11px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-family:var(--mono)}
 .meter{min-width:0}
-.trk{display:block;height:10px;background:var(--card);border:2px solid var(--ink);overflow:hidden}
-.fil{display:block;height:100%;background:var(--ink)}
-.rt{font-size:12px;color:var(--mut);text-align:end;min-width:0;line-height:1.3;font-weight:700}
-.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;font-family:inherit;font-size:13px;font-weight:800;border:3px solid var(--ink);padding:9px 14px;cursor:pointer;text-decoration:none;color:var(--ink);background:var(--accent);box-shadow:3px 3px 0 var(--ink);transition:transform .06s,box-shadow .06s}
-.btn:hover{transform:translate(-1px,-1px);box-shadow:4px 4px 0 var(--ink)}
-.btn:active{transform:translate(3px,3px);box-shadow:0 0 0 var(--ink)}
-.btn.ghost{background:var(--card)}
-.btn.danger{background:var(--dng);color:#fff}
-.tbtn{display:inline-flex;align-items:center;justify-content:center;width:38px;height:38px;padding:0;font-size:17px;line-height:1;border:3px solid var(--ink);background:var(--card);color:var(--ink);cursor:pointer;box-shadow:3px 3px 0 var(--ink);transition:transform .06s,box-shadow .06s}
-.tbtn:hover{transform:translate(-1px,-1px);box-shadow:4px 4px 0 var(--ink)}
-.tbtn:active{transform:translate(3px,3px);box-shadow:0 0 0 var(--ink)}
-input[type=text],input[type=number],textarea{background:var(--card);border:3px solid var(--ink);color:var(--ink);border-radius:0;padding:9px 11px;font-family:inherit;font-size:14px;flex:1 1 130px;min-width:0;max-width:280px;outline:none}
-input[type=number]{max-width:96px}
-textarea{width:100%;max-width:100%;font-family:var(--mono);resize:vertical}
-input::placeholder,textarea::placeholder{color:#9a958a}
-input:focus,textarea:focus{box-shadow:3px 3px 0 var(--accent)}
-input[type=checkbox]{width:20px;height:20px;accent-color:var(--ink);flex:0 0 auto}
-.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.trk{display:block;height:7px;background:var(--line);border-radius:99px;overflow:hidden}
+.fil{display:block;height:100%;background:var(--accent);border-radius:99px}
+.rt{font-size:12px;color:var(--mut);text-align:end;min-width:0;line-height:1.5;font-weight:650}
+.btn,.tbtn{display:inline-flex;align-items:center;justify-content:center;gap:7px;font-family:inherit;font-size:13px;font-weight:750;border:1px solid transparent;border-radius:10px;padding:10px 15px;cursor:pointer;text-decoration:none;transition:background .18s,transform .18s,box-shadow .18s}
+.btn{background:var(--accent);color:var(--accent-text);box-shadow:0 4px 10px color-mix(in srgb,var(--accent) 20%,transparent)}
+.btn:hover{color:var(--accent-text);transform:translateY(-1px);box-shadow:0 7px 16px color-mix(in srgb,var(--accent) 22%,transparent)}
+.btn:active,.tbtn:active{transform:translateY(1px)}
+.btn.ghost{background:var(--card);color:var(--ink);border-color:var(--line);box-shadow:none}
+.btn.ghost:hover,.tbtn:hover{color:var(--accent);border-color:var(--accent);background:var(--soft);box-shadow:none}
+.btn.danger{background:var(--dng);color:#FFFFFF;box-shadow:none}
+.tbtn{width:38px;height:38px;padding:0;font-size:17px;line-height:1;background:var(--card);color:var(--ink);border-color:var(--line)}
+input[type=text],input[type=number],input[type=search],input:not([type]),textarea,select{background:var(--card);border:1px solid var(--line);border-radius:10px;color:var(--ink);padding:10px 12px;font:inherit;font-size:13px;min-height:42px;min-width:0;outline:none}
+input[type=text],input[type=number],input[type=search],input:not([type]){flex:1 1 150px;max-width:360px}
+input[type=number]{max-width:115px}
+textarea{width:100%;max-width:100%;font-family:var(--mono);line-height:1.5;resize:vertical}
+select{width:100%;max-width:100%}
+input::placeholder,textarea::placeholder{color:var(--mut);opacity:.82}
+input:focus,textarea:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 18%,transparent)}
+input[type=checkbox]{width:17px;height:17px;accent-color:var(--accent);flex:0 0 auto}
+.row{display:flex;gap:9px;flex-wrap:wrap;align-items:center}
 form.row{margin:0 0 8px}
-.grid{display:grid;gap:10px}
-.eprow{display:flex;align-items:center;gap:10px;justify-content:space-between;border:2px solid var(--ink);padding:10px 12px;background:var(--card)}
+.grid{display:grid;gap:13px}
+.create-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}
+.field{display:grid;gap:6px;min-width:0}
+.field>span{font-size:12px;font-weight:700;color:var(--mut)}
+.field input{width:100%;max-width:none}
+.toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:10px}
+.toolbar .row{margin-inline-start:auto}
+#linksearch{width:220px;max-width:100%}
+.eprow{display:flex;align-items:center;gap:12px;justify-content:space-between;border:1px solid var(--line);border-radius:13px;padding:16px;background:var(--card)}
 .eplabel{display:flex;align-items:center;gap:10px;flex:1;min-width:0;cursor:pointer}
-.eplabel b{font-weight:800}
+.eplabel b{font-weight:750}
 .eptag{display:block;font-size:11px;color:var(--mut);font-family:var(--mono);margin-top:2px}
-.hint{font-size:12px;color:var(--mut);font-weight:700;margin:0 0 6px}
-code{font-family:var(--mono);background:var(--paper);border:2px solid var(--ink);padding:6px 8px;word-break:break-all;font-size:12px;color:var(--ink);display:block}
+.hint{font-size:12px;color:var(--mut);font-weight:550;margin:0 0 7px}
+code{display:block;font-family:var(--mono);background:var(--soft);border:1px solid var(--line);border-radius:9px;padding:8px 10px;word-break:break-all;font-size:12px;color:var(--ink);unicode-bidi:plaintext}
+.hint code,p code{display:inline;border-radius:5px;padding:1px 5px}
 .obmsg{padding:12px 14px;font-size:13px}
-.obmsg.good{border-color:var(--ok);box-shadow:5px 5px 0 var(--ok)}
-.obmsg.bad{border-color:var(--dng);box-shadow:5px 5px 0 var(--dng)}
-.pill.oball{background:var(--frz);color:#111;margin:4px 0 2px}
-.pill.obwarn{background:var(--warn);color:#111;margin:4px 0 2px}
-.obres{margin-top:10px;padding:9px 11px;border:2px dashed var(--ink);background:var(--paper);font-family:var(--mono);font-size:12px;word-break:break-word;unicode-bidi:plaintext}
+.obmsg.good{border-color:var(--ok);background:color-mix(in srgb,var(--ok) 9%,var(--card))}
+.obmsg.bad{border-color:var(--dng);background:color-mix(in srgb,var(--dng) 9%,var(--card))}
+.pill.oball{background:color-mix(in srgb,var(--ok) 12%,var(--card));color:var(--ink)}
+.pill.obwarn{background:color-mix(in srgb,var(--warn) 14%,var(--card));color:var(--ink)}
+.obres{margin-top:10px;padding:10px 12px;border:1px dashed var(--line);border-radius:10px;background:var(--soft);font-family:var(--mono);font-size:12px;word-break:break-word;unicode-bidi:plaintext}
+.switch{display:flex;align-items:center;gap:12px;cursor:pointer;user-select:none}
+.switch input{position:absolute;opacity:0;width:0;height:0}
+.switch .knob{position:relative;flex:0 0 auto;width:46px;height:26px;background:var(--line);border-radius:999px;transition:background .18s}
+.switch .knob::after{content:"";position:absolute;top:3px;inset-inline-start:3px;width:20px;height:20px;border-radius:50%;background:var(--card);box-shadow:0 1px 4px rgba(0,0,0,.15);transition:inset-inline-start .18s}
+.switch input:checked+.knob{background:var(--accent)}
+.switch input:checked+.knob::after{inset-inline-start:23px}
+.switch input:focus-visible+.knob{outline:2px solid var(--accent);outline-offset:3px}
+.switch .swtxt{display:flex;flex-direction:column;line-height:1.35}
+.switch .swsub{font-size:12px;color:var(--mut)}
+.switch.on .swtxt b{color:var(--accent)}
 .spin{display:inline-block;width:11px;height:11px;margin-inline-end:7px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;animation:sp .7s linear infinite;vertical-align:-1px}
 @keyframes sp{to{transform:rotate(360deg)}}
 button[disabled]{opacity:.65;cursor:progress}
-.warnpulse{background:var(--warn)!important}
-:focus-visible{outline:3px solid var(--ink);outline-offset:2px}
-@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+.warnpulse{background:var(--warn)!important;color:#17253D!important}
+:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+@media (max-width:820px){.dashboard-hero{grid-template-columns:1fr;grid-template-rows:auto;gap:6px}.dashboard-hero>.eyebrow,.dashboard-hero>.big,.dashboard-hero>.metrics,.dashboard-hero>.pills,.dashboard-hero>.chart{grid-column:1;grid-row:auto}.dashboard-hero>.chart{border-inline-start:0;border-top:1px solid var(--line);padding:17px 0 0;margin-top:12px}.dashboard-hero .chart svg{height:100px}}
+@media (max-width:620px){body{padding:0 14px 40px}.top{min-height:66px;margin-bottom:25px;gap:12px}.brand{font-size:17px}.crumb{display:none}.rightnav{gap:6px}.rightnav .btn{padding:8px 10px}.pagehead{align-items:stretch;flex-direction:column}.pagehead .btn{align-self:flex-start}.card{padding:17px;border-radius:15px}.dashboard-hero{padding:21px}.metrics{gap:16px}.create-grid{grid-template-columns:1fr}.toolbar .row{margin-inline-start:0}.toolbar #linksearch{width:100%}.u{grid-template-columns:10px minmax(0,1fr) auto;gap:8px 12px;padding:13px 4px}.u .st{grid-column:1;grid-row:1}.u .nm{grid-column:2;grid-row:1}.u .rt{grid-column:3;grid-row:1}.u .meter{grid-column:2/4;grid-row:2}.rt{font-size:11px}.row>.btn{flex:1 1 auto}.btn{min-height:42px}.eprow{padding:12px}.eprow .row{align-items:flex-start}}
+@media (prefers-reduced-motion:reduce){*,*:before,*:after{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
 """
 
 def _page(title, inner):
     return ("<!doctype html><html lang=fa dir=rtl><head><meta charset=utf-8>"
             "<meta name=viewport content='width=device-width,initial-scale=1'>"
             "<meta name=color-scheme content='light dark'>"
-            "<link rel=icon href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect x='3' y='3' width='26' height='26' fill='%%23FFDD2D' stroke='%%23111' stroke-width='4'/></svg>\">"
+            "<link rel=icon href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect x='2' y='2' width='28' height='28' rx='8' fill='%%23256BD1'/><path d='M10 22v-6m6 6V11m6 11V7' stroke='%%23fff' stroke-width='3' stroke-linecap='round'/></svg>\">"
             "<title>%s</title>"
             "<script>(function(){try{var t=localStorage.getItem('mj-theme')||((window.matchMedia&&matchMedia('(prefers-color-scheme:dark)').matches)?'dark':'light');document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>"
             "<style>%s</style></head><body><div class=wrap>%s</div><div id=tt class=tt></div>"
@@ -2194,8 +2237,13 @@ def _top(crumb="", csrf=None):
                   "<button class='btn ghost'>خروج</button></form>") % csrf
     right += ("<button id=themebtn type=button class=tbtn onclick=\"toggleTheme()\" "
               "aria-label='تغییر تم' title='تغییر تم'>🌙</button>")
-    return ("<header class=top><span class=brand><span class=dot-sig></span>Mohajer</span>"
+    return ("<header class=top><a class=brand href='/a/'><span class=dot-sig aria-hidden=true></span>Mohajer</a>"
             "<span class=rightnav>%s</span></header>" % right)
+
+def _page_heading(title, detail="", action=""):
+    return ("<div class=pagehead><div><span class=eyebrow>پنل مدیریت مهاجر</span>"
+            "<h1>%s</h1><p>%s</p></div>%s</div>" %
+            (html.escape(title), html.escape(detail), action))
 
 def _metric_big(b):
     s = fmt_bytes(b); p = s.rsplit(" ", 1)
@@ -2205,7 +2253,7 @@ def svg_bars(series, w=760, h=96):
     vals = [v for _, v in series]; mx = max(vals + [1]); n = len(series) or 1; bw = w / n; bars = ""
     for i, (lab, v) in enumerate(series):
         bh = max(3.0, (v / mx) * (h - 6)); val = fmt_bytes(v)
-        bars += ('<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" fill="currentColor" opacity="%s"></rect>'
+        bars += ('<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" rx="3" fill="currentColor" opacity="%s"></rect>'
                  ) % (i * bw + 3, h - bh, max(3.0, bw - 6), bh, ("1" if v > 0 else "0.18"))
         # full-height transparent hit target -> tappable on touch; carries the value for the tooltip
         bars += ('<rect class="bar" x="%.1f" y="0" width="%.1f" height="%d" fill="transparent" data-t="%s" data-v="%s">'
@@ -2248,7 +2296,7 @@ def render_dashboard(csrf):
     ov = users_overview()
     active = sum(1 for u in ov if not u["disabled_ts"]); disabled = len(ov) - active
     chart = svg_bars(daily_series(7))
-    hero = ("<div class='card hero'><div class=eyebrow>مصرف امروز</div><div class=big><span class=n>%s</span></div>"
+    hero = ("<div class='card hero dashboard-hero'><div class=eyebrow>مصرف امروز</div><div class=big><span class=n>%s</span></div>"
             "<div class=metrics><div class=metric><div class=k>کل</div><div class='v mono'><span class=n>%s</span></div></div>"
             "<div class=metric><div class=k>۳۰ روز اخیر</div><div class='v mono'><span class=n>%s</span></div></div></div>"
             "<div class=pills><span class=pill><span class='d ok'></span>%d فعال</span>"
@@ -2257,12 +2305,20 @@ def render_dashboard(csrf):
         _metric_big(today), fmt_bytes(total), fmt_bytes(last30), active, disabled, chart)
     onmap = xr_online_map() or {}
     rows = "".join(_user_row(u, u["token"] in onmap) for u in ov) or "<div class=u><span class=nm style='color:var(--mut)'>هنوز لینکی نساخته‌ای</span></div>"
-    users = ("<div class=card><div class=row style='justify-content:space-between;margin-bottom:8px'>"
-             "<h2 style='margin:0'>لینک‌ها</h2><span class=row>"
+    users = ("<div class=card><div class=toolbar>"
+             "<h2 style='margin:0'>لینک‌ها</h2>"
+             "<input id=linksearch type=search placeholder='جست‌وجوی لینک' aria-label='جست‌وجوی لینک'>"
+             "<span class=row>"
              "<a class='btn ghost' href='/a/config'>⚙ پیکربندی</a>"
              "<a class='btn ghost' href='/a/outbounds'>🌍 خروجی‌ها</a>"
-             "<a class=btn href='/a/new'>+ لینک جدید</a></span></div>%s</div>") % rows
-    return _page("پنل", _top("", csrf) + hero + users)
+             "</span></div>%s<p id=search-empty class=hint hidden>لینکی با این نام پیدا نشد.</p></div>"
+             "<script>(function(){var q=document.getElementById('linksearch'),e=document.getElementById('search-empty');"
+             "if(!q)return;q.addEventListener('input',function(){var term=q.value.trim().toLocaleLowerCase(),seen=0;"
+             "document.querySelectorAll('a.u').forEach(function(row){var hit=row.textContent.toLocaleLowerCase().includes(term);"
+             "row.hidden=!hit;if(hit)seen++;});e.hidden=seen!==0;});})();</script>") % rows
+    heading = _page_heading("نمای کلی", "مصرف و وضعیت لینک‌ها در یک نگاه",
+                            "<a class=btn href='/a/new'>+ لینک جدید</a>")
+    return _page("پنل", _top("", csrf) + heading + hero + users)
 
 def _form(action, fields, csrf, btn, cls="btn"):
     inner = "".join(fields) + "<input type=hidden name=csrf value='%s'>" % csrf
@@ -2298,7 +2354,7 @@ def render_user(token, csrf, msg=""):
     reset = "<a class='btn ghost' href='/a/reset?token=%s'>♻️ ریست مصرف</a>" % token
     dele = "<a class='btn danger' href='/a/del?token=%s'>حذف لینک</a>" % token
     hero = ("<div class='card hero'><div class=eyebrow><span class='st %s' style='display:inline-block;margin-inline-start:6px;vertical-align:middle'></span>%s</div>"
-            "<div class=title>%s</div>"
+            "<h1 class=title>%s</h1>"
             "<div class=metrics><div class=metric><div class=k>مصرف</div><div class=v><span class=n>%s / %s</span></div></div>"
             "<div class=metric><div class=k>امروز</div><div class='v mono'><span class=n>%s</span></div></div>"
             "<div class=metric><div class=k>انقضا</div><div class=v>%s</div></div></div>"
@@ -2313,11 +2369,18 @@ def render_user(token, csrf, msg=""):
     return _page("کاربر", _top("<a href='/a/'>← داشبورد</a>", csrf) + notice + hero + frz_card + link + actions)
 
 def render_new(csrf):
-    f = _form("/a/new", ["<input type=number name=gb step=any min=0 placeholder='حجم (گیگ) — ۰ = نامحدود'>",
-                         "<input type=number name=days step=any min=0 placeholder='مدت (روز) — ۰ = نامحدود'>",
-                         "<input type=text name=name placeholder='نام مشتری'>"], csrf, "ساخت لینک")
+    f = ("<form method=post action='/a/new' class=grid>"
+         "<div class=create-grid>"
+         "<label class=field><span>نام مشتری</span><input type=text name=name placeholder='مثلاً علی' required></label>"
+         "<label class=field><span>حجم (گیگابایت)</span><input type=number name=gb step=any min=0 "
+         "placeholder='۰ = نامحدود' required></label>"
+         "<label class=field><span>مدت (روز)</span><input type=number name=days step=any min=0 "
+         "placeholder='۰ = نامحدود' required></label></div>"
+         "<input type=hidden name=csrf value='%s'>"
+         "<div class=row><button class=btn>ساخت لینک</button></div></form>") % _config_html(csrf)
     return _page("لینک جدید", _top("<a href='/a/'>← داشبورد</a>", csrf) +
-                 "<div class=card><h2>لینک جدید</h2>%s</div>" % f)
+                 _page_heading("لینک جدید", "حجم، مدت و نام مشتری را تعیین کنید.") +
+                 "<div class=card>%s</div>" % f)
 
 def render_delconfirm(token, csrf):
     f = _form("/a/delete", ["<input type=hidden name=token value='%s'>" % token,
@@ -2410,9 +2473,7 @@ def _render_config_fields(settings, editable=True):
                 _config_html("Host: %s · SNI: %s" % (pair["host"], pair["sni"])))
                 for i, pair in enumerate(hosts))
             host = ("<label class=hint for='hostidx_%s'>جفت Host / SNI آماده‌شده</label>"
-                    "<select id='hostidx_%s' name='hostidx_%s'%s "
-                    "style='width:100%%;max-width:100%%;padding:9px;border:3px solid var(--ink);"
-                    "background:var(--card);color:var(--ink);font:inherit'>%s</select>") % (
+                    "<select id='hostidx_%s' name='hostidx_%s'%s>%s</select>") % (
                         key, key, key, disabled, options)
             path = "<div><span class=hint>مسیر ثابتِ آماده‌شده برای این endpoint</span><code dir=ltr>%s</code></div>" % (
                 _config_html(ep.get("path", "")))
@@ -2426,10 +2487,11 @@ def _render_config_fields(settings, editable=True):
             head, label, ports, host, path, fragment))
     return ("<h2>نوع و تعداد کانفیگ‌ها</h2>"
             "<p class=hint>فقط پورت‌ها، مسیرها و جفت‌های Host / SNI آماده‌شده روی سرور قابل انتخاب‌اند. "
-            "تعداد سقفی ندارد؛ تعداد بیشتر روی پورت‌ها و آی‌پی‌ها پخش می‌شود. "
+            "تعداد سقفی ندارد؛ تعداد بیشتر روی پورت‌ها و آدرس‌های اتصال پخش می‌شود. "
             "با حذف پورت یا غیرفعال‌کردن پروتکل، کانفیگ قدیمی آن قطع می‌شود و برنامهٔ کاربر باید اشتراک را تازه کند.</p>%s"
-            "<h2 style='margin-top:16px'>آی‌پی‌های تمیز کلادفلر</h2>"
-            "<textarea name=ips rows=4 dir=ltr placeholder='104.16.96.1, 104.21.96.1'%s>%s</textarea>") % (
+            "<h2 style='margin-top:16px'>آدرس‌های اتصال CDN (دامنه یا IPv4)</h2>"
+            "<p class=hint>دامنه باید در Cloudflare فعال و به همین مسیر متصل باشد. Host و SNI را از بالا انتخاب کنید.</p>"
+            "<textarea name=ips rows=4 dir=ltr placeholder='cdn.example.com, 104.16.96.1'%s>%s</textarea>") % (
                 "".join(rows), disabled, _config_html("\n".join(ips)))
 
 def _render_link_outbounds(obs, editable):
@@ -2477,6 +2539,7 @@ def render_config(csrf, msg=""):
             "<button class=btn style='margin-top:12px'>ذخیره و بازتولید همهٔ لینک‌های پیش‌فرض</button>"
             "</form>") % (fields, _config_html(csrf))
     return _page("پیکربندی", _top("<a href='/a/'>← داشبورد</a>", csrf) +
+                 _page_heading("پیکربندی عمومی", "تغییرات این صفحه برای لینک‌های پیش‌فرض اعمال می‌شود.") +
                  _config_message(msg) + _sync_notice() + "<div class=card>%s</div>" % body)
 
 def render_user_config(token, csrf, msg=""):
@@ -2516,7 +2579,9 @@ def render_user_config(token, csrf, msg=""):
                  "<button class='btn ghost' name=action value=default>بازگشت به پیش‌فرض عمومی</button>"
                  "</form>") % (token_attr, _config_html(csrf))
         body = "<div class=card>%s%s</div>" % (save, reset)
-    return _page("تنظیمات لینک", _top(back, csrf) + _config_message(msg) + _sync_notice() + mode + body)
+    return _page("تنظیمات لینک", _top(back, csrf) +
+                 _page_heading("تنظیمات لینک", user["label"]) +
+                 _config_message(msg) + _sync_notice() + mode + body)
 
 OB_JS = """
 var OB={csrf:''};
@@ -2622,7 +2687,8 @@ def render_outbounds(csrf, msg=""):
             add + "<h2 style='margin:18px 0 8px'>خروجی‌ها</h2>" +
             "<div id=oblist>%s</div>" % render_ob_list(csrf) + save +
             "<script>%s\nOB.csrf=%s;obRecalc();</script>" % (OB_JS, json.dumps(csrf)))
-    return _page("خروجی‌ها", _top("<a href='/a/'>← داشبورد</a>", csrf) + body)
+    return _page("خروجی‌ها", _top("<a href='/a/'>← داشبورد</a>", csrf) +
+                 _page_heading("خروجی‌ها", "مسیر خروج ترافیک از سرور را مدیریت کنید.") + body)
 
 def route_admin(method, path, query, cookie_header, body, now=None):
     now = now or int(time.time())
@@ -2661,7 +2727,7 @@ def _parse_config_fields(form, current):
         if count < 0: raise ValueError("تعداد کانفیگ نمی‌تواند منفی باشد")
         recipe[tag] = {"enabled": ("en_" + tag) in form, "count": count}
     ips = parse_ips(form.get("ips", ""))
-    if not ips: raise ValueError("حداقل یک آی‌پی تمیز معتبر وارد کنید")
+    if not ips: raise ValueError("حداقل یک دامنه یا IPv4 معتبر وارد کنید")
     options = current["endpoint_settings"]
     if form.get("endpoint_fields") == "1":
         options = {}

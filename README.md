@@ -47,15 +47,15 @@ No database server, no web framework, no pip packages — just **Python 3 stdlib
 
 The origin VPS IP is throttled from some ISPs. Instead of exposing the server directly,
 a **`cloudflared` tunnel** dials out to Cloudflare (outbound-only, works behind NAT).
-Clients connect to **clean Cloudflare edge IPs**; Cloudflare routes by Host/SNI + path
-through the tunnel to local `xray` inbounds. Because Cloudflare anycast serves every
-hostname from any edge IP, you can point links at whichever edge IPs are fastest from
-your users' networks — and swap them live from the bot.
+Clients connect to a **Cloudflare-proxied hostname** by default on new installs, or
+to manually selected edge IPs. Cloudflare routes by Host/SNI + path through the
+tunnel to local `xray` inbounds. Existing installations keep their saved addresses
+until an admin changes them from the bot or web panel.
 
 ```
   client (v2rayNG)                Cloudflare edge            VPS (NAT)
   ───────────────                 ──────────────            ─────────
-  vless://…@<cleanIP>:443  ──TLS──►  edge:443  ──tunnel──►  cloudflared
+  vless://…@<hostname>:443 ──TLS──►  edge:443  ──tunnel──►  cloudflared
         Host/SNI: cdn.example.ir       (routes by             │ path-routes to
         path: /1afb5cae5563             Host+path)            ▼
                                                        xray 127.0.0.1:10000  (vless-ws)
@@ -142,7 +142,7 @@ mohajer/
 - 🧩 **لینک چندپروتکلی** — یک لینک شامل VLESS / VMess / Trojan روی WS (با و بدون TLS) + VLESS-XHTTP؛ کلاینت خودش بینشان سوییچ می‌کند.
 - 📊 **حجم و زمانِ زنده** — محدودیت حجم و زمانِ هر کاربر زنده از طریق xray اعمال می‌شود؛ لینک پس از اتمام خودکار غیرفعال و حذف می‌شود.
 - ☁️ **پشت کلادفلر** — تونل خروجیِ `cloudflared` (پشت NAT هم کار می‌کند) آی‌پی throttle‌شده‌ی سرور را پنهان می‌کند.
-- 🌐 **تعویض زنده‌ی آی‌پی تمیز** — آی‌پی‌های لبه‌ی کلادفلر را برای *همه‌ی* لینک‌ها از داخل ربات ویرایش کن؛ مشتری فقط Update می‌زند. یک اسکنر هم برای یافتن سریع‌ترین آی‌پی از روی اینترنت خودت دارد.
+- 🌐 **آدرس CDN قابل انتخاب** — دامنهٔ فعال کلادفلر یا IP لبه را از پنل انتخاب کن؛ مشتری پس از تغییر اشتراک را Update می‌کند. اسکن IP فقط برای مسیر دستی لازم است.
 - 📱 **صفحه‌ی کپیِ موبایلی** — لینک ساب را در مرورگر باز کن → یک صفحه‌ی تمیز راست‌چین با کپی تکی/گروهی و نوار پیشرفت حجم و زمان.
 - 🪶 **بسیار سبک** — حدود ۲۵ مگابایت رم، فقط stdlib، روی سرور ۵۱۲ مگابایتی راحت اجرا می‌شود.
 - ♻️ **مقاوم در برابر ریبوت** — کاربرها در حافظه‌ی xray هستند؛ enforcer بعد از هر ری‌استارت همه را خودکار resync می‌کند و لینک‌ها تغییر نمی‌کنند.
@@ -151,10 +151,10 @@ mohajer/
 
 آی‌پی سرور روی بعضی اینترنت‌ها throttle می‌شود. به‌جای در معرض گذاشتنِ مستقیمِ سرور، یک
 تونل **`cloudflared`** از سمت سرور به کلادفلر وصل می‌شود (فقط خروجی، پشت NAT هم کار
-می‌کند). کلاینت‌ها به **آی‌پی‌های تمیزِ لبه‌ی کلادفلر** وصل می‌شوند؛ کلادفلر بر اساس
-Host/SNI و مسیر، ترافیک را از تونل به inboundهای محلیِ `xray` می‌رساند. چون anycastِ
-کلادفلر هر دامنه را از هر آی‌پی لبه سرو می‌کند، می‌توانی لینک‌ها را به سریع‌ترین آی‌پی‌ها
-برای شبکه‌ی کاربرانت اشاره بدهی — و آن‌ها را زنده از داخل ربات عوض کنی.
+می‌کند). کلاینت‌ها به **دامنهٔ پروکسی‌شدهٔ کلادفلر** یا IP لبهٔ انتخابی وصل می‌شوند؛
+کلادفلر بر اساس Host/SNI و مسیر، ترافیک را از تونل به inboundهای محلیِ `xray`
+می‌رساند. در حالت دامنه، DNS آدرس لبه را تعیین می‌کند. اگر IP برگشتی در یک شبکه
+مسدود باشد، باید از مسیر پشتیبان مستقل استفاده کرد.
 
 ### 🚀 نصب سریع — فقط یک ویزارد
 
