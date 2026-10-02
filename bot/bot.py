@@ -198,7 +198,7 @@ def _rotate_legacy_emails(token):
                   "ON CONFLICT(token,tag) DO UPDATE SET email=excluded.email", (token, tag, email))
     c.commit(); c.close()
 
-def _adu(ep, secret, email):
+def _user_inbound(ep, secret, email):
     if "reality" in ep:
         r = ep["reality"]
         cl = {"id": secret, "email": email, "level": 0}
@@ -217,18 +217,32 @@ def _adu(ep, secret, email):
         elif proto == "vmess": settings = {"clients": [{"id": secret, "email": email, "level": 0}]}
         else:                  settings = {"clients": [{"id": secret, "email": email, "level": 0}], "decryption": "none"}
         ib = {"tag": ep["tag"], "listen": "127.0.0.1", "port": ep["port"], "protocol": proto, "settings": settings, "streamSettings": stream}
+    return ib
+
+def _adu_inbounds(inbounds):
+    if not inbounds: return True
+    expected = {cl["email"] for ib in inbounds for cl in ib["settings"]["clients"]}
     fd, f = tempfile.mkstemp(prefix="dpbot_adu_", suffix=".json")
     try:
         with os.fdopen(fd, "w") as out:
-            json.dump({"inbounds": [ib]}, out)
-        r = subprocess.run([XRAY_BIN, "api", "adu", "--server=%s" % XRAY_API, f], capture_output=True, text=True, timeout=15)
+            json.dump({"inbounds": inbounds}, out)
+        r = subprocess.run([XRAY_BIN, "api", "adu", "--server=%s" % XRAY_API, "-timeout=10", f],
+                           capture_output=True, text=True, timeout=15)
         out = (r.stdout + r.stderr).lower()
     except Exception as e:
         out = str(e).lower()
     finally:
         try: os.remove(f)
         except Exception: pass
-    return ("add user:" in out) or ("already" in out) or ("exists" in out)
+    # The CLI prints "add user" before the API call and can exit 0 even when
+    # that call failed. Require a result for every identity in the batch.
+    results = {}
+    for match in re.finditer(r"add user:\s*([^\s]+)\s*\n(.*?)(?=add user:|processing inbound:|added \d+ user|\Z)", out, re.S):
+        results[match[1]] = "result: ok" in match[2] or "already exists" in match[2]
+    return all(results.get(email.lower(), False) for email in expected)
+
+def _adu(ep, secret, email):
+    return _adu_inbounds([_user_inbound(ep, secret, email)])
 
 def xr_add_user(token, secret):
     ok = True
@@ -245,6 +259,29 @@ def xr_add_user(token, secret):
         elif not _adu(ep, secret, legacy_email(token, ep["tag"])):
             ok = False
     return ok
+
+def xr_add_users(users):
+    """Restore a fleet after restart using one CLI process/API connection."""
+    inbounds = {}
+    for u in users:
+        token = u["token"]
+        slots = active_slot_keys(token)
+        converted = slot_mode_tags(token)
+        for ep in ENDPOINTS:
+            ep_slots = sorted(s for s in slots if s[0] == ep["tag"])
+            if not ep_slots: continue
+            if u["credential_mode"] == "slots" or ep["tag"] in converted:
+                identities = [ensure_slot_credential(token, ep, security, port)
+                              for _, security, port in ep_slots]
+            else:
+                identities = [{"secret": u["uuid"], "email": legacy_email(token, ep["tag"])}]
+            for identity in identities:
+                ib = _user_inbound(ep, identity["secret"], identity["email"])
+                if ep["tag"] in inbounds:
+                    inbounds[ep["tag"]]["settings"]["clients"].extend(ib["settings"]["clients"])
+                else:
+                    inbounds[ep["tag"]] = ib
+    return _adu_inbounds(list(inbounds.values()))
 
 def _rmu_email(tag, email):
     try:
@@ -1442,7 +1479,6 @@ def create_user(vol_gb, dur_days, label=None):
     return token
 
 def delete_user(token):
-    refresh_usage(token)
     c = db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone()
     if not u: c.close(); return False
     c.close()
@@ -1454,7 +1490,7 @@ def delete_user(token):
         return False
     c = db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone()
     if not u: c.close(); return False
-    custom = u["config_override"] is not None
+    routed = u["config_override"] is not None and effective_outbounds(token) != get_outbounds()
     # Keep lifetime totals and daily rows when deleting a subscription.
     retired = int(meta_get("retired_bytes", "0") or 0) + int(u["used_bytes"] or 0)
     c.execute("INSERT INTO meta(k,v) VALUES('retired_bytes',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
@@ -1463,20 +1499,15 @@ def delete_user(token):
     c.execute("DELETE FROM slot_mode_tags WHERE token=?", (token,))
     c.execute("DELETE FROM legacy_emails WHERE token=?", (token,))
     c.execute("DELETE FROM usage_ledger WHERE token=?", (token,))
+    if routed:
+        c.execute("INSERT INTO meta(k,v) VALUES('outbound_sync_pending','1') "
+                  "ON CONFLICT(k) DO UPDATE SET v='1'")
     c.execute("DELETE FROM users WHERE token=?", (token,)); c.commit(); c.close()
     del_sub(token)
     force_disconnect(tags)
-    if custom:
-        try:
-            applied, reason = apply_xray_outbounds()
-        except Exception as exc:
-            applied, reason = False, str(exc)
-        if applied:
-            meta_set("outbound_sync_pending", "")
-            resync_all()
-        else:
-            meta_set("outbound_sync_pending", "1")
-            print("outbound cleanup pending:", reason, flush=True)
+    # Authentication and live sessions are already revoked. Only a divergent
+    # custom route needs cleanup; the enforcer can remove its orphan rules
+    # without blocking this request on a restart and fleet-wide resync.
     return True
 
 def exhaust_reason(u, now=None):
@@ -1506,11 +1537,14 @@ def reenable_user(token):
     c = db(); c.execute("UPDATE users SET disabled_ts=0,auth_pending=0 WHERE token=?", (token,)); c.commit(); c.close()
     return True
 
-def maybe_reenable(token):
+def maybe_reenable(token, refresh=False):
     # after an extend: if it was disabled but now has quota/time again, bring it back live immediately
     c = db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone(); c.close()
-    if u and u["disabled_ts"] and not u["frozen"] and not exhaust_reason(u):
-        return reenable_user(token)
+    if u and u["disabled_ts"] and not u["frozen"]:
+        if refresh:
+            refresh_usage(token)
+            c = db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone(); c.close()
+        if u and not exhaust_reason(u): return reenable_user(token)
     return False
 
 def freeze_user(token):
@@ -1752,7 +1786,7 @@ def resync_all(allow_missing_stats_restart=True):
     # A failed per-link revocation must not restore its old shared credential.
     begin_xray_counter_epoch()
     c = db(); rows = c.execute("SELECT * FROM users").fetchall(); c.close()
-    ok = True; cut = set(); missing_stats = {}
+    ok = True; cut = set(); missing_stats = {}; eligible = []
     for u in rows:
         user_ok, user_cut, diagnosis = _reconcile_user_membership(u)
         cut.update(user_cut)
@@ -1762,10 +1796,11 @@ def resync_all(allow_missing_stats_restart=True):
                 missing_stats[u["token"]] = diagnosis["missing_stats_pid"]
             continue
         if not _eligible_for_membership(u): continue  # grace, freeze, or exhausted quota -> keep out of xray
-        if not xr_add_user(u["token"], u["uuid"]):
-            ok = False
-            continue
-        write_sub(u["token"], u["uuid"], u["label"])
+        eligible.append(u)
+    if xr_add_users(eligible):
+        for u in eligible: write_sub(u["token"], u["uuid"], u["label"])
+    else:
+        ok = False
     if cut: force_disconnect(cut)
     meta_set("membership_sync_pending", "" if ok else "1")
     if not ok and missing_stats and allow_missing_stats_restart:
@@ -1875,6 +1910,56 @@ def extend_time(token, days):
         now = int(time.time()); base = u["expiry_ts"] if (u["expiry_ts"] or 0) > now else now
         c.execute("UPDATE users SET expiry_ts=? WHERE token=?", (base + int(float(days) * 86400), token)); c.commit()
     c.close()
+
+def prepare_bulk_extension(kind, amount, now=None):
+    now = int(time.time()) if now is None else now
+    field, unit = {"volume": ("limit_bytes", GB), "time": ("expiry_ts", 86400)}.get(kind, (None, None))
+    try:
+        value = float(str(amount).replace(",", "."))
+        scaled = value * unit if unit else 0
+        if not math.isfinite(scaled) or scaled < 1 or scaled > 2**63 - 1: raise ValueError()
+        delta = int(scaled)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("مقدار افزایش باید عددی مثبت و معتبر باشد")
+    c = db()
+    try:
+        rows = c.execute("SELECT token FROM users WHERE pending_delete=0 AND %s>0" % field).fetchall()
+    finally:
+        c.close()
+    rec = {"kind": kind, "amount": value, "delta": delta, "tokens": [r["token"] for r in rows],
+           "expires": now + 600}
+    operation = secrets.token_hex(16)
+    meta_set("bulk_" + operation, json.dumps(rec))
+    return operation, rec
+
+def apply_bulk_extension(operation, now=None):
+    """Apply a reviewed set once, atomically; enforcer renews eligible disabled links."""
+    now = int(time.time()) if now is None else now
+    c = db()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        row = c.execute("SELECT v FROM meta WHERE k=?", ("bulk_" + operation,)).fetchone()
+        if not row: raise ValueError("درخواست افزایش گروهی پیدا نشد؛ دوباره بررسی کنید")
+        rec = json.loads(row["v"])
+        if "count" in rec: return rec["count"]  # a retry must not add the quota twice
+        if now >= rec["expires"]: raise ValueError("تأیید افزایش گروهی منقضی شد؛ دوباره بررسی کنید")
+        field = {"volume": "limit_bytes", "time": "expiry_ts"}[rec["kind"]]
+        count = 0
+        for token in rec["tokens"]:
+            user = c.execute("SELECT %s AS value FROM users WHERE token=? AND pending_delete=0 AND %s>0" %
+                             (field, field), (token,)).fetchone()
+            if not user: continue  # deleted or changed to unlimited since the review
+            base = max(user["value"], now) if rec["kind"] == "time" else user["value"]
+            value = base + rec["delta"]
+            if value > 2**63 - 1: raise ValueError("مقدار افزایش بیش از حد بزرگ است")
+            c.execute("UPDATE users SET %s=? WHERE token=?" % field, (value, token))
+            count += 1
+        rec["count"] = count
+        c.execute("UPDATE meta SET v=? WHERE k=?", (json.dumps(rec), "bulk_" + operation))
+        c.commit()
+        return count
+    finally:
+        c.close()
 
 def set_unlimited(token, field):
     c = db(); c.execute("UPDATE users SET %s=0 WHERE token=?" % field, (token,)); c.commit(); c.close()
@@ -2482,7 +2567,7 @@ def _user_row(u, online=False):
         badge, fmt_bytes(used), human_limit(lim), fill,
         fmt_bytes(u["today"]), human_expiry(u["expiry_ts"]))
 
-def render_dashboard(csrf):
+def render_dashboard(csrf, msg=""):
     total, today, last30 = panel_usage_summary()
     ov = users_overview()
     active = sum(1 for u in ov if not u["disabled_ts"]); disabled = len(ov) - active
@@ -2507,8 +2592,44 @@ def render_dashboard(csrf):
              "document.querySelectorAll('a.u').forEach(function(row){var hit=row.textContent.toLocaleLowerCase().includes(term);"
              "row.hidden=!hit;if(hit)seen++;});e.hidden=seen!==0;});})();</script>") % (_icon("sliders"), rows)
     heading = _page_heading("نمای کلی", "مصرف و وضعیت لینک‌ها در یک نگاه",
-                            "<a class=btn href='/a/new'>%s لینک جدید</a>" % _icon("plus"))
-    return _page("پنل", _top("", csrf) + heading + hero + users)
+                            "<div class=row><a class=btn href='/a/new'>%s لینک جدید</a>"
+                            "<a class='btn ghost' href='/a/bulk'>%s افزایش گروهی</a></div>" % (_icon("plus"), _icon("plus")))
+    return _page("پنل", _top("", csrf) + _config_message(msg) + heading + hero + users)
+
+def render_bulk(csrf, msg=""):
+    c = db()
+    try:
+        counts = c.execute("SELECT SUM(limit_bytes>0),SUM(expiry_ts>0) FROM users WHERE pending_delete=0").fetchone()
+    finally:
+        c.close()
+    cards = []
+    for kind, label, unit, count in (("volume", "حجم", "گیگابایت", counts[0] or 0),
+                                     ("time", "مدت", "روز", counts[1] or 0)):
+        cards.append("<div class=card><h2>افزایش گروهی %s</h2><p class=hint>%d لینک دارای %s محدود</p>"
+                     "<form class=grid method=post action='/a/bulk-preview'>"
+                     "<input type=hidden name=csrf value='%s'><input type=hidden name=kind value='%s'>"
+                     "<label class=field><span>افزایش %s هر لینک (%s)</span>"
+                     "<input type=number name=amount step=any min=0 required placeholder='مثلاً ۰٫۵'></label>"
+                     "<div class=row><button class=btn%s>بررسی افزایش %s</button></div></form></div>" %
+                     (label, count, label, csrf, kind, label, unit, " disabled" if not count else "", label))
+    return _page("افزایش گروهی", _top(_back("/a/", "داشبورد"), csrf) + _config_message(msg) +
+                 _page_heading("افزایش گروهی", "مقدار افزایش به سهمیهٔ هر لینک این پنل اضافه می‌شود.") +
+                 "<div class=card><p class=hint>کانفیگ‌های هر لینک سهمیهٔ مشترک دارند. حجم و مدت نامحدود حفظ می‌شود. "
+                 "لینک‌های منقضی هم مشمول‌اند؛ مدت آن‌ها از زمان تأیید محاسبه می‌شود. "
+                 "لینک‌های فریز دستی، فریز می‌مانند.</p></div><div class=manage-grid>" + "".join(cards) + "</div>")
+
+def render_bulk_confirm(operation, rec, csrf):
+    unit = "گیگابایت حجم" if rec["kind"] == "volume" else "روز مدت"
+    count = len(rec["tokens"])
+    form = _form("/a/bulk-apply", ["<input type=hidden name=operation value='%s'>" % operation,
+                                    "<input type=hidden name=confirm value=yes>"], csrf,
+                 "تأیید افزایش برای %d لینک" % count)
+    return _page("تأیید افزایش گروهی", _top(_back("/a/bulk", "بازگشت"), csrf) +
+                 "<div class=card><h2>تأیید افزایش گروهی</h2><p>به هر یک از <b>%d لینک</b>، "
+                 "<b>%s %s</b> اضافه می‌شود.</p><p class=hint>سهمیهٔ نامحدود و فریز دستی حفظ می‌شود. "
+                 "لینک‌های غیرفعالی که پس از افزایش، حجم و زمان معتبر دارند، تا %d ثانیه دوباره فعال می‌شوند.</p>"
+                 "<div class=row>%s<a class='btn ghost' href='/a/bulk'>انصراف</a></div></div>" %
+                 (count, _config_html("%g" % rec["amount"]), unit, POLL, form))
 
 def _form(action, fields, csrf, btn, cls="btn"):
     inner = "".join(fields) + "<input type=hidden name=csrf value='%s'>" % csrf
@@ -2980,7 +3101,8 @@ def route_admin(method, path, query, cookie_header, body, now=None):
     if not csrf:
         return 200, {"Content-Type": "text/html; charset=utf-8"}, render_expired().encode("utf-8")
     if method == "GET":
-        if path in ("/a", "/a/"):      return _html(render_dashboard(csrf))
+        if path in ("/a", "/a/"):      return _html(render_dashboard(csrf, query.get("msg", [""])[0]))
+        if path == "/a/bulk":          return _html(render_bulk(csrf, query.get("msg", [""])[0]))
         if path == "/a/user":          return _html(render_user(query.get("token", [""])[0], csrf, query.get("msg", [""])[0]))
         if path == "/a/new":           return _html(render_new(csrf))
         if path == "/a/config":        return _html(render_config(csrf, query.get("msg", [""])[0]))
@@ -3084,6 +3206,19 @@ def route_admin_post(method, path, query, csrf, body, now, sid):
         _sess_drop(sid)          # manual logout is the only thing that ends a session
         ck = "mj_sess=; HttpOnly; Secure; SameSite=Strict; Path=/a; Max-Age=0"
         return 200, {"Content-Type": "text/html; charset=utf-8", "Set-Cookie": ck}, render_loggedout().encode("utf-8")
+    if path == "/a/bulk-preview":
+        try:
+            operation, rec = prepare_bulk_extension(form.get("kind"), form.get("amount"), now)
+            if not rec["tokens"]: raise ValueError("لینک مشمولی برای این افزایش وجود ندارد")
+        except ValueError as exc:
+            return _redirect("/a/bulk?msg=" + urllib.parse.quote("خطا: " + str(exc)))
+        return _html(render_bulk_confirm(operation, rec, csrf))
+    if path == "/a/bulk-apply":
+        if form.get("confirm") != "yes": return _redirect("/a/bulk")
+        try: count = apply_bulk_extension(form.get("operation", ""), now)
+        except ValueError as exc:
+            return _redirect("/a/bulk?msg=" + urllib.parse.quote("خطا: " + str(exc)))
+        return _redirect("/a/?msg=" + urllib.parse.quote("افزایش گروهی برای %d لینک اعمال شد" % count))
     token = form.get("token", "")
     def _num(x, cast):
         try:
@@ -3093,7 +3228,7 @@ def route_admin_post(method, path, query, csrf, body, now, sid):
     if path == "/a/addvol":
         gb = _num(form.get("gb"), float)
         if gb: extend_volume(token, gb)
-        refresh_usage(token); maybe_reenable(token); return _redirect("/a/user?token=" + token)
+        maybe_reenable(token, refresh=True); return _redirect("/a/user?token=" + token)
     if path == "/a/addtime":
         days = _num(form.get("days"), float)
         if days: extend_time(token, days)

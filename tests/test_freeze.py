@@ -16,6 +16,7 @@ class FreezeBase(unittest.TestCase):
         self._save = {}
         for name, fn in [
             ("xr_add_user",    lambda t, s: self.added.append(t) or True),
+            ("xr_add_users",   lambda users: self.added.extend(u["token"] for u in users) or True),
             ("xr_remove_user", lambda t: self.removed.append(t) or True),
             ("write_sub",      lambda t, s, l: self.wrote.append(t)),
             ("online_tags_of", lambda t: set()),
@@ -80,6 +81,27 @@ class FreezeTests(FreezeBase):
         c = bot.db(); c.execute("UPDATE users SET usage_reset_bytes=used_bytes WHERE token='t1'"); c.commit(); c.close()
         self.assertTrue(bot.maybe_reenable("t1"))
         self.assertIn("t1", self.added)
+
+    def test_active_renewal_does_not_wait_for_xray_usage(self):
+        self._mk()
+        original = bot.refresh_usage
+        bot.refresh_usage = lambda token: self.fail("active link renewal must not query Xray")
+        try:
+            self.assertFalse(bot.maybe_reenable("t1", refresh=True))
+        finally:
+            bot.refresh_usage = original
+
+    def test_disabled_renewal_reads_usage_before_reenabling(self):
+        self._mk(limit=100, used=50, disabled=123456)
+        original = bot.refresh_usage
+        def refresh(token):
+            c = bot.db(); c.execute("UPDATE users SET used_bytes=150 WHERE token=?", (token,)); c.commit(); c.close()
+        bot.refresh_usage = refresh
+        try:
+            self.assertFalse(bot.maybe_reenable("t1", refresh=True))
+            self.assertNotIn("t1", self.added)
+        finally:
+            bot.refresh_usage = original
 
     def test_resync_all_skips_frozen(self):
         self._mk(token="a", frozen=1)

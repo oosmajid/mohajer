@@ -30,6 +30,12 @@ class ProtocolEnforcement(unittest.TestCase):
         self.saved = {}
         self.added, self.removed, self.kicked = [], [], []
         self.patch("_adu", lambda ep, secret, email: self.added.append((ep["tag"], secret, email)) or True)
+        def add_batch(inbounds):
+            for ib in inbounds:
+                for cl in ib["settings"]["clients"]:
+                    self.added.append((ib["tag"], cl.get("id", cl.get("password")), cl["email"]))
+            return True
+        self.patch("_adu_inbounds", add_batch)
         self.patch("_rmu_email", lambda tag, email: self.removed.append((tag, email)) or True)
         self.patch("force_disconnect", lambda tags: self.kicked.append(set(tags)))
         self.patch("xr_online_map", lambda: {})
@@ -173,6 +179,51 @@ class ProtocolEnforcement(unittest.TestCase):
         self.assertTrue(bot.delete_user("a"))
         c = bot.db(); u = c.execute("SELECT token FROM users WHERE token='a'").fetchone(); c.close()
         self.assertIsNone(u)
+
+    def test_deleting_copied_custom_settings_does_not_resync_fleet(self):
+        self.user("a", mode="slots")
+        bot.set_link_override("a", bot.global_settings_snapshot())
+        self.patch("apply_xray_outbounds", lambda: self.fail("no routing cleanup needed"))
+        self.patch("resync_all", lambda: self.fail("unrelated users must not be resynced"))
+        self.assertTrue(bot.delete_user("a"))
+        self.assertNotEqual(bot.meta_get("outbound_sync_pending"), "1")
+
+    def test_deleting_custom_route_queues_cleanup_after_revocation(self):
+        self.user("a", mode="slots")
+        self.assertTrue(bot.xr_add_user("a", "unused"))
+        custom = bot.global_settings_snapshot()
+        custom["outbounds"] = [{"tag": "clean", "link": "socks://1.2.3.4:1080", "domains": []}]
+        bot.set_link_override("a", custom)
+        self.patch("apply_xray_outbounds", lambda: self.fail("cleanup must run in enforcer"))
+        self.assertTrue(bot.delete_user("a"))
+        self.assertEqual(bot.meta_get("outbound_sync_pending"), "1")
+        self.assertEqual(len(self.removed), 2)
+        self.assertTrue(self.kicked)
+        self.assertEqual(bot._custom_outbound_sets(), {})
+
+    def test_batch_restore_preserves_secrets_and_excludes_ineligible_users(self):
+        self.user("legacy")
+        self.user("slots", mode="slots")
+        self.user("frozen", mode="slots", frozen=1)
+        self.user("deleting", mode="slots")
+        self.assertTrue(bot.xr_add_user("slots", "unused"))
+        before = bot._slot_credential_map("slots")
+        c = bot.db(); c.execute("UPDATE users SET pending_delete=1 WHERE token='deleting'"); c.commit(); c.close()
+        batches = []
+        self.patch("_adu_inbounds", lambda inbounds: batches.append(inbounds) or True)
+        self.assertTrue(bot.resync_all())
+        self.assertEqual(len(batches), 1)
+        clients = [cl for ib in batches[0] for cl in ib["settings"]["clients"]]
+        self.assertEqual({cl["email"].split('.')[0] for cl in clients}, {"u_legacy", "u_slots"})
+        self.assertEqual({cl['id'] for cl in clients if cl['email'].startswith('u_slots.')},
+                         {cl['secret'] for cl in before.values()})
+        self.assertIn("00000000-0000-4000-8000-000000000001", {cl['id'] for cl in clients})
+
+    def test_incomplete_batch_keeps_membership_retry_pending(self):
+        self.user("a", mode="slots")
+        self.patch("_adu_inbounds", lambda inbounds: False)
+        self.assertFalse(bot.resync_all())
+        self.assertEqual(bot.meta_get("membership_sync_pending"), "1")
 
     def test_failed_freeze_removal_stays_frozen_for_retry(self):
         self.user("a", mode="slots")

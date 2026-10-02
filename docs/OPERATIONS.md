@@ -81,6 +81,24 @@ CSRF-protected; delete needs a second confirm. A bot restart clears all
 sessions/login-links — just send `/admin` again. The panel binds `127.0.0.1`
 only, so it is unreachable except through this ingress.
 
+## Bulk quota and time
+
+Use **افزایش گروهی** in the dashboard. Enter GB per link or days per link,
+review the number of affected links, and confirm within ten minutes. Decimal
+amounts are supported. This applies to the current panel's reviewed links;
+every configuration inside a subscription shares its link's quota.
+
+Unlimited quota/time fields remain unlimited. Pending deletions are excluded;
+manually frozen links stay frozen. Expired links receive time starting at
+confirmation. The enforcer re-enables eligible disabled links on its next poll.
+The transaction records its result, so repeating the confirmation cannot add
+the amount twice. No credentials or subscription URLs are changed.
+
+Deleting a custom link no longer resyncs every user when its outbound routing
+matches the public routing. Cleanup for divergent custom routing runs through
+the existing enforcer retry queue after access is revoked. Necessary full
+resyncs restore stored identities through one Xray CLI batch.
+
 
 ## Relay ingresses
 

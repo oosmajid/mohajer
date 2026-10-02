@@ -169,6 +169,19 @@ On all four panel hosts, the active `xray.service` reads
   the snapshot, so later global changes apply again. Port and protocol removals
   revoke old Xray credentials; older links migrate the affected endpoint to slot
   credentials the first time its ports change.
+- **Delete latency / resync:** deleting a custom link with copied global routing
+  does not rewrite outbounds or resync other users. Divergent custom route cleanup
+  is queued atomically in `outbound_sync_pending` after revocation; the enforcer
+  handles it. `resync_all()` restores eligible users in one `api adu` batch with
+  their stored legacy/per-slot secrets. Every batch result must be acknowledged;
+  a zero CLI exit code alone does not prove registration succeeded.
+- **Bulk quota/time:** dashboard **افزایش گروهی** opens `/a/bulk`. Review a positive
+  decimal GB/day amount, then confirm the displayed set of finite links within
+  ten minutes. Unlimited fields and pending deletion links are excluded; expired
+  time starts at confirmation time, manual freeze remains. The confirmed set is
+  stored in `meta.bulk_<operation>` and applied in one SQLite transaction with a
+  durable result, so retrying a POST cannot extend twice. Credentials, usage and
+  subscription files remain unchanged. The enforcer renews eligible disabled links.
 - **TLS client settings:** public and custom endpoint settings store independent
   `fingerprint` (default `chrome`), `fragment_fm`, and `ech_enabled` (default false).
   Removing Fragment does not remove fingerprint or ALPN. ECH only applies to CDN
