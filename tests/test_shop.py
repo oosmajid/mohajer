@@ -725,5 +725,89 @@ class ShopServicesTests(SalesCase):
         self.assertEqual(actions, ["outage_start", "outage_end"])
 
 
+class ShopReferralTests(SalesCase):
+    def setUp(self):
+        super().setUp()
+        shop.set_setting("bot_username", "MohajerShopBot")
+        bot.handle_update(msg(BOB, "/start ref_%d" % ALICE))       # Bob is Alice's friend
+        self.calls.clear()
+
+    def gift(self, uid, amount):
+        bot.handle_update(cb(ADMIN, "sa:uwal:%d:add" % uid)); bot.handle_update(msg(ADMIN, "%d هدیه" % amount))
+
+    def ledger(self, uid):
+        return [tuple(r) for r in bot.db().execute("SELECT kind, delta FROM shop_wallet_tx WHERE tg_id=? ORDER BY id", (uid,))]
+
+    def test_invite_page_link_share_and_stats(self):
+        bot.handle_update(msg(ALICE, shop.B_INVITE))
+        page = self.last()
+        self.assertIn("https://t.me/MohajerShopBot?start=ref_%d" % ALICE, page["text"])
+        self.assertIn("دعوت‌شده‌ها: ۱ · خریدارها: ۰", page["text"])
+        share = page["reply_markup"]["inline_keyboard"][0][0]["url"]
+        self.assertTrue(share.startswith("https://t.me/share/url?url=https%3A%2F%2Ft.me%2FMohajerShopBot"))
+        bot.handle_update(cb(ALICE, "c:ref_msg"))
+        self.assertTrue(self.last()["text"].endswith("start=ref_%d" % ALICE))
+
+    def test_inviter_hears_about_new_friend_once(self):
+        bot.handle_update(msg(300 + 1, "/start ref_%d" % ALICE))
+        bot.handle_update(msg(300 + 1, "/start ref_%d" % ALICE))
+        self.assertEqual(len([t for t in self.texts(ALICE) if "عضو شد" in t]), 1)
+
+    def test_friend_gets_first_purchase_discount_only(self):
+        bot.handle_update(msg(BOB, shop.B_BUY))
+        self.assertIn("۱۰٪ تخفیف", self.last()["text"])
+        self.assertIn("۱۳۵٬۰۰۰ تومان", self.last()["reply_markup"]["inline_keyboard"][0][0]["text"])
+        bot.handle_update(cb(BOB, "c:plan:%d" % self.plan["id"]))
+        self.assertIn("<s>۱۵۰٬۰۰۰</s>", self.last("editMessageText")["text"])
+        o = self.buy(BOB)
+        self.assertEqual((o["price"], o["discount"]), (135000, 15000))
+        self.assertTrue(135001 <= o["amount"] <= 135999)
+        bot.handle_update(photo(BOB)); bot.handle_update(cb(ADMIN, "r:ok:%d" % o["id"]))
+        o2 = self.buy(BOB)
+        self.assertEqual((o2["price"], o2["discount"]), (150000, 0))
+        bot.handle_update(msg(ALICE, shop.B_BUY))                   # not invited: full price
+        self.assertNotIn("تخفیف", self.last()["text"])
+
+    def test_inviter_rewarded_once_after_first_real_purchase(self):
+        bot.handle_update(cb(BOB, "c:test"))                        # a free test is not a purchase
+        self.assertEqual(self.ledger(ALICE), [])
+        o = self.buy(BOB); bot.handle_update(photo(BOB)); bot.handle_update(cb(ADMIN, "r:ok:%d" % o["id"]))
+        self.assertEqual(self.ledger(ALICE), [("referral", 13500)])    # 10% of what Bob paid (135,000)
+        self.assertIn("پاداش", self.texts(ALICE)[-1])
+        self.gift(BOB, 150000); bot.handle_update(cb(BOB, "c:wpay:%d" % self.plan["id"]))
+        self.assertEqual(self.ledger(ALICE), [("referral", 13500)])
+        bot.handle_update(msg(ALICE, shop.B_INVITE))
+        self.assertIn("خریدارها: ۱", self.last()["text"]); self.assertIn("۱۳٬۵۰۰ تومان", self.last()["text"])
+
+    def test_wallet_first_purchase_also_rewards_and_discounts(self):
+        self.gift(BOB, 135000)
+        bot.handle_update(cb(BOB, "c:plan:%d" % self.plan["id"]))
+        self.assertEqual(self.last("editMessageText")["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
+                         "c:wpay:%d" % self.plan["id"])
+        bot.handle_update(cb(BOB, "c:wpay:%d" % self.plan["id"]))
+        self.assertEqual(shop.balance(BOB), 0)
+        self.assertEqual(self.ledger(ALICE), [("referral", 13500)])
+
+    def test_failed_wallet_purchase_neither_counts_nor_rewards(self):
+        self.gift(BOB, 135000)
+        bot.create_user = lambda *a, **k: None
+        bot.handle_update(cb(BOB, "c:wpay:%d" % self.plan["id"]))
+        self.assertEqual(self.ledger(ALICE), [])
+        self.assertEqual(shop.first_buy_discount(BOB), 10)
+
+    def test_admin_changes_percentages(self):
+        bot.handle_update(cb(ADMIN, "sa:ref"))
+        self.assertIn("دعوت‌شده‌ها: ۱", self.last("editMessageText")["text"])
+        bot.handle_update(cb(ADMIN, "sa:ref_reward:20")); bot.handle_update(cb(ADMIN, "sa:ref_discount:0"))
+        bot.handle_update(cb(ADMIN, "sa:ref_reward:7"))           # not a choice
+        self.assertEqual((shop.ref_reward_pct(), shop.ref_discount_pct()), (20, 0))
+        o = self.buy(BOB)
+        self.assertEqual(o["price"], 150000)
+        bot.handle_update(photo(BOB)); bot.handle_update(cb(ADMIN, "r:ok:%d" % o["id"]))
+        self.assertEqual(self.ledger(ALICE), [("referral", 30000)])
+        actions = [r["action"] for r in bot.db().execute("SELECT action FROM shop_admin_log WHERE action LIKE 'ref_%'")]
+        self.assertEqual(actions, ["ref_reward", "ref_discount"])
+
+
 if __name__ == "__main__":
     unittest.main()

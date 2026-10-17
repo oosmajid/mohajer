@@ -257,6 +257,9 @@ On all four panel hosts, the active `xray.service` reads
   refuse to go negative and write the ledger row; `(kind, ref)` is unique so a retried credit is a no-op.
 - **Shop ticker** (`shop.tick`, every 60s): daily backup, test follow-ups, expiring unpaid invoices,
   wallet auto-renewals, then usage/expiry warnings (`warn_flags` bits, reset on every buy/renewal).
+- **Referrals:** `referrer_id` is only set when a customer is first created. Invitees get
+  `meta.shop_ref_discount`% off until their first approved purchase (`priced()`); the inviter gets
+  `meta.shop_ref_reward`% of it once, guarded by the unique ledger ref `ref:<invitee id>`.
 - **Inspect state:** `sqlite3 <db> "SELECT label,used_bytes,max(used_bytes-usage_reset_bytes,0) AS current_used,limit_bytes,expiry_ts FROM users"`.
 
 ## 6. Verifying a change without breaking prod
@@ -303,7 +306,7 @@ shop_services(token, tg_id, kind, created_ts, followup_sent, feedback, plan_id, 
                                                     -- customer <-> users.token; kind test|paid
 shop_plans(id, gb, days, price, active, popular)    -- 0 gb/days = unlimited
 shop_cards(id, number, holder, active)              -- card-to-card destinations, one picked per invoice
-shop_orders(id, tg_id, kind buy|renew|topup, pay_method card|wallet, token, gb, days, price, amount, paid_amount, card_id, status,
+shop_orders(id, tg_id, kind buy|renew|topup, pay_method card|wallet, discount, token, gb, days, price, amount, paid_amount, card_id, status,
             receipt_file, receipt_uid UNIQUE, ..., review_msgs) -- awaiting->review->approved|rejected; expired|cancelled
 shop_staff(tg_id, role, added_ts, added_by)          -- role 'support'; owners = ADMIN_IDS
 shop_admin_log(id, ts, actor, action, target, detail) -- audit trail of admin/support actions

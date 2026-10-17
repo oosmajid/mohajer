@@ -4,7 +4,7 @@
 # staff. This module reuses bot.py's core (db, tg, create_user, enforcer state ...)
 # through `core`, which bot.py binds once at import time (see bind()).
 # Roadmap and feature list: docs/SHOP.md.
-import os, json, time, html, sqlite3, secrets, tempfile, threading, urllib.request
+import os, json, time, html, sqlite3, secrets, tempfile, threading, urllib.request, urllib.parse
 
 core = None   # the bot module (bot.py); set by bind()
 
@@ -57,7 +57,8 @@ def init_db():
         amount INTEGER NOT NULL, paid_amount INTEGER, card_id INTEGER, status TEXT NOT NULL,
         receipt_file TEXT, receipt_uid TEXT UNIQUE, created_ts INTEGER NOT NULL, receipt_ts INTEGER,
         decided_ts INTEGER, decided_by INTEGER, note TEXT, review_msgs TEXT)""")
-    _add_cols(c, "shop_orders", [("pay_method", "TEXT NOT NULL DEFAULT 'card'")])   # card | wallet
+    _add_cols(c, "shop_orders", [("pay_method", "TEXT NOT NULL DEFAULT 'card'"),    # card | wallet
+                                 ("discount", "INTEGER NOT NULL DEFAULT 0")])        # toman off the list price
     _add_cols(c, "shop_services", [("plan_id", "INTEGER"),                          # plan used for auto-renew
                                    ("auto_renew", "INTEGER NOT NULL DEFAULT 0"),
                                    ("auto_note_ts", "INTEGER NOT NULL DEFAULT 0"),  # last "not enough balance" note
@@ -454,8 +455,38 @@ def owned_service(uid, token):
                   "WHERE s.token=? AND s.tg_id=?", (token, uid)).fetchone()
     c.close(); return r
 
+# --- referral discount ---
+REF_REWARD_DEFAULT, REF_DISCOUNT_DEFAULT = 10, 10   # percent
+REF_REWARD_CHOICES, REF_DISCOUNT_CHOICES = (0, 5, 10, 15, 20), (0, 5, 10, 15, 20)
+
+def ref_reward_pct():   return int(setting("ref_reward", REF_REWARD_DEFAULT))
+def ref_discount_pct(): return int(setting("ref_discount", REF_DISCOUNT_DEFAULT))
+
+def has_purchased(uid):
+    c = core.db()
+    n = c.execute("SELECT COUNT(*) FROM shop_orders WHERE tg_id=? AND status='approved' AND kind!='topup'", (uid,)).fetchone()[0]
+    c.close(); return n > 0
+
+def first_buy_discount(uid):
+    """Percent off for a customer who joined through an invite and has not bought yet."""
+    cust = get_customer(uid)
+    if not cust or not cust["referrer_id"] or has_purchased(uid): return 0
+    return ref_discount_pct()
+
+def priced(uid, plan):
+    """The plan as this customer pays for it (dict): price after any first-purchase discount."""
+    p = dict(plan); p["list_price"] = p.get("list_price", p["price"])
+    d = first_buy_discount(uid)
+    p["price"] = p["list_price"] * (100 - d) // 100
+    p["discount"] = p["list_price"] - p["price"]
+    return p
+
+def price_text(p):
+    return ("<s>%s</s> %s" % (fa("{:,}".format(p["list_price"]).replace(",", "٬")), toman(p["price"]))
+            if p.get("discount") else toman(p["price"]))
+
 def plans_view(uid, token=None):
-    plans = list_plans()
+    plans = [priced(uid, p) for p in list_plans()]
     if not plans:
         return "🛒 فعلاً پلنی برای فروش نداریم؛ به‌زودی برمی‌گردیم 🙏", None
     suffix = (":" + token) if token else ""
@@ -468,6 +499,8 @@ def plans_view(uid, token=None):
         head = "🔄 <b>تمدید «%s»</b>\nحجم و زمان پلن به همین سرویس اضافه می‌شه و لینکت عوض نمی‌شه:" % html.escape(u["label"] if u else "")
     else:
         head = "🛒 <b>خرید سرویس</b>\nیکی از پلن‌ها رو انتخاب کن:"
+    if plans[0]["discount"]:
+        head += "\n\n🎁 چون با دعوت دوستت اومدی، <b>%s٪ تخفیف</b> روی اولین خریدت داری (قیمت‌ها با تخفیفه)." % fa(first_buy_discount(uid))
     return head + ("\n\n" + "\n".join(per_gb) if per_gb else ""), kb
 
 def send_plans(chat, uid, token=None, mid=None):
@@ -477,8 +510,9 @@ def send_plans(chat, uid, token=None, mid=None):
 
 def invoice_view(plan, token=None, bal=0):
     suffix = (":" + token) if token else ""
-    text = ("🧾 <b>پیش‌فاکتور</b>\n\n📦 %s\n%s💰 مبلغ: <b>%s</b>\n👛 موجودی کیف پول: %s"
-            % (plan_title(plan["gb"], plan["days"]), "🔄 تمدید سرویس فعلی\n" if token else "", toman(plan["price"]), toman(bal)))
+    text = ("🧾 <b>پیش‌فاکتور</b>\n\n📦 %s\n%s💰 مبلغ: <b>%s</b>%s\n👛 موجودی کیف پول: %s"
+            % (plan_title(plan["gb"], plan["days"]), "🔄 تمدید سرویس فعلی\n" if token else "", price_text(plan),
+               " (🎁 تخفیف دعوت)" if plan.get("discount") else "", toman(bal)))
     kb = []
     if bal >= plan["price"]:
         kb.append([{"text": "💰 پرداخت از کیف پول (فوری)", "callback_data": "c:wpay:%d%s" % (plan["id"], suffix)}])
@@ -513,17 +547,18 @@ def create_order(uid, kind, price, plan=None, token=None, now=None):
         for _ in range(50):
             if amount not in taken: break
             amount = price + 1 + secrets.randbelow(999)
-        oid = c.execute("INSERT INTO shop_orders(tg_id,kind,token,plan_id,gb,days,price,amount,card_id,status,created_ts) "
-                        "VALUES(?,?,?,?,?,?,?,?,?,'awaiting',?)",
+        oid = c.execute("INSERT INTO shop_orders(tg_id,kind,token,plan_id,gb,days,price,amount,card_id,status,created_ts,discount) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,'awaiting',?,?)",
                         (uid, kind, token, plan["id"] if plan else None, plan["gb"] if plan else 0,
-                         plan["days"] if plan else 0, price, amount, secrets.choice(cards)[0], now)).lastrowid
+                         plan["days"] if plan else 0, price, amount, secrets.choice(cards)[0], now,
+                         (plan.get("discount", 0) if isinstance(plan, dict) else 0) if plan else 0)).lastrowid
         c.commit()
     finally:
         c.close()
     return get_order(oid)
 
 def plan_order(uid, plan, token=None):
-    return create_order(uid, "renew" if token else "buy", plan["price"], plan, token)
+    return create_order(uid, "renew" if token else "buy", priced(uid, plan)["price"], priced(uid, plan), token)
 
 def get_card(cid):
     c = core.db(); r = c.execute("SELECT * FROM shop_cards WHERE id=?", (cid,)).fetchone(); c.close(); return r
@@ -699,6 +734,7 @@ def approve(oid, uid):
                   [[{"text": "🛒 خرید سرویس", "callback_data": "c:buy"}]])
     else:
         deliver_message(o, token, "🎉 <b>پرداختت تأیید شد!</b>", extra)
+        reward_inviter(o)
     refresh_review(oid)
     return "ok"
 
@@ -716,14 +752,14 @@ def auto_kb(token):
 def wallet_buy(uid, plan, token=None, kind="purchase"):
     """Pay a plan from the wallet: debit + order row in one transaction, then deliver; a failed
     delivery is refunded. Returns (status, order, token); status ok | funds | failed."""
-    now = int(time.time())
+    now = int(time.time()); plan = priced(uid, plan)
     c = core.db()
     try:
         c.execute("BEGIN IMMEDIATE")
         oid = c.execute("INSERT INTO shop_orders(tg_id,kind,token,plan_id,gb,days,price,amount,status,created_ts,decided_ts,"
-                        "decided_by,pay_method) VALUES(?,?,?,?,?,?,?,?,'approved',?,?,?,'wallet')",
+                        "decided_by,pay_method,discount) VALUES(?,?,?,?,?,?,?,?,'approved',?,?,?,'wallet',?)",
                         (uid, "renew" if token else "buy", token, plan["id"], plan["gb"], plan["days"], plan["price"],
-                         plan["price"], now, now, uid)).lastrowid
+                         plan["price"], now, now, uid, plan["discount"])).lastrowid
         wallet_apply(c, uid, -plan["price"], kind, ref="order:%d" % oid)
         c.commit()
     except InsufficientFunds:
@@ -743,6 +779,7 @@ def wallet_buy(uid, plan, token=None, kind="purchase"):
         finally:
             c.close()
         return "failed", o, None
+    reward_inviter(o)
     return "ok", get_order(oid), tok
 
 def wallet_pay(chat, mid, uid, plan_id, token=None):
@@ -753,11 +790,64 @@ def wallet_pay(chat, mid, uid, plan_id, token=None):
         core.edit(chat, mid, "این سرویس پیدا نشد."); return
     status, o, tok = wallet_buy(uid, plan, token)
     if status == "funds":
-        text, kb = invoice_view(plan, token, balance(uid)); core.edit(chat, mid, "⚠️ موجودی کافی نیست.\n\n" + text, kb); return
+        text, kb = invoice_view(priced(uid, plan), token, balance(uid)); core.edit(chat, mid, "⚠️ موجودی کافی نیست.\n\n" + text, kb); return
     if status == "failed":
         core.edit(chat, mid, "❌ ساخت سرویس الان ممکن نشد؛ مبلغ به کیف پولت برگشت. چند دقیقهٔ دیگه دوباره امتحان کن."); return
-    core.edit(chat, mid, "✅ از کیف پولت %s کم شد. موجودی: %s" % (toman(plan["price"]), toman(balance(uid))))
+    core.edit(chat, mid, "✅ از کیف پولت %s کم شد. موجودی: %s" % (toman(o["price"]), toman(balance(uid))))
     deliver_message(o, tok, "🎉 <b>خریدت انجام شد!</b>")
+
+def reward_inviter(o):
+    """The inviter earns a share of the invitee's FIRST real purchase. ref='ref:<invitee>' is
+    unique in the ledger, so it can only ever be paid once per invited customer."""
+    cust = get_customer(o["tg_id"])
+    if not cust or not cust["referrer_id"] or o["kind"] == "topup": return
+    c = core.db()
+    n = c.execute("SELECT COUNT(*) FROM shop_orders WHERE tg_id=? AND status='approved' AND kind!='topup'", (o["tg_id"],)).fetchone()[0]
+    c.close()
+    amount = o["price"] * ref_reward_pct() // 100
+    if n != 1 or amount <= 0: return
+    bal = wallet_change(cust["referrer_id"], amount, "referral", ref="ref:%d" % o["tg_id"])
+    if bal is not None:
+        core.send(cust["referrer_id"], "🎉 دوستت %s اولین خریدش رو انجام داد!\n💰 %s پاداش به کیف پولت اضافه شد. موجودی: <b>%s</b>"
+                  % (html.escape(cust["first_name"] or ""), toman(amount), toman(bal)))
+
+def bot_username():
+    name = setting("bot_username")
+    if not name:
+        name = ((core.tg("getMe") or {}).get("result") or {}).get("username")
+        if name: set_setting("bot_username", name)
+    return name or "bot"
+
+def invite_link(uid):
+    return "https://t.me/%s?start=ref_%d" % (bot_username(), uid)
+
+def invite_stats(uid):
+    c = core.db()
+    invited = c.execute("SELECT COUNT(*) FROM shop_customers WHERE referrer_id=?", (uid,)).fetchone()[0]
+    buyers = c.execute("SELECT COUNT(DISTINCT o.tg_id) FROM shop_orders o JOIN shop_customers c ON c.tg_id=o.tg_id "
+                       "WHERE c.referrer_id=? AND o.status='approved' AND o.kind!='topup'", (uid,)).fetchone()[0]
+    earned = c.execute("SELECT COALESCE(SUM(delta),0) FROM shop_wallet_tx WHERE tg_id=? AND kind='referral'", (uid,)).fetchone()[0]
+    c.close(); return invited, buyers, earned
+
+def share_text():
+    d = ref_discount_pct()
+    return ("🔐 من از %s وی‌پی‌ان می‌گیرم و راضی‌ام. با لینک من بیا%s 👇"
+            % (shop_name(), ("، %s٪ تخفیف اولین خرید داری" % fa(d)) if d else ""))
+
+def invite_view(uid):
+    link = invite_link(uid); invited, buyers, earned = invite_stats(uid)
+    r, d = ref_reward_pct(), ref_discount_pct()
+    rules = []
+    if r: rules.append("🎁 تو: <b>%s٪</b> مبلغ اولین خریدش به کیف پولت" % fa(r))
+    if d: rules.append("🎁 دوستت: <b>%s٪ تخفیف</b> اولین خرید" % fa(d))
+    text = ("👥 <b>دعوت دوستان</b>\n\n" +
+            ("هر دوستی که با لینک تو بیاد و خرید کنه:\n%s\n\n" % "\n".join(rules) if rules else "") +
+            "🔗 لینک دعوت تو:\n<code>%s</code>\n\n📊 دعوت‌شده‌ها: %s · خریدارها: %s\n💰 پاداش تا الان: %s"
+            % (link, fa(invited), fa(buyers), toman(earned)))
+    kb = [[{"text": "📤 فرستادن برای دوستان", "url": "https://t.me/share/url?url=%s&text=%s"
+            % (urllib.parse.quote(link, safe=""), urllib.parse.quote(share_text(), safe=""))}],
+          [{"text": "📋 پیام آماده برای فوروارد", "callback_data": "c:ref_msg"}]]
+    return text, kb
 
 REJECT_REASONS = ["مبلغ واریزی با فاکتور یکی نیست", "رسید ناخوانا یا نامعتبر است", "واریزی به حساب ما نرسیده", "رسید تکراری است"]
 
@@ -1038,6 +1128,7 @@ def customer_message(chat, uid, m):
         if text == B_BUY: send_plans(chat, uid); return
         if text == B_WALLET: core.send(chat, *wallet_view(uid)); return
         if text == B_SERVICES: core.send(chat, *services_view(uid)); return
+        if text == B_INVITE: core.send(chat, *invite_view(uid)); return
         if text == B_TEST: test_offer(chat, uid); return
         if text == B_ACCOUNT: core.send(chat, account_text(uid), account_kb(uid)); return
         if text == B_GUIDE: core.send(chat, GUIDE_TEXT, guide_kb()); return
@@ -1078,7 +1169,7 @@ def customer_callback(chat, mid, uid, data, cbid, user=None):
         if parts[1] == "wpay": wallet_pay(chat, mid, uid, int(parts[2]), token); return
         plan = get_plan(int(parts[2]))
         if not plan or not plan["active"]: send_plans(chat, uid, token, mid); return
-        text, kb = invoice_view(plan, token, balance(uid)); core.edit(chat, mid, text, kb); return
+        text, kb = invoice_view(priced(uid, plan), token, balance(uid)); core.edit(chat, mid, text, kb); return
     if parts[:2] == ["c", "cancel"] and len(parts) == 3 and parts[2].isdigit():
         core.answer(cbid); cancel_order(chat, mid, uid, int(parts[2])); return
     if data == "c:wallet":
@@ -1095,6 +1186,8 @@ def customer_callback(chat, mid, uid, data, cbid, user=None):
         core.answer(cbid); lines = tx_lines(uid, 30)
         core.edit(chat, mid, "📜 <b>تراکنش‌ها</b> (آخرین ۳۰ مورد)\n\n" + ("\n".join(lines) or "هنوز تراکنشی نداری."),
                   [[{"text": "بازگشت", "callback_data": "c:wallet"}]]); return
+    if data == "c:ref_msg":
+        core.answer(cbid); core.send(chat, "%s\n%s" % (share_text(), invite_link(uid))); return
     if data == "c:svcs":
         core.answer(cbid); core.edit(chat, mid, *services_view(uid)); return
     if parts[:2] == ["c", "svc"] and len(parts) == 3:
@@ -1153,7 +1246,11 @@ def on_update(up):
     if rate_limited(uid): return
     if staff_role(uid): support_message(chat, uid, m); return
     text = m.get("text") or ""
+    is_new = get_customer(uid) is None
     cust = touch_customer(m["from"], start_referrer(text) if text.startswith("/start") else None)
+    if is_new and cust["referrer_id"]:
+        core.send(cust["referrer_id"], "👋 %s با لینک دعوت تو عضو شد! بعد از اولین خریدش پاداشت می‌رسه 🎁"
+                  % html.escape(cust["first_name"] or "یه نفر"))
     if cust["blocked"]: say(chat, BLOCKED_TEXT, {"remove_keyboard": True}); return
     if flag("maintenance"): say(chat, MAINTENANCE_TEXT); return
     customer_message(chat, uid, m)
@@ -1181,6 +1278,7 @@ def shop_admin_kb():
               "callback_data": "sa:queue"}],
             [{"text": "📦 پلن‌ها", "callback_data": "sa:plans"}, {"text": "💳 کارت‌ها", "callback_data": "sa:cards"}],
             [{"text": "👤 کاربران", "callback_data": "sa:users"}, {"text": "🎁 تست رایگان", "callback_data": "sa:test"}],
+            [{"text": "👥 دعوت دوستان", "callback_data": "sa:ref"}],
             [{"text": "✅ اعلام رفع اختلال" if setting("outage") else "📢 اعلان اختلال", "callback_data": "sa:outage"}],
             [{"text": "🎧 پشتیبان‌ها", "callback_data": "sa:staff"}, {"text": "📜 لاگ کارها", "callback_data": "sa:log"}],
             [{"text": "💾 بکاپ الان", "callback_data": "sa:backup"},
@@ -1308,6 +1406,31 @@ def end_outage(uid, chat):
         ids, "✅ <b>اختلال برطرف شد</b>\nاگه هنوز وصل نمی‌شی، توی برنامه اشتراک رو آپدیت کن 🙏",
         [[{"text": "📚 آموزش اتصال", "callback_data": "c:guide"}]]))))
 
+def ref_admin():
+    c = core.db()
+    invited = c.execute("SELECT COUNT(*) FROM shop_customers WHERE referrer_id IS NOT NULL").fetchone()[0]
+    buyers = c.execute("SELECT COUNT(DISTINCT o.tg_id) FROM shop_orders o JOIN shop_customers c ON c.tg_id=o.tg_id "
+                       "WHERE c.referrer_id IS NOT NULL AND o.status='approved' AND o.kind!='topup'").fetchone()[0]
+    paid = c.execute("SELECT COALESCE(SUM(delta),0) FROM shop_wallet_tx WHERE kind='referral'").fetchone()[0]
+    discounts = c.execute("SELECT COALESCE(SUM(discount),0) FROM shop_orders WHERE status='approved'").fetchone()[0]
+    top = c.execute("SELECT c.referrer_id id, r.first_name, COUNT(*) n FROM shop_customers c LEFT JOIN shop_customers r "
+                    "ON r.tg_id=c.referrer_id WHERE c.referrer_id IS NOT NULL GROUP BY c.referrer_id ORDER BY n DESC LIMIT 5").fetchall()
+    c.close()
+    mark = lambda on, t: ("✅ " + t) if on else t
+    text = ("👥 <b>دعوت دوستان</b>\n\nپاداش دعوت‌کننده: <b>%s٪</b> اولین خرید دوستش (به کیف پول)\n"
+            "تخفیف دعوت‌شده: <b>%s٪</b> روی اولین خرید\n\nدعوت‌شده‌ها: %s · خریدارها: %s\n"
+            "پاداش پرداخت‌شده: %s · تخفیف داده‌شده: %s"
+            % (fa(ref_reward_pct()), fa(ref_discount_pct()), fa(invited), fa(buyers), toman(paid), toman(discounts)))
+    if top:
+        text += "\n\n🏆 <b>برترین‌ها</b>\n" + "\n".join("%s. %s · <code>%d</code> · %s نفر" % (
+            fa(i + 1), html.escape(t["first_name"] or "-"), t["id"], fa(t["n"])) for i, t in enumerate(top))
+    kb = [[{"text": "پاداش دعوت‌کننده:", "callback_data": "sa:noop"}],
+          [{"text": mark(v == ref_reward_pct(), fa("%d٪" % v)), "callback_data": "sa:ref_reward:%d" % v} for v in REF_REWARD_CHOICES],
+          [{"text": "تخفیف دعوت‌شده:", "callback_data": "sa:noop"}],
+          [{"text": mark(v == ref_discount_pct(), fa("%d٪" % v)), "callback_data": "sa:ref_discount:%d" % v} for v in REF_DISCOUNT_CHOICES],
+          [{"text": "بازگشت", "callback_data": "sa:menu"}]]
+    return text, kb
+
 USERS_PROMPT = "👤 <b>کاربران</b>\nآیدی عددی یا @یوزرنیم مشتری را بفرست، یا یک پیام از او را فوروارد کن:"
 
 def log_text(limit=15):
@@ -1419,12 +1542,16 @@ def admin_callback(chat, mid, uid, data, cbid):
         on = not test_enabled(); set_setting("test_enabled", "1" if on else "0")
         log(uid, "test_on" if on else "test_off")
         core.answer(cbid); core.edit(chat, mid, test_admin_text(), test_admin_kb()); return
-    for key, choices in (("test_mb", TEST_MB_CHOICES), ("test_hours", TEST_HOUR_CHOICES)):
-        if data.startswith("sa:%s:" % key):
+    if data == "sa:ref":
+        core.answer(cbid); core.edit(chat, mid, *ref_admin()); return
+    for key, choices, view in (("test_mb", TEST_MB_CHOICES, lambda: (test_admin_text(), test_admin_kb())),
+                               ("test_hours", TEST_HOUR_CHOICES, lambda: (test_admin_text(), test_admin_kb())),
+                               ("ref_reward", REF_REWARD_CHOICES, ref_admin), ("ref_discount", REF_DISCOUNT_CHOICES, ref_admin)):
+        if data.startswith("sa:%s:" % key) and data.rsplit(":", 1)[1].isdigit():
             v = int(data.rsplit(":", 1)[1])
             if v in choices and str(v) != setting(key):
                 set_setting(key, v); log(uid, key, v)
-                core.edit(chat, mid, test_admin_text(), test_admin_kb())
+                core.edit(chat, mid, *view())
             core.answer(cbid); return
     if data == "sa:log":
         core.answer(cbid); core.edit(chat, mid, log_text(), [[{"text": "بازگشت", "callback_data": "sa:menu"}]]); return
