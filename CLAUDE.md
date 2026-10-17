@@ -260,6 +260,9 @@ On all four panel hosts, the active `xray.service` reads
 - **Referrals:** `referrer_id` is only set when a customer is first created. Invitees get
   `meta.shop_ref_discount`% off until their first approved purchase (`priced()`); the inviter gets
   `meta.shop_ref_reward`% of it once, guarded by the unique ledger ref `ref:<invitee id>`.
+- **Tickets:** `shop_tickets` (open -> answered -> closed) + `shop_ticket_msgs`. A photo sent while a
+  ticket step is waiting is a ticket attachment, never a payment receipt. 3+ customers reporting the
+  same carrier within 30 min alerts the owners (at most hourly).
 - **Inspect state:** `sqlite3 <db> "SELECT label,used_bytes,max(used_bytes-usage_reset_bytes,0) AS current_used,limit_bytes,expiry_ts FROM users"`.
 
 ## 6. Verifying a change without breaking prod
@@ -310,6 +313,8 @@ shop_orders(id, tg_id, kind buy|renew|topup, pay_method card|wallet, discount, t
             receipt_file, receipt_uid UNIQUE, ..., review_msgs) -- awaiting->review->approved|rejected; expired|cancelled
 shop_staff(tg_id, role, added_ts, added_by)          -- role 'support'; owners = ADMIN_IDS
 shop_admin_log(id, ts, actor, action, target, detail) -- audit trail of admin/support actions
+shop_tickets(id, tg_id, token, category, carrier, status, rating, created_ts, updated_ts)
+shop_ticket_msgs(id, ticket_id, sender, role customer|staff, text, file, ts)
 ```
 
 See `docs/ARCHITECTURE.md` for the full flow diagrams and `docs/OPERATIONS.md` for

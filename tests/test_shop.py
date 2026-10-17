@@ -809,5 +809,131 @@ class ShopReferralTests(SalesCase):
         self.assertEqual(actions, ["ref_reward", "ref_discount"])
 
 
+class ShopTicketTests(SalesCase):
+    def setUp(self):
+        super().setUp()
+        bot.handle_update(cb(ADMIN, "sa:uwal:%d:add" % ALICE)); bot.handle_update(msg(ADMIN, "150000 هدیه"))
+        bot.handle_update(cb(ALICE, "c:wpay:%d" % self.plan["id"]))
+        self.tok = self.row("SELECT token FROM shop_services WHERE tg_id=?", (ALICE,))["token"]
+        self.calls.clear()
+
+    def report(self, uid=ALICE, service=None, cat="down", carrier="mci", text="وصل نمی‌شه"):
+        bot.handle_update(msg(uid, shop.B_REPORT))
+        bot.handle_update(cb(uid, "c:rep_go"))
+        bot.handle_update(cb(uid, "c:rs:%s" % (service or self.tok)))
+        bot.handle_update(cb(uid, "c:rc:%s" % cat))
+        if carrier: bot.handle_update(cb(uid, "c:rk:%s" % carrier))
+        if text is not None: bot.handle_update(msg(uid, text))
+        return self.row("SELECT * FROM shop_tickets WHERE tg_id=? ORDER BY id DESC", (uid,))
+
+    def staff_cards(self, chat):
+        return [p for m, p in self.calls if m == "sendMessage" and p["chat_id"] == chat and "تیکت #" in p["text"]]
+
+    def test_quick_fix_comes_first_and_can_end_it(self):
+        bot.handle_update(msg(ALICE, shop.B_REPORT))
+        self.assertIn("آپدیت", self.last()["text"])
+        bot.handle_update(cb(ALICE, "c:rep_ok"))
+        self.assertIsNone(self.row("SELECT * FROM shop_tickets"))
+
+    def test_full_report_reaches_staff_with_service_details(self):
+        t = self.report()
+        self.assertEqual((t["category"], t["carrier"], t["token"], t["status"]), ("down", "mci", self.tok, "open"))
+        self.assertIsNone(shop.get_state(ALICE))
+        self.assertIn("ثبت شد", self.texts(ALICE)[-1])
+        for staff in (ADMIN, SUPPORT):
+            card = self.staff_cards(staff)[-1]
+            self.assertIn("همراه اول", card["text"]); self.assertIn(self.tok, card["text"]); self.assertIn("وصل نمی‌شه", card["text"])
+            self.assertEqual(card["reply_markup"]["inline_keyboard"][0][0]["callback_data"], "t:r:%d" % t["id"])
+
+    def test_payment_question_skips_carrier_and_accepts_screenshot(self):
+        t = self.report(service="-", cat="pay", carrier=None, text=None)
+        self.assertIsNone(t)
+        bot.handle_update(photo(ALICE, "shot"))                    # a screenshot, not a receipt
+        t = self.row("SELECT * FROM shop_tickets")
+        self.assertEqual((t["category"], t["carrier"], t["token"]), ("pay", None, None))
+        self.assertEqual(self.row("SELECT file FROM shop_ticket_msgs")["file"], "photo:big-shot")
+        self.assertIsNone(self.row("SELECT * FROM shop_orders WHERE receipt_uid='shot'"))
+        self.assertTrue(any(m == "sendPhoto" and p["chat_id"] == SUPPORT for m, p in self.calls))
+
+    def test_disabled_service_suggests_renewal_first(self):
+        c = bot.db(); c.execute("UPDATE users SET disabled_ts=1 WHERE token=?", (self.tok,)); c.commit(); c.close()
+        bot.handle_update(msg(ALICE, shop.B_REPORT)); bot.handle_update(cb(ALICE, "c:rep_go"))
+        bot.handle_update(cb(ALICE, "c:rs:%s" % self.tok))
+        self.assertEqual(self.last("editMessageText")["reply_markup"]["inline_keyboard"][0][0]["callback_data"], "c:renew:%s" % self.tok)
+        bot.handle_update(cb(ALICE, "c:rcats")); bot.handle_update(cb(ALICE, "c:rc:other")); bot.handle_update(msg(ALICE, "سؤال"))
+        self.assertEqual(self.row("SELECT category FROM shop_tickets")["category"], "other")
+
+    def test_menu_tap_cancels_a_half_written_report(self):
+        bot.handle_update(msg(ALICE, shop.B_REPORT)); bot.handle_update(cb(ALICE, "c:rep_go"))
+        bot.handle_update(cb(ALICE, "c:rs:-")); bot.handle_update(cb(ALICE, "c:rc:other"))
+        bot.handle_update(msg(ALICE, shop.B_WALLET))
+        self.assertIsNone(shop.get_state(ALICE)); self.assertIsNone(self.row("SELECT * FROM shop_tickets"))
+
+    def test_others_cannot_report_on_my_service(self):
+        bot.handle_update(msg(BOB, "/start")); bot.handle_update(cb(BOB, "c:rs:%s" % self.tok))
+        self.assertIn("پیدا نشد", self.last("editMessageText")["text"])
+
+    def test_staff_reply_customer_follow_up_close_and_rating(self):
+        t = self.report()
+        bot.handle_update(cb(SUPPORT, "t:r:%d" % t["id"])); bot.handle_update(msg(SUPPORT, "آپدیت کن لطفاً"))
+        self.assertEqual(self.row("SELECT status FROM shop_tickets")["status"], "answered")
+        self.assertIn("آپدیت کن لطفاً", self.texts(ALICE)[-1])
+        bot.handle_update(cb(ALICE, "c:tk:%d" % t["id"])); bot.handle_update(msg(ALICE, "هنوز نه"))
+        self.assertEqual(self.row("SELECT status FROM shop_tickets")["status"], "open")
+        self.assertIn("هنوز نه", self.staff_cards(ADMIN)[-1]["text"])
+        bot.handle_update(cb(ADMIN, "t:c:%d:1" % t["id"]))           # canned "fixed"
+        self.assertIn("برطرف شد", self.texts(ALICE)[-1])
+        bot.handle_update(cb(ADMIN, "t:x:%d" % t["id"]))
+        self.assertEqual(self.row("SELECT status FROM shop_tickets")["status"], "closed")
+        bot.handle_update(cb(ALICE, "c:tkr:%d:0" % t["id"]))         # not happy -> reopened
+        t2 = self.row("SELECT * FROM shop_tickets")
+        self.assertEqual((t2["status"], t2["rating"]), ("open", 0))
+        self.assertEqual(shop.get_state(ALICE), {"stage": "tk_reply", "id": t["id"]})
+        bot.handle_update(cb(ALICE, "c:tkr:%d:1" % t["id"]))         # rating is given once
+        self.assertEqual(self.row("SELECT rating FROM shop_tickets")["rating"], 0)
+        msgs = [tuple(r) for r in bot.db().execute("SELECT role, text FROM shop_ticket_msgs ORDER BY id")]
+        self.assertEqual([r for r, _ in msgs], ["customer", "staff", "customer", "staff"])
+
+    def test_customer_closes_when_solved(self):
+        t = self.report()
+        bot.handle_update(cb(ALICE, "c:tkok:%d" % t["id"]))
+        self.assertEqual(self.row("SELECT status,rating FROM shop_tickets")[:], ("closed", 1))
+        bot.handle_update(cb(ALICE, "c:tk:%d" % t["id"]))
+        self.assertNotEqual(shop.get_state(ALICE), {"stage": "tk_reply", "id": t["id"]})
+
+    def test_open_ticket_limit(self):
+        for i in range(shop.MAX_OPEN_TICKETS): self.report(text="مشکل %d" % i)
+        self.report(text="یکی دیگه")
+        self.assertEqual(self.row("SELECT COUNT(*) n FROM shop_tickets")["n"], shop.MAX_OPEN_TICKETS)
+
+    def test_ticket_lists_for_support_and_admin(self):
+        t = self.report()
+        bot.handle_update(msg(SUPPORT, shop.B_TICKETS))
+        self.assertEqual(self.last()["reply_markup"]["inline_keyboard"][0][0]["callback_data"], "t:v:%d" % t["id"])
+        bot.handle_update(msg(ADMIN, shop.B_SHOP))
+        self.assertIn("تیکت‌ها (۱)", self.last()["reply_markup"]["inline_keyboard"][1][1]["text"])
+        bot.handle_update(cb(ADMIN, "sa:tickets"))
+        self.assertIn("#%d" % t["id"], self.last("editMessageText")["reply_markup"]["inline_keyboard"][0][0]["text"])
+
+    def test_customer_cannot_use_staff_ticket_buttons(self):
+        t = self.report()
+        bot.handle_update(cb(ALICE, "t:x:%d" % t["id"]))
+        self.assertEqual(self.row("SELECT status FROM shop_tickets")["status"], "open")
+
+    def test_carrier_alert_after_several_customers(self):
+        others = [401, 402]
+        for uid in others:
+            bot.handle_update(msg(uid, "/start"))
+            self.report(uid=uid, service="-", cat="slow", carrier="irancell")
+        self.assertFalse([t for t in self.texts(ADMIN) if "گزارش از ایرانسل" in t])
+        self.report(cat="slow", carrier="irancell")
+        alerts = [p for m, p in self.calls if m == "sendMessage" and p["chat_id"] == ADMIN and "گزارش از ایرانسل" in p["text"]]
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]["reply_markup"]["inline_keyboard"][0][0]["callback_data"], "sa:outage")
+        bot.handle_update(msg(403, "/start")); self.report(uid=403, service="-", cat="down", carrier="irancell")
+        alerts = [t for t in self.texts(ADMIN) if "گزارش از ایرانسل" in t]
+        self.assertEqual(len(alerts), 1)                              # at most once an hour
+
+
 if __name__ == "__main__":
     unittest.main()

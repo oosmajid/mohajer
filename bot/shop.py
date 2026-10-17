@@ -64,6 +64,14 @@ def init_db():
                                    ("auto_note_ts", "INTEGER NOT NULL DEFAULT 0"),  # last "not enough balance" note
                                    ("warn_flags", "INTEGER NOT NULL DEFAULT 0")])   # WARN_* already sent this period
     c.execute("CREATE INDEX IF NOT EXISTS shop_orders_status ON shop_orders(status)")
+    # Support tickets. status: open (waiting for staff) -> answered (waiting for customer) -> closed.
+    c.execute("""CREATE TABLE IF NOT EXISTS shop_tickets(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, tg_id INTEGER NOT NULL, token TEXT, category TEXT NOT NULL,
+        carrier TEXT, status TEXT NOT NULL, rating INTEGER, created_ts INTEGER NOT NULL, updated_ts INTEGER NOT NULL)""")
+    c.execute("CREATE INDEX IF NOT EXISTS shop_tickets_status ON shop_tickets(status)")
+    c.execute("""CREATE TABLE IF NOT EXISTS shop_ticket_msgs(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, ticket_id INTEGER NOT NULL, sender INTEGER NOT NULL,
+        role TEXT NOT NULL, text TEXT, file TEXT, ts INTEGER NOT NULL)""")
     c.execute("CREATE INDEX IF NOT EXISTS shop_orders_owner ON shop_orders(tg_id)")
     c.execute("""CREATE TABLE IF NOT EXISTS shop_staff(
         tg_id INTEGER PRIMARY KEY, role TEXT NOT NULL, added_ts INTEGER NOT NULL, added_by INTEGER)""")
@@ -1068,6 +1076,279 @@ def run_auto_renewals(now=None):
                        "مبلغ تمدید: %s · موجودی: %s" % (html.escape(r["label"]), toman(plan["price"]), toman(balance(r["tg_id"]))),
                        [[{"text": "➕ شارژ %s" % toman(short), "callback_data": "c:topup_amt:%d" % short}], renew_btn])
 
+# --- support tickets ---
+TICKET_CATS = [("down", "🔴 کلاً وصل نمی‌شه"), ("slow", "🐢 سرعتش کمه"), ("carrier", "📶 فقط روی یه اینترنت مشکل داره"),
+               ("pay", "💳 مشکل پرداخت"), ("other", "💬 سؤال یا موارد دیگه")]
+CARRIERS = [("mci", "همراه اول"), ("irancell", "ایرانسل"), ("rightel", "رایتل"), ("fixed", "اینترنت خانگی"), ("all", "همه")]
+NEEDS_CARRIER = ("down", "slow", "carrier")
+CAT_NAMES, CARRIER_NAMES = dict(TICKET_CATS), dict(CARRIERS)
+MAX_OPEN_TICKETS = 3
+
+QUICK_FIX = ("🛠 <b>گزارش اختلال</b>\n\nقبل از ثبت گزارش، این‌ها رو امتحان کن؛ بیشتر مشکل‌ها همین‌جا حل می‌شن:\n\n"
+             "۱. توی برنامه، اشتراک رو <b>آپدیت</b> کن.\n"
+             "۲. یه کانفیگ دیگه از لیست رو انتخاب کن.\n"
+             "۳. حالت هواپیما رو یه بار روشن و خاموش کن.\n"
+             "۴. اگه روی یه اینترنت وصل نمی‌شی، اون یکی رو امتحان کن (مثلاً وای‌فای ↔ دیتا).")
+
+def report_start(chat, uid, mid=None):
+    set_state(uid, None)
+    kb = [[{"text": "✅ درست شد", "callback_data": "c:rep_ok"}, {"text": "📝 هنوز مشکل دارم", "callback_data": "c:rep_go"}]]
+    if mid: core.edit(chat, mid, QUICK_FIX, kb)
+    else: core.send(chat, QUICK_FIX, kb)
+
+def report_pick_service(chat, mid, uid):
+    c = core.db()
+    n = c.execute("SELECT COUNT(*) FROM shop_tickets WHERE tg_id=? AND status!='closed'", (uid,)).fetchone()[0]; c.close()
+    if n >= MAX_OPEN_TICKETS:
+        core.edit(chat, mid, "📝 الان %s گزارش باز داری؛ به‌زودی جواب می‌گیری 🙏" % fa(n)); return
+    rows = my_services(uid)
+    kb = [[{"text": "%s %s" % ("⏸" if u["disabled_ts"] else "🟢", u["label"]), "callback_data": "c:rs:%s" % u["token"]}] for u in rows]
+    kb.append([{"text": "💬 سؤال عمومی / قبل از خرید", "callback_data": "c:rs:-"}])
+    core.edit(chat, mid, "📝 مشکل مربوط به کدوم سرویسه؟", kb)
+
+def report_pick_cat(chat, mid, uid, token):
+    set_state(uid, {"stage": "tk_cat", "token": token})
+    u = owned_service(uid, token) if token else None
+    if u and u["disabled_ts"]:
+        core.edit(chat, mid, "⏸ سرویس «%s» تموم شده و برای همین وصل نمی‌شه.\nبا تمدید، همین لینک دوباره فعال می‌شه." % html.escape(u["label"]),
+                  [[{"text": "➕ تمدید", "callback_data": "c:renew:%s" % token}],
+                   [{"text": "📝 مشکل دیگه‌ای دارم", "callback_data": "c:rcats"}]]); return
+    core.edit(chat, mid, "📝 مشکل چیه؟", [[{"text": t, "callback_data": "c:rc:%s" % k}] for k, t in TICKET_CATS])
+
+def report_text_prompt(chat, mid, uid, st):
+    st["stage"] = "tk_text"; set_state(uid, st)
+    core.edit(chat, mid, "✍️ مشکلت رو کوتاه بنویس (اگه اسکرین‌شات داری، همون رو بفرست).",
+              [[{"text": "انصراف", "callback_data": "c:rep_cancel"}]])
+
+def service_summary(token):
+    c = core.db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone(); c.close()
+    if not u: return "سرویس حذف شده (<code>%s</code>)" % token
+    return "%s %s · %s/%s · %s · <code>%s</code>" % (
+        "⏸" if u["disabled_ts"] else "🟢", html.escape(u["label"]), fa_bytes(core.current_usage(u)),
+        fa_bytes(u["limit_bytes"]) if u["limit_bytes"] else "∞", fa_left(u["expiry_ts"]), token)
+
+def get_ticket(tid):
+    c = core.db(); r = c.execute("SELECT * FROM shop_tickets WHERE id=?", (tid,)).fetchone(); c.close(); return r
+
+def ticket_card(t, history=3):
+    cust = get_customer(t["tg_id"])
+    c = core.db()
+    msgs = c.execute("SELECT * FROM shop_ticket_msgs WHERE ticket_id=? ORDER BY id DESC LIMIT ?", (t["id"], history)).fetchall()
+    c.close()
+    status = {"open": "🟠 منتظر پاسخ", "answered": "🔵 پاسخ داده شد", "closed": "⚪️ بسته"}[t["status"]]
+    lines = ["🎫 <b>تیکت #%d</b> · %s" % (t["id"], status),
+             "📝 %s%s" % (CAT_NAMES.get(t["category"], t["category"]), (" · 📶 " + CARRIER_NAMES.get(t["carrier"], "")) if t["carrier"] else ""),
+             "👤 %s · <code>%d</code>" % (html.escape(cust["first_name"] or "-") if cust else "-", t["tg_id"]),
+             "📦 %s" % (service_summary(t["token"]) if t["token"] else "سؤال عمومی"), ""]
+    for m in reversed(msgs):
+        who = "👤" if m["role"] == "customer" else "🎧"
+        lines.append("%s %s%s" % (who, html.escape(m["text"] or ""), " 📎" if m["file"] else ""))
+    if t["rating"] is not None: lines += ["", "رضایت: %s" % ("👍" if t["rating"] else "👎")]
+    return "\n".join(lines)
+
+CANNED = [("🔄 آپدیت اشتراک", "لطفاً توی برنامه اشتراک رو آپدیت کن و یه کانفیگ دیگه رو امتحان کن 🙏"),
+          ("✅ برطرف شد", "مشکل از سمت ما بود و برطرف شد ✅ اشتراک رو آپدیت کن و دوباره وصل شو."),
+          ("🔍 در حال بررسی", "داریم بررسی می‌کنیم؛ به محض نتیجه خبرت می‌کنیم 🙏"),
+          ("🧾 شمارهٔ پیگیری", "لطفاً شمارهٔ پیگیری یا عکس رسید واریز رو بفرست تا بررسی کنیم.")]
+
+def ticket_kb(t):
+    if t["status"] == "closed": return [[{"text": "🔓 باز کردن دوباره", "callback_data": "t:o:%d" % t["id"]}]]
+    return ([[{"text": "✍️ پاسخ", "callback_data": "t:r:%d" % t["id"]}, {"text": "✅ بستن", "callback_data": "t:x:%d" % t["id"]}]] +
+            [[{"text": CANNED[i][0], "callback_data": "t:c:%d:%d" % (t["id"], i)},
+              {"text": CANNED[i + 1][0], "callback_data": "t:c:%d:%d" % (t["id"], i + 1)}] for i in (0, 2)])
+
+def notify_staff_ticket(tid, file=None, head=""):
+    t = get_ticket(tid)
+    for chat in reviewers():
+        core.send(chat, head + ticket_card(t), ticket_kb(t))
+        if file: send_file(chat, file, "📎 پیوست تیکت #%d" % tid)
+
+def send_file(chat, file, caption):
+    kind, fid = file.split(":", 1)
+    core.tg("sendPhoto" if kind == "photo" else "sendDocument", chat_id=chat,
+            **{("photo" if kind == "photo" else "document"): fid}, caption=caption)
+
+def add_ticket_msg(c, tid, sender, role, text, file=None):
+    now = int(time.time())
+    c.execute("INSERT INTO shop_ticket_msgs(ticket_id,sender,role,text,file,ts) VALUES(?,?,?,?,?,?)",
+              (tid, sender, role, (text or "")[:2000], file, now))
+    c.execute("UPDATE shop_tickets SET status=?,updated_ts=? WHERE id=?",
+              ("answered" if role == "staff" else "open", now, tid))
+
+def create_ticket(chat, uid, st, text, file):
+    now = int(time.time())
+    c = core.db()
+    tid = c.execute("INSERT INTO shop_tickets(tg_id,token,category,carrier,status,created_ts,updated_ts) VALUES(?,?,?,?,'open',?,?)",
+                    (uid, st.get("token"), st["cat"], st.get("carrier"), now, now)).lastrowid
+    add_ticket_msg(c, tid, uid, "customer", text, file); c.commit(); c.close()
+    set_state(uid, None)
+    say(chat, "✅ گزارشت ثبت شد (تیکت #%s).\nبه‌زودی همین‌جا جواب می‌گیری 🙏" % fa(tid))
+    notify_staff_ticket(tid, file)
+    carrier_alert(st.get("carrier"), st["cat"], now)
+
+CARRIER_ALERT_N, CARRIER_ALERT_WINDOW, CARRIER_ALERT_EVERY = 3, 1800, 3600
+
+def carrier_alert(carrier, cat, now):
+    """Several reports from one carrier in a short time usually means an outage, not a customer issue."""
+    if cat not in NEEDS_CARRIER or not carrier or carrier == "all": return
+    c = core.db()
+    n = c.execute("SELECT COUNT(DISTINCT tg_id) FROM shop_tickets WHERE carrier=? AND category IN ('down','slow','carrier') "
+                  "AND created_ts>=?", (carrier, now - CARRIER_ALERT_WINDOW)).fetchone()[0]
+    c.close()
+    if n < CARRIER_ALERT_N or now - int(setting("carrier_alert_" + carrier, 0)) < CARRIER_ALERT_EVERY: return
+    set_setting("carrier_alert_" + carrier, now)
+    for a in owner_ids():
+        core.send(a, "📶 <b>%s گزارش از %s</b> در نیم ساعت اخیر؛ احتمالاً اختلال عمومی است." % (fa(n), CARRIER_NAMES[carrier]),
+                  [[{"text": "📢 اعلان اختلال", "callback_data": "sa:outage"}]])
+
+def customer_ticket_input(chat, uid, m, st):
+    """Text or screenshot while a ticket step waits for it. Returns True when consumed."""
+    if st.get("stage") not in ("tk_text", "tk_reply"): return False
+    text = (m.get("text") or m.get("caption") or "").strip()
+    rf = receipt_file(m); file = rf[0] if rf else None
+    if not text and not file:
+        say(chat, "یه توضیح کوتاه یا اسکرین‌شات بفرست:"); return True
+    if st["stage"] == "tk_text":
+        create_ticket(chat, uid, st, text, file); return True
+    t = get_ticket(st["id"])
+    if not t or t["tg_id"] != uid:
+        set_state(uid, None); return False
+    c = core.db(); add_ticket_msg(c, t["id"], uid, "customer", text, file); c.commit(); c.close()
+    set_state(uid, None)
+    say(chat, "✅ پیامت به تیکت #%s اضافه شد." % fa(t["id"]))
+    notify_staff_ticket(t["id"], file, "💬 پیام جدید مشتری\n")
+    return True
+
+def customer_ticket_kb(tid):
+    return [[{"text": "✍️ جواب دادن", "callback_data": "c:tk:%d" % tid},
+             {"text": "✅ مشکلم حل شد", "callback_data": "c:tkok:%d" % tid}]]
+
+def close_ticket(tid):
+    c = core.db()
+    n = c.execute("UPDATE shop_tickets SET status='closed',updated_ts=? WHERE id=? AND status!='closed'", (int(time.time()), tid)).rowcount
+    c.commit(); c.close(); return n
+
+ticket_pending = {}   # staff uid -> ticket id awaiting a typed reply; staff only, tiny
+
+def staff_reply(uid, tid, text):
+    t = get_ticket(tid)
+    if not t: return False
+    c = core.db(); add_ticket_msg(c, tid, uid, "staff", text); c.commit(); c.close()
+    log(uid, "ticket_reply", tid)
+    core.send(t["tg_id"], "🎧 <b>پاسخ پشتیبانی</b> · تیکت #%s\n\n%s" % (fa(tid), html.escape(text)), customer_ticket_kb(tid))
+    return True
+
+def ticket_callback(chat, mid, uid, data, cbid):
+    """Staff buttons on tickets: t:r (reply) t:c (canned) t:x (close) t:o (reopen) t:v (view)."""
+    parts = data.split(":")
+    if len(parts) < 3 or not parts[2].isdigit(): core.answer(cbid); return
+    action, tid = parts[1], int(parts[2]); t = get_ticket(tid)
+    if not t: core.answer(cbid, "تیکت پیدا نشد"); return
+    if action == "v":
+        core.answer(cbid); core.send(chat, ticket_card(t, history=10), ticket_kb(t)); return
+    if action == "o":
+        c = core.db(); c.execute("UPDATE shop_tickets SET status='open' WHERE id=?", (tid,)); c.commit(); c.close()
+        log(uid, "ticket_reopen", tid); core.answer(cbid, "دوباره باز شد")
+        t = get_ticket(tid); core.edit(chat, mid, ticket_card(t), ticket_kb(t)); return
+    if t["status"] == "closed": core.answer(cbid, "این تیکت بسته شده"); return
+    if action == "r":
+        ticket_pending[uid] = tid; core.answer(cbid)
+        core.send(chat, "✍️ پاسخ تیکت #%d را بنویس:" % tid); return
+    if action == "c" and len(parts) == 4 and parts[3].isdigit() and int(parts[3]) < len(CANNED):
+        staff_reply(uid, tid, CANNED[int(parts[3])][1]); core.answer(cbid, "فرستاده شد")
+        t = get_ticket(tid); core.edit(chat, mid, ticket_card(t), ticket_kb(t)); return
+    if action == "x":
+        if close_ticket(tid):
+            log(uid, "ticket_close", tid)
+            core.send(t["tg_id"], "✅ تیکت #%s بسته شد.\nمشکلت حل شد؟" % fa(tid),
+                      [[{"text": "👍 آره، ممنون", "callback_data": "c:tkr:%d:1" % tid},
+                        {"text": "👎 نه هنوز", "callback_data": "c:tkr:%d:0" % tid}]])
+        core.answer(cbid, "بسته شد"); t = get_ticket(tid); core.edit(chat, mid, ticket_card(t), ticket_kb(t)); return
+    core.answer(cbid)
+
+def ticket_text(chat, uid, text):
+    """A staff member's typed reply. Returns True when consumed."""
+    tid = ticket_pending.get(uid)
+    if not tid: return False
+    if not text.strip(): core.send(chat, "متن پاسخ را بنویس:"); return True
+    ticket_pending.pop(uid, None)
+    if staff_reply(uid, tid, text.strip()):
+        core.send(chat, "✅ پاسخ برای مشتری فرستاده شد.\n\n" + ticket_card(get_ticket(tid)), ticket_kb(get_ticket(tid)))
+    return True
+
+def tickets_view(status_filter=("open", "answered")):
+    c = core.db()
+    rows = c.execute("SELECT t.*, c.first_name FROM shop_tickets t LEFT JOIN shop_customers c ON c.tg_id=t.tg_id "
+                     "WHERE t.status IN (%s) ORDER BY t.status='answered', t.updated_ts LIMIT 30"
+                     % ",".join("?" * len(status_filter)), status_filter).fetchall()
+    c.close()
+    if not rows: return "🎫 تیکت بازی نیست ✨", None
+    return ("🎫 <b>تیکت‌های باز</b> (%s)\n🟠 منتظر پاسخ ما · 🔵 منتظر مشتری" % fa(len(rows)),
+            [[{"text": "%s #%d · %s · %s" % ("🟠" if r["status"] == "open" else "🔵", r["id"], r["first_name"] or r["tg_id"],
+                                              CAT_NAMES.get(r["category"], "")), "callback_data": "t:v:%d" % r["id"]}] for r in rows])
+
+def customer_ticket_callback(chat, mid, uid, data, cbid):
+    """c:rep* / c:rs / c:rc / c:rk / c:tk* buttons. Returns True when handled."""
+    parts = data.split(":")
+    if data == "c:report":
+        core.answer(cbid); report_start(chat, uid); return True
+    if data == "c:rep_ok":
+        core.answer(cbid); set_state(uid, None); core.edit(chat, mid, "😍 عالیه! اگه دوباره مشکلی بود همین‌جاییم."); return True
+    if data == "c:rep_cancel":
+        core.answer(cbid); set_state(uid, None); core.edit(chat, mid, "گزارش لغو شد."); return True
+    if data == "c:rep_go":
+        core.answer(cbid); report_pick_service(chat, mid, uid); return True
+    if parts[:2] == ["c", "rs"] and len(parts) == 3:
+        core.answer(cbid)
+        token = None if parts[2] == "-" else parts[2]
+        if token and not owned_service(uid, token): core.edit(chat, mid, "این سرویس پیدا نشد."); return True
+        report_pick_cat(chat, mid, uid, token); return True
+    st = get_state(uid) or {}
+    if data == "c:rcats" and st.get("stage") == "tk_cat":
+        core.answer(cbid)
+        core.edit(chat, mid, "📝 مشکل چیه؟", [[{"text": t, "callback_data": "c:rc:%s" % k}] for k, t in TICKET_CATS]); return True
+    if parts[:2] == ["c", "rc"] and len(parts) == 3 and parts[2] in CAT_NAMES:
+        core.answer(cbid)
+        if st.get("stage") != "tk_cat": report_start(chat, uid, mid); return True
+        st["cat"] = parts[2]
+        if parts[2] in NEEDS_CARRIER:
+            st["stage"] = "tk_car"; set_state(uid, st)
+            core.edit(chat, mid, "📶 با کدوم اینترنت مشکل داری؟",
+                      [[{"text": t, "callback_data": "c:rk:%s" % k} for k, t in CARRIERS[i:i + 3]] for i in (0, 3)]); return True
+        report_text_prompt(chat, mid, uid, st); return True
+    if parts[:2] == ["c", "rk"] and len(parts) == 3 and parts[2] in CARRIER_NAMES:
+        core.answer(cbid)
+        if st.get("stage") != "tk_car": report_start(chat, uid, mid); return True
+        st["carrier"] = parts[2]; report_text_prompt(chat, mid, uid, st); return True
+    if parts[:2] in (["c", "tk"], ["c", "tkok"]) and len(parts) == 3 and parts[2].isdigit() or \
+            (parts[:2] == ["c", "tkr"] and len(parts) == 4 and parts[2].isdigit()):
+        t = get_ticket(int(parts[2]))
+        if not t or t["tg_id"] != uid: core.answer(cbid, "تیکت پیدا نشد"); return True
+        if parts[1] == "tk":
+            if t["status"] == "closed": core.answer(cbid, "این تیکت بسته شده؛ اگه مشکل داری گزارش جدید ثبت کن"); return True
+            core.answer(cbid); set_state(uid, {"stage": "tk_reply", "id": t["id"]})
+            core.send(chat, "✍️ پیامت برای تیکت #%s رو بنویس:" % fa(t["id"])); return True
+        if parts[1] == "tkok":
+            core.answer(cbid, "ممنون! 🙏")
+            if close_ticket(t["id"]):
+                c = core.db(); c.execute("UPDATE shop_tickets SET rating=1 WHERE id=?", (t["id"],)); c.commit(); c.close()
+                core.edit(chat, mid, "✅ خوشحالیم که مشکلت حل شد! تیکت #%s بسته شد." % fa(t["id"]))
+                for a in reviewers(): core.send(a, "✅ مشتری تیکت #%d را بست (حل شد)." % t["id"])
+            return True
+        good = parts[3] == "1"
+        c = core.db()
+        n = c.execute("UPDATE shop_tickets SET rating=? WHERE id=? AND rating IS NULL", (1 if good else 0, t["id"])).rowcount
+        if n and not good: c.execute("UPDATE shop_tickets SET status='open' WHERE id=?", (t["id"],))
+        c.commit(); c.close()
+        core.answer(cbid)
+        if good: core.edit(chat, mid, "😍 ممنون از بازخوردت!"); return True
+        core.edit(chat, mid, "😔 متأسفیم. تیکت دوباره باز شد؛ اگه توضیحی داری همین الان بنویس.")
+        if n:
+            set_state(uid, {"stage": "tk_reply", "id": t["id"]})
+            notify_staff_ticket(t["id"], head="👎 مشتری از نتیجه راضی نبود؛ تیکت دوباره باز شد\n")
+        return True
+    return False
+
 # --- account ---
 def account_text(uid):
     cust = get_customer(uid)
@@ -1118,6 +1399,8 @@ def receipt_file(m):
 
 def customer_message(chat, uid, m):
     text = (m.get("text") or "").strip()
+    menu_tap = text.startswith("/start") or text in {b for row in CUSTOMER_MENU for b in row}
+    if not menu_tap and customer_ticket_input(chat, uid, m, get_state(uid) or {}): return
     rf = receipt_file(m)
     if rf: receive_receipt(chat, uid, *rf); return
     if text.startswith("/start"):
@@ -1129,6 +1412,7 @@ def customer_message(chat, uid, m):
         if text == B_WALLET: core.send(chat, *wallet_view(uid)); return
         if text == B_SERVICES: core.send(chat, *services_view(uid)); return
         if text == B_INVITE: core.send(chat, *invite_view(uid)); return
+        if text == B_REPORT: report_start(chat, uid); return
         if text == B_TEST: test_offer(chat, uid); return
         if text == B_ACCOUNT: core.send(chat, account_text(uid), account_kb(uid)); return
         if text == B_GUIDE: core.send(chat, GUIDE_TEXT, guide_kb()); return
@@ -1207,8 +1491,8 @@ def customer_callback(chat, mid, uid, data, cbid, user=None):
         core.answer(cbid, "تمدید خودکار روشن شد؛ موقع تموم شدن، از کیف پولت تمدید می‌شه" if on else "تمدید خودکار خاموش شد")
         core.tg("editMessageReplyMarkup", chat_id=chat, message_id=mid,
                 reply_markup={"inline_keyboard": service_kb(parts[2])}); return
-    if data == "c:report":
-        core.answer(cbid, SOON_TEXT); return
+    if (data.startswith(("c:rep", "c:rs:", "c:rc", "c:rk:", "c:tk")) and
+            customer_ticket_callback(chat, mid, uid, data, cbid)): return
     core.answer(cbid)
 
 # ---------------- support staff UI ----------------
@@ -1220,12 +1504,14 @@ def support_message(chat, uid, m):
     if text == B_RECEIPTS:
         review_pending.pop(uid, None); t, kb = queue_view(); core.send(chat, t, kb); return
     if text == B_TICKETS:
-        say(chat, SOON_TEXT); return
+        ticket_pending.pop(uid, None); t, kb = tickets_view(); core.send(chat, t, kb); return
     if review_text(chat, uid, text): return
+    if ticket_text(chat, uid, text): return
     say(chat, "🎧 <b>پنل پشتیبانی</b>\nاز منوی پایین یکی رو انتخاب کن 👇", reply_kb(SUPPORT_MENU))
 
 def support_callback(chat, mid, uid, data, cbid):
     if data.startswith("r:"): review_callback(chat, mid, uid, data, cbid); return
+    if data.startswith("t:"): ticket_callback(chat, mid, uid, data, cbid); return
     core.answer(cbid)
 
 # ---------------- entry point for every non-admin update ----------------
@@ -1275,7 +1561,9 @@ def shop_admin_text():
 def shop_admin_kb():
     return [[{"text": ("✅ خاموش کردن تعمیرات" if flag("maintenance") else "🛠 روشن کردن تعمیرات"), "callback_data": "sa:maint"}],
             [{"text": "🧾 رسیدهای در انتظار (%s)" % fa(_count("SELECT COUNT(*) FROM shop_orders WHERE status='review'")),
-              "callback_data": "sa:queue"}],
+              "callback_data": "sa:queue"},
+             {"text": "🎫 تیکت‌ها (%s)" % fa(_count("SELECT COUNT(*) FROM shop_tickets WHERE status='open'")),
+              "callback_data": "sa:tickets"}],
             [{"text": "📦 پلن‌ها", "callback_data": "sa:plans"}, {"text": "💳 کارت‌ها", "callback_data": "sa:cards"}],
             [{"text": "👤 کاربران", "callback_data": "sa:users"}, {"text": "🎁 تست رایگان", "callback_data": "sa:test"}],
             [{"text": "👥 دعوت دوستان", "callback_data": "sa:ref"}],
@@ -1446,7 +1734,12 @@ def admin_callback(chat, mid, uid, data, cbid):
     core.pending.pop(chat, None)
     if data.startswith("r:"):
         review_callback(chat, mid, uid, data, cbid); return
-    review_pending.pop(uid, None)
+    if data.startswith("t:"):
+        ticket_callback(chat, mid, uid, data, cbid); return
+    review_pending.pop(uid, None); ticket_pending.pop(uid, None)
+    if data == "sa:tickets":
+        core.answer(cbid); t, kb = tickets_view()
+        core.edit(chat, mid, t, (kb or []) + [[{"text": "بازگشت", "callback_data": "sa:menu"}]]); return
     if data == "sa:queue":
         core.answer(cbid); t, kb = queue_view()
         core.edit(chat, mid, t, (kb or []) + [[{"text": "بازگشت", "callback_data": "sa:menu"}]]); return
@@ -1577,11 +1870,12 @@ def admin_message(chat, uid, m):
     """Admin reply-keyboard buttons and shop input steps. Returns True when handled."""
     text = (m.get("text") or "").strip()
     if text in (B_LINKS, B_SHOP):
-        core.pending.pop(chat, None); review_pending.pop(uid, None)
+        core.pending.pop(chat, None); review_pending.pop(uid, None); ticket_pending.pop(uid, None)
         if text == B_LINKS: core.send(chat, core.WELCOME, core.main_menu_kb())
         else: core.send(chat, shop_admin_text(), shop_admin_kb())
         return True
     if review_text(chat, uid, text): return True
+    if ticket_text(chat, uid, text): return True
     st = core.pending.get(chat)
     if st and st.get("stage") == "sa_outage":
         if not text: core.send(chat, "متن اعلان را بنویس:"); return True
