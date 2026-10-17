@@ -144,6 +144,7 @@ def init_db():
     # Remember the pre-edit slots for legacy links. A later settings change can then
     # detect a removed port even though the old credential has no per-port identity.
     _snapshot_missing_active_slots()
+    shop.init_db()
 
 def meta_get(k, d=None):
     c = db(); r = c.execute("SELECT v FROM meta WHERE k=?", (k,)).fetchone(); c.close()
@@ -2064,14 +2065,16 @@ def route_cb(chat, mid, data, cbid):
 def handle_update(up):
     if "callback_query" in up:
         cq = up["callback_query"]; uid = cq["from"]["id"]
+        if not is_admin(uid): shop.on_update(up); return   # customers + support staff
         chat = cq["message"]["chat"]["id"]; mid = cq["message"]["message_id"]
-        if not is_admin(uid): answer(cq["id"], "⛔️ اجازه نداری"); return
+        if cq["data"].startswith("sa:"): shop.admin_callback(chat, mid, uid, cq["data"], cq["id"]); return
         route_cb(chat, mid, cq["data"], cq["id"]); return
-    if "message" not in up: return
+    if "message" not in up or "from" not in up["message"]: return
     m = up["message"]; uid = m["from"]["id"]; chat = m["chat"]["id"]; text = m.get("text", "")
     if (not ADMIN_IDS) and meta_get("admin_id") is None and text.startswith("/start"):
         meta_set("admin_id", uid)
-    if not is_admin(uid): send(chat, "⛔️ این ربات خصوصی است."); return
+    if not is_admin(uid): shop.on_update(up); return
+    if shop.admin_message(chat, uid, m): return
     st = pending.get(chat)
     if st and st.get("stage") == "ips_edit":
         valid = parse_ips(text)
@@ -2121,7 +2124,7 @@ def handle_update(up):
         tok = mint_login()
         send(chat, "🔐 لینک ورود به پنل (۱۰ دقیقه اعتبار، یک‌بار مصرف):\n<code>%s/a/login/%s</code>" % (SUB_BASE, tok)); return
     if text.startswith("/start"):
-        pending.pop(chat, None); send(chat, WELCOME, main_menu_kb()); return
+        pending.pop(chat, None); shop.admin_start(chat); return
     send(chat, "از دکمه‌ها استفاده کن 👇", main_menu_kb())
 
 def enforcer():
@@ -3449,6 +3452,7 @@ def main():
     init_db(); tg("deleteWebhook")
     threading.Thread(target=enforcer, daemon=True).start()
     threading.Thread(target=admin_server, daemon=True).start()
+    shop.start_threads()
     print("dpbot started; endpoints=%d" % len(ENDPOINTS), flush=True)
     offset = None
     while True:
@@ -3462,6 +3466,11 @@ def main():
                 except Exception as e: print("handle err", e, flush=True)
         except Exception as e:
             print("poll err", e, flush=True); time.sleep(3)
+
+# Customer storefront (bot/shop.py, deployed next to this file). Imported last so it
+# can call back into everything above through shop.core.
+import shop
+shop.bind(sys.modules[__name__])
 
 if __name__ == "__main__":
     main()

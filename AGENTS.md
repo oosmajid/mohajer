@@ -16,6 +16,11 @@ framework, no DB server. Everything is configured through one env file (`bot.env
 - **`bot/bot.py`** — the admin-only Telegram bot. Long-polls `getUpdates`, renders
   inline-keyboard menus, mints/lists/deletes subscription links, edits clean IPs,
   and runs a background **enforcer** thread (quota/expiry/resync).
+- **`bot/shop.py`** — the customer storefront inside the same bot. `bot.py` hands every
+  non-admin update to `shop.on_update` (customers + support staff); admin reply buttons
+  and `sa:*` callbacks also land there. It calls back into `bot.py` via `shop.core`
+  (bound at the end of `bot.py`) and owns the `shop_*` tables. Roadmap: `docs/SHOP.md`.
+  **Always deploy it next to `bot.py`** — the bot will not start without it.
 - **`sub/subserver.py`** — read-only HTTP server on `127.0.0.1:8090`. Serves each
   `sub-u-<token>` file as raw base64 to proxy clients (+ `Subscription-Userinfo`
   header) or as a mobile HTML copy-page to browsers (UA sniff on `"Mozilla"`).
@@ -242,8 +247,10 @@ On all four panel hosts, the active `xray.service` reads
   is a `:root[data-theme=dark]{…}` override of the same tokens. The admin panel uses
   blue action and chart tokens; the subscriber page uses the same blue palette. Charts
   use `currentColor` so bars follow the theme. Use palette tokens on themeable surfaces.
-- **Edit bot logic:** it's one file, stdlib only. After editing, copy to the server
-  path (see table) and `systemctl restart dpbot` (live) / `mohajer-bot` (fresh).
+- **Edit bot logic:** `bot.py` + `shop.py`, stdlib only. After editing, copy BOTH to the
+  server path (see table) and `systemctl restart dpbot` (live) / `mohajer-bot` (fresh).
+- **Shop state:** customer input steps live in `shop_customers.state` (sqlite), never in
+  the in-memory `pending` dict, which stays admin-only. Shop settings are `meta.shop_*`.
 - **Inspect state:** `sqlite3 <db> "SELECT label,used_bytes,max(used_bytes-usage_reset_bytes,0) AS current_used,limit_bytes,expiry_ts FROM users"`.
 
 ## 6. Verifying a change without breaking prod
@@ -284,6 +291,9 @@ usage_ledger(email, token, last_raw, total_bytes)
 meta(k TEXT PRIMARY KEY, v TEXT)   -- includes clean_ips, config_recipe,
                                    -- endpoint_settings, relay_ingresses, outbounds, xray_pid,
                                    -- membership_sync_pending, outbound_sync_pending
+shop_customers(tg_id, first_name, username, joined_ts, last_seen, referrer_id, blocked, state)
+shop_staff(tg_id, role, added_ts, added_by)          -- role 'support'; owners = ADMIN_IDS
+shop_admin_log(id, ts, actor, action, target, detail) -- audit trail of admin/support actions
 ```
 
 See `docs/ARCHITECTURE.md` for the full flow diagrams and `docs/OPERATIONS.md` for

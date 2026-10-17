@@ -206,6 +206,7 @@ ok "bot.env written (chmod 600)"
 # ---------- 8. code + services ----------
 say "Installing code and systemd units ..."
 install -m 644 "$REPO_DIR/bot/bot.py"       "$ROOT/bot/bot.py"
+install -m 644 "$REPO_DIR/bot/shop.py"      "$ROOT/bot/shop.py"
 install -m 644 "$REPO_DIR/sub/subserver.py" "$ROOT/sub/subserver.py"
 install -d "$ROOT/sub/fonts"
 install -m 644 "$REPO_DIR/sub/fonts/Vazirmatn-variable.woff2" "$REPO_DIR/sub/fonts/OFL.txt" "$ROOT/sub/fonts/"
