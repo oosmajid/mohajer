@@ -2067,7 +2067,7 @@ def handle_update(up):
         cq = up["callback_query"]; uid = cq["from"]["id"]
         if not is_admin(uid): shop.on_update(up); return   # customers + support staff
         chat = cq["message"]["chat"]["id"]; mid = cq["message"]["message_id"]
-        if cq["data"].startswith("sa:"): shop.admin_callback(chat, mid, uid, cq["data"], cq["id"]); return
+        if cq["data"].startswith(("sa:", "r:")): shop.admin_callback(chat, mid, uid, cq["data"], cq["id"]); return
         route_cb(chat, mid, cq["data"], cq["id"]); return
     if "message" not in up or "from" not in up["message"]: return
     m = up["message"]; uid = m["from"]["id"]; chat = m["chat"]["id"]; text = m.get("text", "")

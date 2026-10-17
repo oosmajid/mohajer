@@ -251,6 +251,8 @@ On all four panel hosts, the active `xray.service` reads
   server path (see table) and `systemctl restart dpbot` (live) / `mohajer-bot` (fresh).
 - **Shop state:** customer input steps live in `shop_customers.state` (sqlite), never in
   the in-memory `pending` dict, which stays admin-only. Shop settings are `meta.shop_*`.
+- **Shop orders:** approval flips `review -> approved` inside `BEGIN IMMEDIATE` before minting, so a
+  double click or two reviewers can never deliver twice; a failed mint puts it back to `review`.
 - **Inspect state:** `sqlite3 <db> "SELECT label,used_bytes,max(used_bytes-usage_reset_bytes,0) AS current_used,limit_bytes,expiry_ts FROM users"`.
 
 ## 6. Verifying a change without breaking prod
@@ -293,6 +295,10 @@ meta(k TEXT PRIMARY KEY, v TEXT)   -- includes clean_ips, config_recipe,
                                    -- membership_sync_pending, outbound_sync_pending
 shop_customers(tg_id, first_name, username, joined_ts, last_seen, referrer_id, blocked, state, test_used_ts)
 shop_services(token, tg_id, kind, created_ts, followup_sent, feedback) -- customer <-> users.token; kind test|paid
+shop_plans(id, gb, days, price, active, popular)    -- 0 gb/days = unlimited
+shop_cards(id, number, holder, active)              -- card-to-card destinations, one picked per invoice
+shop_orders(id, tg_id, kind buy|renew, token, gb, days, price, amount, paid_amount, card_id, status,
+            receipt_file, receipt_uid UNIQUE, ..., review_msgs) -- awaiting->review->approved|rejected; expired|cancelled
 shop_staff(tg_id, role, added_ts, added_by)          -- role 'support'; owners = ADMIN_IDS
 shop_admin_log(id, ts, actor, action, target, detail) -- audit trail of admin/support actions
 ```

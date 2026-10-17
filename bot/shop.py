@@ -33,6 +33,23 @@ def init_db():
         token TEXT PRIMARY KEY, tg_id INTEGER NOT NULL, kind TEXT NOT NULL,
         created_ts INTEGER NOT NULL, followup_sent INTEGER NOT NULL DEFAULT 0, feedback TEXT)""")
     c.execute("CREATE INDEX IF NOT EXISTS shop_services_owner ON shop_services(tg_id)")
+    c.execute("""CREATE TABLE IF NOT EXISTS shop_plans(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, gb REAL NOT NULL, days REAL NOT NULL,   -- 0 = unlimited
+        price INTEGER NOT NULL, active INTEGER NOT NULL DEFAULT 1, popular INTEGER NOT NULL DEFAULT 0,
+        created_ts INTEGER NOT NULL)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS shop_cards(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, number TEXT NOT NULL, holder TEXT NOT NULL,
+        active INTEGER NOT NULL DEFAULT 1, created_ts INTEGER NOT NULL)""")
+    # One row per invoice. gb/days/price are a snapshot, so later plan edits never change it.
+    # status: awaiting (no receipt yet) -> review -> approved | rejected; or expired | cancelled.
+    c.execute("""CREATE TABLE IF NOT EXISTS shop_orders(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, tg_id INTEGER NOT NULL, kind TEXT NOT NULL,  -- buy | renew
+        token TEXT, plan_id INTEGER, gb REAL NOT NULL, days REAL NOT NULL, price INTEGER NOT NULL,
+        amount INTEGER NOT NULL, paid_amount INTEGER, card_id INTEGER, status TEXT NOT NULL,
+        receipt_file TEXT, receipt_uid TEXT UNIQUE, created_ts INTEGER NOT NULL, receipt_ts INTEGER,
+        decided_ts INTEGER, decided_by INTEGER, note TEXT, review_msgs TEXT)""")
+    c.execute("CREATE INDEX IF NOT EXISTS shop_orders_status ON shop_orders(status)")
+    c.execute("CREATE INDEX IF NOT EXISTS shop_orders_owner ON shop_orders(tg_id)")
     c.execute("""CREATE TABLE IF NOT EXISTS shop_staff(
         tg_id INTEGER PRIMARY KEY, role TEXT NOT NULL, added_ts INTEGER NOT NULL, added_by INTEGER)""")
     c.execute("""CREATE TABLE IF NOT EXISTS shop_admin_log(
@@ -78,6 +95,29 @@ def fa_size(mb):
 
 def fa_hours(h):
     return fa("%g روز" % (h / 24)) if h >= 24 and h % 24 == 0 else fa("%d ساعت" % h)
+
+def toman(n):
+    return fa("{:,}".format(int(n)).replace(",", "٬")) + " تومان"
+
+def fa_clock(ts):
+    return fa(time.strftime("%H:%M", time.gmtime(ts + core.IRAN_OFFSET)))
+
+_IN_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+
+def to_ascii(s):
+    """Persian/Arabic digits -> ASCII, so admins and customers can type either."""
+    return (s or "").translate(_IN_DIGITS)
+
+def parse_amount(text):
+    """'150,000' / '۱۵۰٬۰۰۰' / '150.000 تومان' -> 150000; None if not a positive integer."""
+    digits = "".join(ch for ch in to_ascii(text) if "0" <= ch <= "9")
+    try: n = int(digits)
+    except ValueError: return None
+    return n if n > 0 else None
+
+def plan_title(gb, days):
+    return "%s · %s" % ("حجم نامحدود" if not gb else fa("%g گیگ" % gb),
+                        "زمان نامحدود" if not days else fa("%g روز" % days))
 
 # ---------------- roles ----------------
 ROLE_SUPPORT = "support"   # sees receipts + tickets; no settings, plans or staff
@@ -296,11 +336,325 @@ def record_feedback(chat, mid, uid, data):
                 core.send(a, "👎 یک مشتری از تست رایگان راضی نبود: %s · <code>%d</code>"
                           % (html.escape(cust["first_name"] or ""), uid))
 
+# --- plans & buying ---
+def get_plan(pid):
+    c = core.db(); r = c.execute("SELECT * FROM shop_plans WHERE id=?", (pid,)).fetchone(); c.close(); return r
+
+def list_plans(active_only=True):
+    c = core.db()
+    rows = c.execute("SELECT * FROM shop_plans %s ORDER BY price" % ("WHERE active=1" if active_only else "")).fetchall()
+    c.close(); return rows
+
+def owned_service(uid, token):
+    """The customer's link row (users join shop_services), or None if it is not theirs / gone."""
+    c = core.db()
+    r = c.execute("SELECT u.* FROM shop_services s JOIN users u ON u.token=s.token "
+                  "WHERE s.token=? AND s.tg_id=?", (token, uid)).fetchone()
+    c.close(); return r
+
+def plans_view(uid, token=None):
+    plans = list_plans()
+    if not plans:
+        return "🛒 فعلاً پلنی برای فروش نداریم؛ به‌زودی برمی‌گردیم 🙏", None
+    suffix = (":" + token) if token else ""
+    kb = [[{"text": "%s%s · %s" % ("🔥 " if p["popular"] else "", plan_title(p["gb"], p["days"]), toman(p["price"])),
+            "callback_data": "c:plan:%d%s" % (p["id"], suffix)}] for p in plans]
+    per_gb = ["• %s ← هر گیگ %s" % (plan_title(p["gb"], p["days"]), toman(p["price"] / p["gb"]))
+              for p in plans if p["gb"]]
+    if token:
+        u = owned_service(uid, token)
+        head = "🔄 <b>تمدید «%s»</b>\nحجم و زمان پلن به همین سرویس اضافه می‌شه و لینکت عوض نمی‌شه:" % html.escape(u["label"] if u else "")
+    else:
+        head = "🛒 <b>خرید سرویس</b>\nیکی از پلن‌ها رو انتخاب کن:"
+    return head + ("\n\n" + "\n".join(per_gb) if per_gb else ""), kb
+
+def send_plans(chat, uid, token=None, mid=None):
+    text, kb = plans_view(uid, token)
+    if mid: core.edit(chat, mid, text, kb)
+    else: core.send(chat, text, kb)
+
+def invoice_view(plan, token=None):
+    suffix = (":" + token) if token else ""
+    text = ("🧾 <b>پیش‌فاکتور</b>\n\n📦 %s\n%s💰 مبلغ: <b>%s</b>"
+            % (plan_title(plan["gb"], plan["days"]), "🔄 تمدید سرویس فعلی\n" if token else "", toman(plan["price"])))
+    kb = [[{"text": "💳 پرداخت کارت‌به‌کارت", "callback_data": "c:pay:%d%s" % (plan["id"], suffix)}],
+          [{"text": "بازگشت", "callback_data": "c:plans%s" % suffix}]]
+    return text, kb
+
+ORDER_TTL = 3600            # an invoice waits this long for its receipt
+LATE_RECEIPT = 24 * 3600    # a receipt for an expired invoice is still accepted (people pay late)
+OPEN = ("awaiting", "review")
+
+def get_order(oid):
+    c = core.db(); r = c.execute("SELECT * FROM shop_orders WHERE id=?", (oid,)).fetchone(); c.close(); return r
+
+def create_order(uid, plan, token=None, now=None):
+    """New card-to-card invoice with a unique amount (price + a few random tomans) so the
+    reviewer can match the bank SMS to it. Older unpaid invoices of the customer are cancelled."""
+    now = int(time.time()) if now is None else now
+    c = core.db()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        cards = c.execute("SELECT id FROM shop_cards WHERE active=1").fetchall()
+        if not cards: c.rollback(); return None
+        c.execute("UPDATE shop_orders SET status='cancelled' WHERE tg_id=? AND status='awaiting'", (uid,))
+        taken = {r[0] for r in c.execute("SELECT amount FROM shop_orders WHERE status IN ('awaiting','review')")}
+        amount = plan["price"] + 1 + secrets.randbelow(999)
+        for _ in range(50):
+            if amount not in taken: break
+            amount = plan["price"] + 1 + secrets.randbelow(999)
+        oid = c.execute("INSERT INTO shop_orders(tg_id,kind,token,plan_id,gb,days,price,amount,card_id,status,created_ts) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,'awaiting',?)",
+                        (uid, "renew" if token else "buy", token, plan["id"], plan["gb"], plan["days"], plan["price"],
+                         amount, secrets.choice(cards)[0], now)).lastrowid
+        c.commit()
+    finally:
+        c.close()
+    return get_order(oid)
+
+def get_card(cid):
+    c = core.db(); r = c.execute("SELECT * FROM shop_cards WHERE id=?", (cid,)).fetchone(); c.close(); return r
+
+def payment_text(o):
+    card = get_card(o["card_id"])
+    return ("💳 <b>پرداخت کارت‌به‌کارت · سفارش #%s</b>\n\n"
+            "مبلغ دقیق: <b>%s</b>\n<code>%d</code>\n\n"
+            "به این کارت:\n<code>%s</code>\nبه نام <b>%s</b>\n\n"
+            "⏳ مهلت پرداخت: تا ساعت %s\n"
+            "📸 بعد از واریز، <b>عکس رسید</b> رو همین‌جا بفرست.\n\n"
+            "⚠️ لطفاً دقیقاً همین مبلغ رو واریز کن تا پرداختت زودتر شناسایی بشه."
+            % (fa(o["id"]), toman(o["amount"]), o["amount"], card["number"] if card else "-",
+               html.escape(card["holder"] if card else "-"), fa_clock(o["created_ts"] + ORDER_TTL)))
+
+def start_payment(chat, mid, uid, plan_id, token=None):
+    plan = get_plan(plan_id)
+    if not plan or not plan["active"]:
+        core.edit(chat, mid, "این پلن دیگه موجود نیست.", [[{"text": "🛒 پلن‌ها", "callback_data": "c:plans"}]]); return
+    if token and not owned_service(uid, token):
+        core.edit(chat, mid, "این سرویس پیدا نشد."); return
+    o = create_order(uid, plan, token)
+    if not o:
+        core.edit(chat, mid, "😔 پرداخت کارت‌به‌کارت موقتاً در دسترس نیست؛ کمی بعد دوباره امتحان کن.")
+        for a in owner_ids(): core.send(a, "⚠️ مشتری می‌خواست بخرد ولی هیچ کارت فعالی تعریف نشده است.")
+        return
+    core.edit(chat, mid, payment_text(o), [[{"text": "❌ لغو سفارش", "callback_data": "c:cancel:%d" % o["id"]}]])
+
+def cancel_order(chat, mid, uid, oid):
+    c = core.db()
+    n = c.execute("UPDATE shop_orders SET status='cancelled' WHERE id=? AND tg_id=? AND status='awaiting'", (oid, uid)).rowcount
+    c.commit(); c.close()
+    core.edit(chat, mid, "سفارش #%s لغو شد." % fa(oid) if n else "این سفارش دیگه باز نیست.")
+
+# --- receipts ---
+def receive_receipt(chat, uid, file_ref, file_uid, now=None):
+    """Attach a receipt image to the customer's open invoice and send it to the reviewers."""
+    now = int(time.time()) if now is None else now
+    c = core.db()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        o = c.execute("SELECT * FROM shop_orders WHERE tg_id=? AND (status='awaiting' OR "
+                      "(status='expired' AND created_ts>=?)) ORDER BY id DESC LIMIT 1", (uid, now - LATE_RECEIPT)).fetchone()
+        if not o:
+            c.rollback()
+            core.send(chat, "📸 الان سفارش پرداخت‌نشده‌ای نداری.\nاول از «🛒 خرید سرویس» یه پلن انتخاب کن.",
+                      [[{"text": "🛒 خرید سرویس", "callback_data": "c:buy"}]]); return
+        if c.execute("SELECT 1 FROM shop_orders WHERE receipt_uid=?", (file_uid,)).fetchone():
+            c.rollback(); say(chat, "⚠️ این رسید قبلاً ارسال شده. اگه واریز جدیدی داشتی، عکس رسید همون رو بفرست."); return
+        c.execute("UPDATE shop_orders SET status='review',receipt_file=?,receipt_uid=?,receipt_ts=? WHERE id=?",
+                  (file_ref, file_uid, now, o["id"]))
+        c.commit()
+    finally:
+        c.close()
+    say(chat, "✅ رسیدت رسید! بعد از بررسی خبرت می‌کنیم 🙏\nشمارهٔ سفارش: #%s" % fa(o["id"]))
+    send_review(o["id"])
+
+def reviewers():
+    c = core.db(); staff = [r[0] for r in c.execute("SELECT tg_id FROM shop_staff")]; c.close()
+    return owner_ids() + [s for s in staff if s not in owner_ids()]
+
+def review_caption(o):
+    cust = get_customer(o["tg_id"]); card = get_card(o["card_id"])
+    late = o["receipt_ts"] and o["receipt_ts"] > o["created_ts"] + ORDER_TTL
+    what = "خرید" if o["kind"] == "buy" else "تمدید"
+    lines = ["🧾 <b>رسید · سفارش #%d</b> (%s)%s" % (o["id"], what, " ⏰ دیرتر از مهلت" if late else ""), "",
+             "👤 %s · <code>%d</code>" % (html.escape(cust["first_name"] or "-") if cust else "-", o["tg_id"]),
+             "📦 %s" % plan_title(o["gb"], o["days"]),
+             "💰 مبلغ فاکتور: <b>%s</b>" % toman(o["amount"])]
+    if o["paid_amount"] is not None:
+        lines.append("✏️ مبلغ واریزی: <b>%s</b>" % toman(o["paid_amount"]))
+    lines.append("💳 کارت: %s (%s)" % (("…" + card["number"][-4:]) if card else "-", html.escape(card["holder"]) if card else "-"))
+    if o["status"] == "approved": lines += ["", "✅ <b>تأیید شد</b> · <code>%s</code>" % o["decided_by"]]
+    if o["status"] == "rejected": lines += ["", "❌ <b>رد شد</b>: %s · <code>%s</code>" % (html.escape(o["note"] or ""), o["decided_by"])]
+    return "\n".join(lines)
+
+def review_kb(o):
+    if o["status"] != "review": return []
+    return [[{"text": "✅ تأیید", "callback_data": "r:ok:%d" % o["id"]}, {"text": "❌ رد", "callback_data": "r:no:%d" % o["id"]}],
+            [{"text": "✏️ اصلاح مبلغ واریزی", "callback_data": "r:amt:%d" % o["id"]}]]
+
+def send_review(oid, to=None):
+    """Post the receipt (photo/document + details + buttons) to reviewers and remember the copies."""
+    o = get_order(oid); kind, file_id = o["receipt_file"].split(":", 1)
+    sent = []
+    for chat in (to or reviewers()):
+        r = core.tg("sendPhoto" if kind == "photo" else "sendDocument", chat_id=chat,
+                    **{("photo" if kind == "photo" else "document"): file_id},
+                    caption=review_caption(o), parse_mode="HTML", reply_markup={"inline_keyboard": review_kb(o)})
+        mid = (r.get("result") or {}).get("message_id")
+        if mid: sent.append([chat, mid])
+    c = core.db()
+    old = json.loads(c.execute("SELECT review_msgs FROM shop_orders WHERE id=?", (oid,)).fetchone()[0] or "[]")
+    c.execute("UPDATE shop_orders SET review_msgs=? WHERE id=?", (json.dumps(old + sent), oid)); c.commit(); c.close()
+
+def refresh_review(oid):
+    """Every reviewer sees the same state (who approved / why rejected) on their copy."""
+    o = get_order(oid)
+    for chat, mid in json.loads(o["review_msgs"] or "[]"):
+        core.tg("editMessageCaption", chat_id=chat, message_id=mid, caption=review_caption(o), parse_mode="HTML",
+                reply_markup={"inline_keyboard": review_kb(o)})
+
+def fulfill(o):
+    """Create or extend the customer's link for an approved order. Returns the token or None."""
+    token = o["token"]
+    c = core.db(); live = token and c.execute("SELECT 1 FROM users WHERE token=?", (token,)).fetchone(); c.close()
+    if o["kind"] == "renew" and live:
+        if o["gb"]: core.extend_volume(token, o["gb"])
+        else: core.set_unlimited(token, "limit_bytes")
+        if o["days"]: core.extend_time(token, o["days"])
+        else: core.set_unlimited(token, "expiry_ts")
+        try: core.refresh_usage(token)
+        except Exception as e: print("shop refresh err", e, flush=True)
+        core.maybe_reenable(token)
+        c = core.db(); c.execute("UPDATE shop_services SET kind='paid' WHERE token=?", (token,)); c.commit(); c.close()
+        return token
+    # a buy - or a renewal whose link was already deleted after its grace period: mint a new one
+    cust = get_customer(o["tg_id"])
+    token = core.create_user(o["gb"], o["days"], label=("%s · %s" % ((cust["first_name"] if cust else "") or o["tg_id"],
+                                                                      plan_title(o["gb"], o["days"])))[:40])
+    if token:
+        c = core.db()
+        c.execute("INSERT INTO shop_services(token,tg_id,kind,created_ts) VALUES(?,?,'paid',?)", (token, o["tg_id"], int(time.time())))
+        c.execute("UPDATE shop_orders SET token=? WHERE id=?", (token, o["id"])); c.commit(); c.close()
+    return token
+
+def approve(oid, uid):
+    """review -> approved exactly once, then deliver. Returns 'ok' | 'done' | 'short' | 'failed'."""
+    c = core.db()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        o = c.execute("SELECT * FROM shop_orders WHERE id=?", (oid,)).fetchone()
+        if not o or o["status"] != "review": c.rollback(); return "done"
+        if o["paid_amount"] is not None and o["paid_amount"] < o["amount"]: c.rollback(); return "short"
+        c.execute("UPDATE shop_orders SET status='approved',decided_ts=?,decided_by=? WHERE id=?", (int(time.time()), uid, oid))
+        c.commit()
+    finally:
+        c.close()
+    token = None
+    try: token = fulfill(get_order(oid))
+    except Exception as e: print("shop fulfill err", e, flush=True)
+    if not token:   # give the order back to the queue so someone can retry
+        c = core.db(); c.execute("UPDATE shop_orders SET status='review',decided_ts=NULL,decided_by=NULL WHERE id=?", (oid,))
+        c.commit(); c.close(); return "failed"
+    o = get_order(oid); log(uid, "order_approve", oid, o["paid_amount"] if o["paid_amount"] is not None else o["amount"])
+    head = "🎉 <b>پرداختت تأیید شد!</b>\n" + ("سرویست تمدید شد ✅" if o["kind"] == "renew" else "سرویس جدیدت فعال شد ✅")
+    core.send(o["tg_id"], "%s\n📦 %s\n\n🔗 <code>%s</code>" % (head, plan_title(o["gb"], o["days"]), core.sub_url(token)),
+              link_kb(token))
+    refresh_review(oid)
+    return "ok"
+
+REJECT_REASONS = ["مبلغ واریزی با فاکتور یکی نیست", "رسید ناخوانا یا نامعتبر است", "واریزی به حساب ما نرسیده", "رسید تکراری است"]
+
+def reject(oid, uid, reason):
+    c = core.db()
+    n = c.execute("UPDATE shop_orders SET status='rejected',note=?,decided_ts=?,decided_by=? WHERE id=? AND status='review'",
+                  (reason, int(time.time()), uid, oid)).rowcount
+    c.commit(); c.close()
+    if not n: return False
+    o = get_order(oid); log(uid, "order_reject", oid, reason)
+    core.send(o["tg_id"], "❌ رسید سفارش #%s تأیید نشد.\nدلیل: %s\n\nاگه فکر می‌کنی اشتباه شده، از «🛠 گزارش اختلال» پیام بده."
+              % (fa(oid), html.escape(reason)), [[{"text": "🛒 خرید دوباره", "callback_data": "c:buy"}]])
+    refresh_review(oid)
+    return True
+
+review_pending = {}   # reviewer uid -> {"kind": "amount" | "reason", "oid": id}; staff only, tiny
+
+def queue_view():
+    c = core.db()
+    rows = c.execute("SELECT o.*, c.first_name FROM shop_orders o LEFT JOIN shop_customers c ON c.tg_id=o.tg_id "
+                     "WHERE o.status='review' ORDER BY o.receipt_ts LIMIT 30").fetchall()
+    c.close()
+    if not rows: return "🧾 رسیدی در انتظار بررسی نیست ✨", None
+    return ("🧾 <b>رسیدهای در انتظار</b> (%s)\nروی هرکدام بزن تا رسیدش بیاد:" % fa(len(rows)),
+            [[{"text": "#%d · %s · %s" % (r["id"], r["first_name"] or r["tg_id"], toman(r["amount"])),
+               "callback_data": "r:q:%d" % r["id"]}] for r in rows])
+
+def review_callback(chat, mid, uid, data, cbid):
+    """Receipt buttons for owners and support staff ('r:<action>:<order>[:<arg>]')."""
+    parts = data.split(":")
+    if len(parts) < 3 or not parts[2].isdigit(): core.answer(cbid); return
+    action, oid = parts[1], int(parts[2])
+    o = get_order(oid)
+    if not o: core.answer(cbid, "سفارش پیدا نشد"); return
+    if action == "q":
+        core.answer(cbid); send_review(oid, to=[chat]); return
+    if o["status"] != "review":
+        core.answer(cbid, "این سفارش قبلاً بررسی شده"); refresh_review(oid); return
+    if action == "ok":
+        res = approve(oid, uid)
+        core.answer(cbid, {"ok": "✅ تأیید شد و سرویس ارسال شد", "done": "این سفارش قبلاً بررسی شده",
+                           "short": "مبلغ واریزی کمتر از فاکتور است؛ رد کن یا مبلغ را اصلاح کن",
+                           "failed": "❌ ساخت سرویس ناموفق بود؛ دوباره تأیید کن"}[res]); return
+    if action == "no":
+        core.answer(cbid)
+        kb = [[{"text": r, "callback_data": "r:nor:%d:%d" % (oid, i)}] for i, r in enumerate(REJECT_REASONS)]
+        kb += [[{"text": "✏️ دلیل دیگر", "callback_data": "r:nox:%d" % oid}], [{"text": "بازگشت", "callback_data": "r:back:%d" % oid}]]
+        core.tg("editMessageReplyMarkup", chat_id=chat, message_id=mid, reply_markup={"inline_keyboard": kb}); return
+    if action == "nor" and len(parts) == 4 and parts[3].isdigit() and int(parts[3]) < len(REJECT_REASONS):
+        reject(oid, uid, REJECT_REASONS[int(parts[3])]); core.answer(cbid, "رد شد"); return
+    if action == "back":
+        core.answer(cbid); core.tg("editMessageReplyMarkup", chat_id=chat, message_id=mid, reply_markup={"inline_keyboard": review_kb(o)}); return
+    if action in ("nox", "amt"):
+        review_pending[uid] = {"kind": "reason" if action == "nox" else "amount", "oid": oid}; core.answer(cbid)
+        core.send(chat, "دلیل رد سفارش #%d را بنویس:" % oid if action == "nox" else
+                  "مبلغی که واقعاً برای سفارش #%d واریز شده را به تومان بفرست:" % oid); return
+    core.answer(cbid)
+
+def review_text(chat, uid, text):
+    """Typed answers to 'other reason' / 'fix amount'. Returns True when it consumed the message."""
+    st = review_pending.get(uid)
+    if not st: return False
+    o = get_order(st["oid"])
+    if not o or o["status"] != "review":
+        review_pending.pop(uid, None); core.send(chat, "این سفارش دیگر در انتظار بررسی نیست."); return True
+    if st["kind"] == "reason":
+        if not text.strip(): core.send(chat, "دلیل را بنویس:"); return True
+        review_pending.pop(uid, None); reject(o["id"], uid, text.strip()[:200])
+        core.send(chat, "❌ سفارش #%d رد شد و به مشتری خبر داده شد." % o["id"]); return True
+    n = parse_amount(text)
+    if not n: core.send(chat, "یک عدد بفرست (تومان)، مثلاً <code>150000</code>:"); return True
+    review_pending.pop(uid, None)
+    c = core.db(); c.execute("UPDATE shop_orders SET paid_amount=? WHERE id=? AND status='review'", (n, o["id"])); c.commit(); c.close()
+    log(uid, "order_paid_amount", o["id"], n); refresh_review(o["id"])
+    core.send(chat, "✏️ مبلغ واریزی سفارش #%d ثبت شد: %s%s" % (o["id"], toman(n),
+              "" if n >= o["amount"] else "\n⚠️ کمتر از فاکتور است؛ تأیید ممکن نیست."))
+    return True
+
+def expire_orders(now=None):
+    now = int(time.time()) if now is None else now
+    c = core.db()
+    rows = c.execute("SELECT id,tg_id FROM shop_orders WHERE status='awaiting' AND created_ts<?", (now - ORDER_TTL,)).fetchall()
+    expired = [r for r in rows if c.execute("UPDATE shop_orders SET status='expired' WHERE id=? AND status='awaiting'",
+                                            (r["id"],)).rowcount]
+    c.commit(); c.close()
+    for r in expired:
+        core.send(r["tg_id"], "⌛️ مهلت پرداخت سفارش #%s تموم شد.\nاگه واریز کردی، تا ۲۴ ساعت هنوز می‌تونی عکس رسید رو بفرستی؛ "
+                  "وگرنه دوباره از «🛒 خرید سرویس» سفارش بده." % fa(r["id"]))
+
 # --- account ---
 def account_text(uid):
     cust = get_customer(uid)
     c = core.db()
-    paid = c.execute("SELECT COUNT(*) FROM shop_services WHERE tg_id=? AND kind='paid'", (uid,)).fetchone()[0]
+    paid = c.execute("SELECT COUNT(*) FROM shop_orders WHERE tg_id=? AND status='approved'", (uid,)).fetchone()[0]
     c.close()
     return ("👤 <b>حساب من</b>\n\n🙂 %s\n🆔 آیدی عددی: <code>%d</code>\n📅 عضویت: %s\n🛍 تعداد خرید: %s\n🎁 تست رایگان: %s"
             % (html.escape(cust["first_name"] or "-"), uid, fa_date(cust["joined_ts"]), fa(paid),
@@ -331,13 +685,25 @@ def guide_steps(key):
             [[{"text": "⬇️ دانلود Happ", "url": url}], [{"text": "بازگشت", "callback_data": "c:guides"}]])
 
 # --- routing ---
+def receipt_file(m):
+    """('photo:<file_id>' | 'doc:<file_id>', file_unique_id) for an image message, else None."""
+    if m.get("photo"):
+        p = m["photo"][-1]; return "photo:" + p["file_id"], p["file_unique_id"]
+    d = m.get("document") or {}
+    if (d.get("mime_type") or "").startswith("image/") or (d.get("mime_type") == "application/pdf"):
+        return "doc:" + d["file_id"], d["file_unique_id"]
+    return None
+
 def customer_message(chat, uid, m):
     text = (m.get("text") or "").strip()
+    rf = receipt_file(m)
+    if rf: receive_receipt(chat, uid, *rf); return
     if text.startswith("/start"):
         set_state(uid, None)
         customer_menu(chat, welcome_text(m["from"].get("first_name"))); return
     if text in {b for row in CUSTOMER_MENU for b in row}:
         set_state(uid, None)
+        if text == B_BUY: send_plans(chat, uid); return
         if text == B_TEST: test_offer(chat, uid); return
         if text == B_ACCOUNT: core.send(chat, account_text(uid)); return
         if text == B_GUIDE: core.send(chat, GUIDE_TEXT, guide_kb()); return
@@ -355,7 +721,26 @@ def customer_callback(chat, mid, uid, data, cbid, user=None):
         core.answer(cbid); text, kb = guide_steps(data[8:]); core.edit(chat, mid, text, kb); return
     if data.startswith("c:fb:") and data.count(":") == 3:
         core.answer(cbid); record_feedback(chat, mid, uid, data); return
-    if data in ("c:buy", "c:report"):
+    parts = data.split(":")
+    token = parts[3] if len(parts) == 4 else None
+    if data == "c:buy":
+        core.answer(cbid); send_plans(chat, uid); return
+    if parts[:2] == ["c", "renew"] and len(parts) == 3:
+        core.answer(cbid)
+        if owned_service(uid, parts[2]): send_plans(chat, uid, parts[2])
+        else: core.send(chat, "این سرویس دیگه وجود نداره؛ می‌تونی یه سرویس جدید بخری.", [[{"text": "🛒 خرید سرویس", "callback_data": "c:buy"}]])
+        return
+    if parts[:2] == ["c", "plans"]:
+        core.answer(cbid); send_plans(chat, uid, parts[2] if len(parts) == 3 else None, mid); return
+    if parts[:2] in (["c", "plan"], ["c", "pay"]) and len(parts) in (3, 4) and parts[2].isdigit():
+        core.answer(cbid)
+        if parts[1] == "pay": start_payment(chat, mid, uid, int(parts[2]), token); return
+        plan = get_plan(int(parts[2]))
+        if not plan or not plan["active"]: send_plans(chat, uid, token, mid); return
+        text, kb = invoice_view(plan, token); core.edit(chat, mid, text, kb); return
+    if parts[:2] == ["c", "cancel"] and len(parts) == 3 and parts[2].isdigit():
+        core.answer(cbid); cancel_order(chat, mid, uid, int(parts[2])); return
+    if data == "c:report":
         core.answer(cbid, SOON_TEXT); return
     core.answer(cbid)
 
@@ -365,11 +750,15 @@ SUPPORT_MENU = [[B_RECEIPTS, B_TICKETS]]
 
 def support_message(chat, uid, m):
     text = (m.get("text") or "").strip()
-    if text in (B_RECEIPTS, B_TICKETS):
+    if text == B_RECEIPTS:
+        review_pending.pop(uid, None); t, kb = queue_view(); core.send(chat, t, kb); return
+    if text == B_TICKETS:
         say(chat, SOON_TEXT); return
+    if review_text(chat, uid, text): return
     say(chat, "🎧 <b>پنل پشتیبانی</b>\nاز منوی پایین یکی رو انتخاب کن 👇", reply_kb(SUPPORT_MENU))
 
 def support_callback(chat, mid, uid, data, cbid):
+    if data.startswith("r:"): review_callback(chat, mid, uid, data, cbid); return
     core.answer(cbid)
 
 # ---------------- entry point for every non-admin update ----------------
@@ -414,6 +803,9 @@ def shop_admin_text():
 
 def shop_admin_kb():
     return [[{"text": ("✅ خاموش کردن تعمیرات" if flag("maintenance") else "🛠 روشن کردن تعمیرات"), "callback_data": "sa:maint"}],
+            [{"text": "🧾 رسیدهای در انتظار (%s)" % fa(_count("SELECT COUNT(*) FROM shop_orders WHERE status='review'")),
+              "callback_data": "sa:queue"}],
+            [{"text": "📦 پلن‌ها", "callback_data": "sa:plans"}, {"text": "💳 کارت‌ها", "callback_data": "sa:cards"}],
             [{"text": "🎁 تست رایگان", "callback_data": "sa:test"}],
             [{"text": "🎧 پشتیبان‌ها", "callback_data": "sa:staff"}, {"text": "📜 لاگ کارها", "callback_data": "sa:log"}],
             [{"text": "💾 بکاپ الان", "callback_data": "sa:backup"},
@@ -452,6 +844,35 @@ def test_admin_kb():
             [{"text": mark(h == test_hours(), fa_hours(h)), "callback_data": "sa:test_hours:%d" % h} for h in TEST_HOUR_CHOICES],
             [{"text": "بازگشت", "callback_data": "sa:menu"}]]
 
+def plans_admin():
+    plans = list_plans(active_only=False)
+    kb = [[{"text": "%s%s%s · %s" % ("" if p["active"] else "⏸ ", "🔥 " if p["popular"] else "",
+                                     plan_title(p["gb"], p["days"]), toman(p["price"])),
+            "callback_data": "sa:plan:%d" % p["id"]}] for p in plans]
+    kb += [[{"text": "➕ افزودن پلن", "callback_data": "sa:plan_add"}], [{"text": "بازگشت", "callback_data": "sa:menu"}]]
+    return ("📦 <b>پلن‌ها</b>\nروی هر پلن بزن تا ویرایشش کنی. ⏸ = مخفی از مشتری · 🔥 = پرفروش"
+            if plans else "📦 <b>پلن‌ها</b>\nهنوز پلنی نساختی."), kb
+
+def plan_admin(p):
+    return ("📦 <b>%s</b>\n💰 %s\nوضعیت: %s%s" % (plan_title(p["gb"], p["days"]), toman(p["price"]),
+                                               "فعال" if p["active"] else "مخفی", " · 🔥 پرفروش" if p["popular"] else ""),
+            [[{"text": "⏸ مخفی کن" if p["active"] else "▶️ فعال کن", "callback_data": "sa:plan_act:%d" % p["id"]},
+              {"text": "🔥 برداشتن برچسب" if p["popular"] else "🔥 پرفروش", "callback_data": "sa:plan_pop:%d" % p["id"]}],
+             [{"text": "✏️ تغییر قیمت", "callback_data": "sa:plan_price:%d" % p["id"]},
+              {"text": "🗑 حذف", "callback_data": "sa:plan_del:%d" % p["id"]}],
+             [{"text": "بازگشت", "callback_data": "sa:plans"}]])
+
+PLAN_ADD_TEXT = ("➕ <b>پلن جدید</b>\nحجم (گیگ)، مدت (روز) و قیمت (تومان) را با فاصله بفرست:\n"
+                 "<code>30 30 150000</code>\nبرای نامحدود، صفر بگذار.")
+
+def cards_admin():
+    c = core.db(); cards = c.execute("SELECT * FROM shop_cards ORDER BY id").fetchall(); c.close()
+    kb = [[{"text": "%s …%s · %s" % ("✅" if k["active"] else "⏸", k["number"][-4:], k["holder"]), "callback_data": "sa:card_act:%d" % k["id"]},
+           {"text": "🗑", "callback_data": "sa:card_del:%d" % k["id"]}] for k in cards]
+    kb += [[{"text": "➕ افزودن کارت", "callback_data": "sa:card_add"}], [{"text": "بازگشت", "callback_data": "sa:menu"}]]
+    return ("💳 <b>کارت‌ها</b>\nبرای هر سفارش یکی از کارت‌های فعال به‌صورت تصادفی نمایش داده می‌شود.\n"
+            "روی کارت بزن تا فعال/غیرفعال شود." if cards else "💳 <b>کارت‌ها</b>\nهنوز کارتی اضافه نکردی؛ بدون کارت فعال، خرید ممکن نیست."), kb
+
 def log_text(limit=15):
     c = core.db(); rows = c.execute("SELECT * FROM shop_admin_log ORDER BY id DESC LIMIT ?", (limit,)).fetchall(); c.close()
     if not rows: return "📜 <b>لاگ کارها</b>\n\nهنوز کاری ثبت نشده."
@@ -463,6 +884,48 @@ def log_text(limit=15):
 def admin_callback(chat, mid, uid, data, cbid):
     """Inline buttons of the shop admin menu; every callback_data starts with 'sa:'."""
     core.pending.pop(chat, None)
+    if data.startswith("r:"):
+        review_callback(chat, mid, uid, data, cbid); return
+    review_pending.pop(uid, None)
+    if data == "sa:queue":
+        core.answer(cbid); t, kb = queue_view()
+        core.edit(chat, mid, t, (kb or []) + [[{"text": "بازگشت", "callback_data": "sa:menu"}]]); return
+    if data == "sa:plans":
+        core.answer(cbid); core.edit(chat, mid, *plans_admin()); return
+    if data == "sa:plan_add":
+        core.pending[chat] = {"stage": "sa_plan_add"}; core.answer(cbid)
+        core.edit(chat, mid, PLAN_ADD_TEXT, [[{"text": "انصراف", "callback_data": "sa:plans"}]]); return
+    if data == "sa:cards":
+        core.answer(cbid); core.edit(chat, mid, *cards_admin()); return
+    if data == "sa:card_add":
+        core.pending[chat] = {"stage": "sa_card_add"}; core.answer(cbid)
+        core.edit(chat, mid, "➕ <b>کارت جدید</b>\nشمارهٔ ۱۶ رقمی و نام صاحب کارت را بفرست:\n<code>6037991234567890 فاطمه میرخلیلی</code>",
+                  [[{"text": "انصراف", "callback_data": "sa:cards"}]]); return
+    parts = data.split(":")
+    if len(parts) == 3 and parts[2].isdigit():
+        what, rid = parts[1], int(parts[2])
+        if what in ("plan", "plan_act", "plan_pop", "plan_price", "plan_del"):
+            p = get_plan(rid)
+            if not p: core.answer(cbid, "پیدا نشد"); core.edit(chat, mid, *plans_admin()); return
+            if what == "plan_price":
+                core.pending[chat] = {"stage": "sa_plan_price", "id": rid}; core.answer(cbid)
+                core.edit(chat, mid, "قیمت جدید «%s» را به تومان بفرست:" % plan_title(p["gb"], p["days"]),
+                          [[{"text": "انصراف", "callback_data": "sa:plan:%d" % rid}]]); return
+            if what == "plan_del":
+                c = core.db(); c.execute("DELETE FROM shop_plans WHERE id=?", (rid,)); c.commit(); c.close()
+                log(uid, "plan_delete", rid, plan_title(p["gb"], p["days"]))
+                core.answer(cbid, "حذف شد"); core.edit(chat, mid, *plans_admin()); return
+            if what in ("plan_act", "plan_pop"):
+                col = "active" if what == "plan_act" else "popular"
+                c = core.db(); c.execute("UPDATE shop_plans SET %s=1-%s WHERE id=?" % (col, col), (rid,)); c.commit(); c.close()
+                log(uid, what, rid); p = get_plan(rid)
+            core.answer(cbid); core.edit(chat, mid, *plan_admin(p)); return
+        if what in ("card_act", "card_del"):
+            c = core.db()
+            if what == "card_act": c.execute("UPDATE shop_cards SET active=1-active WHERE id=?", (rid,))
+            else: c.execute("DELETE FROM shop_cards WHERE id=?", (rid,))
+            c.commit(); c.close(); log(uid, what, rid)
+            core.answer(cbid); core.edit(chat, mid, *cards_admin()); return
     if data == "sa:menu":
         core.answer(cbid); core.edit(chat, mid, shop_admin_text(), shop_admin_kb()); return
     if data == "sa:maint":
@@ -515,11 +978,42 @@ def _forwarded_user_id(m):
 def admin_message(chat, uid, m):
     """Admin reply-keyboard buttons and shop input steps. Returns True when handled."""
     text = (m.get("text") or "").strip()
-    if text == B_LINKS:
-        core.pending.pop(chat, None); core.send(chat, core.WELCOME, core.main_menu_kb()); return True
-    if text == B_SHOP:
-        core.pending.pop(chat, None); core.send(chat, shop_admin_text(), shop_admin_kb()); return True
+    if text in (B_LINKS, B_SHOP):
+        core.pending.pop(chat, None); review_pending.pop(uid, None)
+        if text == B_LINKS: core.send(chat, core.WELCOME, core.main_menu_kb())
+        else: core.send(chat, shop_admin_text(), shop_admin_kb())
+        return True
+    if review_text(chat, uid, text): return True
     st = core.pending.get(chat)
+    if st and st.get("stage") == "sa_plan_add":
+        nums = to_ascii(text).split()
+        try:
+            gb, days, price = float(nums[0]), float(nums[1]), parse_amount(nums[2])
+            if len(nums) != 3 or gb < 0 or days < 0 or not price or gb > 100000 or days > 3650: raise ValueError()
+        except (ValueError, IndexError):
+            core.send(chat, "سه عدد بفرست: حجم، روز، قیمت. مثلاً <code>30 30 150000</code>"); return True
+        c = core.db()
+        pid = c.execute("INSERT INTO shop_plans(gb,days,price,created_ts) VALUES(?,?,?,?)", (gb, days, price, int(time.time()))).lastrowid
+        c.commit(); c.close(); core.pending.pop(chat, None); log(uid, "plan_add", pid, "%g/%g/%d" % (gb, days, price))
+        core.send(chat, "✅ پلن اضافه شد.", plans_admin()[1]); return True
+    if st and st.get("stage") == "sa_plan_price":
+        price = parse_amount(text)
+        if not price: core.send(chat, "قیمت را به تومان بفرست، مثلاً <code>150000</code>:"); return True
+        c = core.db(); c.execute("UPDATE shop_plans SET price=? WHERE id=?", (price, st["id"])); c.commit(); c.close()
+        core.pending.pop(chat, None); log(uid, "plan_price", st["id"], price)
+        p = get_plan(st["id"])
+        if p: core.send(chat, *plan_admin(p))
+        return True
+    if st and st.get("stage") == "sa_card_add":
+        raw = to_ascii(text).strip()
+        digits = "".join(ch for ch in raw[:30] if ch.isdigit())
+        holder = raw.lstrip("0123456789 -").strip()
+        if len(digits) != 16 or not holder:
+            core.send(chat, "شمارهٔ ۱۶ رقمی و بعد نام صاحب کارت را بفرست:\n<code>6037991234567890 فاطمه میرخلیلی</code>"); return True
+        c = core.db()
+        cid = c.execute("INSERT INTO shop_cards(number,holder,created_ts) VALUES(?,?,?)", (digits, holder[:60], int(time.time()))).lastrowid
+        c.commit(); c.close(); core.pending.pop(chat, None); log(uid, "card_add", cid, "…" + digits[-4:])
+        core.send(chat, "✅ کارت اضافه شد.", cards_admin()[1]); return True
     if st and st.get("stage") == "sa_staff_add":
         tid = _forwarded_user_id(m) or (int(text) if text.isdigit() else None)
         if not tid:
@@ -568,6 +1062,7 @@ def tick():
         set_setting("backup_day", core.day_key())
         for a in owner_ids(): send_backup(a)
     send_test_followups()
+    expire_orders()
 
 def ticker():
     while True:

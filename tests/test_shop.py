@@ -24,17 +24,31 @@ class ShopCase(unittest.TestCase):
         self._db, self._tg, self._admins = bot.DB_PATH, bot.tg, set(bot.ADMIN_IDS)
         bot.DB_PATH = self.path; bot.init_db()
         bot.ADMIN_IDS.clear(); bot.ADMIN_IDS.add(ADMIN)
-        self.calls = []
-        bot.tg = lambda method, **p: self.calls.append((method, p)) or {"ok": True}
-        bot.pending.clear(); shop._hits.clear()
+        self.calls, self.minted = [], []
+        bot.tg = self.fake_tg
+        bot.pending.clear(); shop._hits.clear(); shop.review_pending.clear()
+
+    def fake_tg(self, method, **p):
+        self.calls.append((method, p))
+        return {"ok": True, "result": {"message_id": len(self.calls)}}
 
     def tearDown(self):
         bot.tg = self._tg; bot.DB_PATH = self._db
         bot.ADMIN_IDS.clear(); bot.ADMIN_IDS.update(self._admins)
-        bot.pending.clear(); shop._hits.clear()
+        bot.pending.clear(); shop._hits.clear(); shop.review_pending.clear()
         for suffix in ("", "-wal", "-shm"):
             try: os.unlink(self.path + suffix)
             except OSError: pass  # Windows may still hold the handle
+
+    def fake_create(self, vol_gb, dur_days, label=None):
+        token = "tok%d" % len(self.minted)
+        self.minted.append((vol_gb, dur_days, label))
+        c = bot.db()
+        c.execute("INSERT INTO users(token,uuid,email,label,limit_bytes,expiry_ts,created_ts,used_bytes) "
+                  "VALUES(?,?,?,?,?,?,?,0)", (token, "u", "u_" + token, label, int(vol_gb * bot.GB),
+                                              int(1e9 + dur_days * 86400), int(1e9)))
+        c.commit(); c.close()
+        return token
 
     def texts(self, chat=None):
         return [p.get("text", "") for m, p in self.calls
@@ -175,7 +189,6 @@ class ShopFoundationTests(ShopCase):
 class ShopFreeTestTests(ShopCase):
     def setUp(self):
         super().setUp()
-        self.minted = []
         self._create = bot.create_user
         bot.create_user = self.fake_create
         bot.handle_update(msg(ALICE, "/start"))
@@ -183,16 +196,6 @@ class ShopFreeTestTests(ShopCase):
     def tearDown(self):
         bot.create_user = self._create
         super().tearDown()
-
-    def fake_create(self, vol_gb, dur_days, label=None):
-        token = "tok%d" % len(self.minted)
-        self.minted.append((vol_gb, dur_days, label))
-        c = bot.db()
-        c.execute("INSERT INTO users(token,uuid,email,label,limit_bytes,expiry_ts,created_ts,used_bytes) "
-                  "VALUES(?,?,?,?,?,?,?,0)", (token, "u", "u_" + token, label, int(vol_gb * bot.GB),
-                                              int(1e9 + dur_days * 86400), int(1e9)))
-        c.commit(); c.close()
-        return token
 
     def test_free_test_is_given_once(self):
         bot.handle_update(msg(ALICE, shop.B_TEST))
@@ -275,6 +278,193 @@ class ShopFreeTestTests(ShopCase):
         self.assertEqual(shop.jalali(1792195200), (1405, 7, 25))   # 2026-10-17
         self.assertEqual(shop.jalali(1773952200), (1404, 12, 29))  # 2026-03-20 Iran time
         self.assertEqual(shop.fa_date(1792195200), "۱۴۰۵/۰۷/۲۵")
+
+
+def photo(uid, uniq="r1"):
+    return {"message": {"from": {"id": uid, "first_name": "U%d" % uid}, "chat": {"id": uid, "type": "private"},
+                        "photo": [{"file_id": "small", "file_unique_id": uniq + "s"},
+                                  {"file_id": "big-" + uniq, "file_unique_id": uniq}]}}
+
+
+class ShopSalesTests(ShopCase):
+    """Plans, card-to-card invoices, receipts and their review."""
+
+    def setUp(self):
+        super().setUp()
+        self._fns = {k: getattr(bot, k) for k in ("create_user", "refresh_usage", "maybe_reenable")}
+        bot.create_user = self.fake_create
+        bot.refresh_usage = lambda token: None
+        bot.maybe_reenable = lambda token, refresh=False: None
+        c = bot.db()
+        c.execute("INSERT INTO shop_staff(tg_id,role,added_ts) VALUES(?, 'support', 0)", (SUPPORT,))
+        c.commit(); c.close()
+        bot.handle_update(cb(ADMIN, "sa:plan_add")); bot.handle_update(msg(ADMIN, "۳۰ 30 150,000"))
+        bot.handle_update(cb(ADMIN, "sa:card_add")); bot.handle_update(msg(ADMIN, "6037-9912-3456-7890 فاطمه میرخلیلی"))
+        self.plan = self.row("SELECT * FROM shop_plans")
+        bot.handle_update(msg(ALICE, "/start"))
+        self.calls.clear()
+
+    def tearDown(self):
+        for k, v in self._fns.items(): setattr(bot, k, v)
+        super().tearDown()
+
+    def buy(self, uid=ALICE, token=None):
+        suffix = (":" + token) if token else ""
+        bot.handle_update(cb(uid, "c:plan:%d%s" % (self.plan["id"], suffix)))
+        bot.handle_update(cb(uid, "c:pay:%d%s" % (self.plan["id"], suffix)))
+        return self.row("SELECT * FROM shop_orders WHERE tg_id=? ORDER BY id DESC", (uid,))
+
+    def review_copies(self):
+        return [p for m, p in self.calls if m == "sendPhoto"]
+
+    def test_admin_inputs_parse_persian_digits_and_separators(self):
+        self.assertEqual((self.plan["gb"], self.plan["days"], self.plan["price"]), (30, 30, 150000))
+        card = self.row("SELECT * FROM shop_cards")
+        self.assertEqual((card["number"], card["holder"]), ("6037991234567890", "فاطمه میرخلیلی"))
+        bot.handle_update(cb(ADMIN, "sa:plan_add")); bot.handle_update(msg(ADMIN, "30 30"))
+        self.assertEqual(self.row("SELECT COUNT(*) n FROM shop_plans")["n"], 1)
+        self.assertEqual(shop.parse_amount("۱۵۰.۰۰۰ تومان"), 150000)
+        self.assertEqual(shop.toman(150000), "۱۵۰٬۰۰۰ تومان")
+
+    def test_buy_flow_creates_unique_amount_invoice(self):
+        bot.handle_update(msg(ALICE, shop.B_BUY))
+        self.assertEqual(self.last()["reply_markup"]["inline_keyboard"][0][0]["callback_data"], "c:plan:%d" % self.plan["id"])
+        o = self.buy()
+        self.assertEqual(o["status"], "awaiting")
+        self.assertTrue(150001 <= o["amount"] <= 150999)
+        self.assertIn("6037991234567890", self.last("editMessageText")["text"])
+        o2 = self.buy()      # a new invoice cancels the unpaid one
+        self.assertEqual(self.row("SELECT status FROM shop_orders WHERE id=?", (o["id"],))["status"], "cancelled")
+        self.assertEqual(o2["status"], "awaiting")
+
+    def test_hidden_plan_is_not_sold(self):
+        bot.handle_update(cb(ADMIN, "sa:plan_act:%d" % self.plan["id"]))
+        bot.handle_update(msg(ALICE, shop.B_BUY))
+        self.assertIn("پلنی", self.last()["text"])
+        bot.handle_update(cb(ALICE, "c:pay:%d" % self.plan["id"]))
+        self.assertIsNone(self.row("SELECT * FROM shop_orders"))
+
+    def test_no_active_card_tells_customer_and_owner(self):
+        bot.handle_update(cb(ADMIN, "sa:card_act:1"))
+        self.calls.clear()
+        self.assertIsNone(self.buy())
+        self.assertIn("موقتاً", self.last("editMessageText")["text"])
+        self.assertTrue(any("کارت فعالی" in t for t in self.texts(ADMIN)))
+
+    def test_receipt_goes_to_admin_and_support_then_support_approves(self):
+        o = self.buy()
+        bot.handle_update(photo(ALICE))
+        self.assertEqual(self.row("SELECT status FROM shop_orders")["status"], "review")
+        copies = self.review_copies()
+        self.assertEqual(sorted(p["chat_id"] for p in copies), [ADMIN, SUPPORT])
+        self.assertEqual(copies[0]["photo"], "big-r1")
+        bot.handle_update(cb(SUPPORT, "r:ok:%d" % o["id"]))
+        self.assertEqual(len(self.minted), 1)
+        self.assertEqual(self.minted[0][:2], (30, 30))
+        o = self.row("SELECT * FROM shop_orders")
+        self.assertEqual((o["status"], o["decided_by"], o["token"]), ("approved", SUPPORT, "tok0"))
+        self.assertEqual(self.row("SELECT tg_id,kind FROM shop_services WHERE token='tok0'")[:], (ALICE, "paid"))
+        self.assertTrue(any(bot.sub_url("tok0") in t for t in self.texts(ALICE)))
+        self.assertEqual(len([m for m, _ in self.calls if m == "editMessageCaption"]), 2)   # both copies updated
+        bot.handle_update(cb(ADMIN, "r:ok:%d" % o["id"]))                                   # late second click
+        self.assertEqual(len(self.minted), 1)
+        actions = [r["action"] for r in bot.db().execute("SELECT action FROM shop_admin_log WHERE action LIKE 'order%'")]
+        self.assertEqual(actions, ["order_approve"])
+
+    def test_duplicate_receipt_and_receipt_without_order(self):
+        bot.handle_update(photo(ALICE))
+        self.assertIn("سفارش پرداخت‌نشده", self.texts(ALICE)[-1])
+        self.buy(); bot.handle_update(photo(ALICE, "same"))
+        bot.handle_update(msg(BOB, "/start")); self.buy(BOB); bot.handle_update(photo(BOB, "same"))
+        self.assertIn("قبلاً ارسال شده", self.texts(BOB)[-1])
+        self.assertEqual(self.row("SELECT status FROM shop_orders WHERE tg_id=?", (BOB,))["status"], "awaiting")
+
+    def test_reject_with_preset_and_custom_reason(self):
+        o = self.buy(); bot.handle_update(photo(ALICE))
+        bot.handle_update(cb(ADMIN, "r:no:%d" % o["id"]))
+        kb = self.last("editMessageReplyMarkup")["reply_markup"]["inline_keyboard"]
+        self.assertEqual(kb[0][0]["callback_data"], "r:nor:%d:0" % o["id"])
+        bot.handle_update(cb(ADMIN, "r:nor:%d:2" % o["id"]))
+        self.assertEqual(self.row("SELECT status,note FROM shop_orders")[:], ("rejected", shop.REJECT_REASONS[2]))
+        self.assertIn(shop.REJECT_REASONS[2], self.texts(ALICE)[-1])
+        o = self.buy(); bot.handle_update(photo(ALICE, "r2"))
+        bot.handle_update(cb(SUPPORT, "r:nox:%d" % o["id"]))
+        bot.handle_update(msg(SUPPORT, "اسم صاحب حساب فرق دارد"))
+        self.assertEqual(self.row("SELECT note FROM shop_orders WHERE id=?", (o["id"],))["note"], "اسم صاحب حساب فرق دارد")
+        self.assertEqual(self.minted, [])
+
+    def test_fixed_paid_amount_blocks_short_payment(self):
+        o = self.buy(); bot.handle_update(photo(ALICE))
+        bot.handle_update(cb(ADMIN, "r:amt:%d" % o["id"])); bot.handle_update(msg(ADMIN, "۱۰۰٬۰۰۰"))
+        bot.handle_update(cb(ADMIN, "r:ok:%d" % o["id"]))
+        self.assertEqual(self.row("SELECT status FROM shop_orders")["status"], "review")
+        self.assertEqual(self.minted, [])
+        bot.handle_update(cb(ADMIN, "r:amt:%d" % o["id"])); bot.handle_update(msg(ADMIN, "200000"))
+        bot.handle_update(cb(ADMIN, "r:ok:%d" % o["id"]))
+        self.assertEqual(self.row("SELECT status,paid_amount FROM shop_orders")[:], ("approved", 200000))
+
+    def test_failed_delivery_returns_order_to_queue(self):
+        o = self.buy(); bot.handle_update(photo(ALICE))
+        bot.create_user = lambda *a, **k: None
+        bot.handle_update(cb(ADMIN, "r:ok:%d" % o["id"]))
+        self.assertEqual(self.row("SELECT status,decided_by FROM shop_orders")[:], ("review", None))
+        bot.handle_update(msg(ADMIN, shop.B_SHOP))
+        self.assertIn("(۱)", self.last()["reply_markup"]["inline_keyboard"][1][0]["text"])
+
+    def test_expiry_and_late_receipt(self):
+        o = self.buy()
+        shop.expire_orders(now=o["created_ts"] + 60)
+        self.assertEqual(self.row("SELECT status FROM shop_orders")["status"], "awaiting")
+        shop.expire_orders(now=o["created_ts"] + shop.ORDER_TTL + 1)
+        self.assertEqual(self.row("SELECT status FROM shop_orders")["status"], "expired")
+        self.assertIn("مهلت پرداخت", self.texts(ALICE)[-1])
+        shop.receive_receipt(ALICE, ALICE, "photo:x", "late", now=o["created_ts"] + 5 * 3600)
+        self.assertEqual(self.row("SELECT status FROM shop_orders")["status"], "review")
+        self.assertIn("دیرتر از مهلت", self.review_copies()[-1]["caption"])
+        o = self.buy()
+        shop.expire_orders(now=o["created_ts"] + shop.ORDER_TTL + 1)
+        shop.receive_receipt(ALICE, ALICE, "photo:y", "too-late", now=o["created_ts"] + shop.LATE_RECEIPT + 60)
+        self.assertEqual(self.row("SELECT status FROM shop_orders WHERE id=?", (o["id"],))["status"], "expired")
+
+    def test_cancel_order(self):
+        o = self.buy()
+        bot.handle_update(cb(BOB, "c:cancel:%d" % o["id"]))
+        self.assertEqual(self.row("SELECT status FROM shop_orders")["status"], "awaiting")
+        bot.handle_update(cb(ALICE, "c:cancel:%d" % o["id"]))
+        self.assertEqual(self.row("SELECT status FROM shop_orders")["status"], "cancelled")
+
+    def test_renewal_extends_same_link(self):
+        o = self.buy(); bot.handle_update(photo(ALICE)); bot.handle_update(cb(ADMIN, "r:ok:%d" % o["id"]))
+        before = self.row("SELECT limit_bytes,expiry_ts FROM users WHERE token='tok0'")
+        bot.handle_update(cb(ALICE, "c:renew:tok0"))
+        self.assertIn("تمدید", self.last()["text"])
+        o = self.buy(token="tok0")
+        self.assertEqual((o["kind"], o["token"]), ("renew", "tok0"))
+        bot.handle_update(photo(ALICE, "r2")); bot.handle_update(cb(ADMIN, "r:ok:%d" % o["id"]))
+        after = self.row("SELECT limit_bytes,expiry_ts FROM users WHERE token='tok0'")
+        self.assertEqual(len(self.minted), 1)                        # no new link
+        self.assertEqual(after["limit_bytes"] - before["limit_bytes"], 30 * bot.GB)
+        self.assertGreater(after["expiry_ts"], before["expiry_ts"])
+
+    def test_renewal_of_deleted_link_mints_new_one_and_others_cannot_renew(self):
+        o = self.buy(); bot.handle_update(photo(ALICE)); bot.handle_update(cb(ADMIN, "r:ok:%d" % o["id"]))
+        self.assertIsNone(self.buy(BOB, token="tok0"))               # not Bob's link
+        o = self.buy(token="tok0")
+        c = bot.db(); c.execute("DELETE FROM users WHERE token='tok0'"); c.commit(); c.close()
+        bot.handle_update(photo(ALICE, "r3")); bot.handle_update(cb(ADMIN, "r:ok:%d" % o["id"]))
+        self.assertEqual(self.row("SELECT token FROM shop_orders WHERE id=?", (o["id"],))["token"], "tok1")
+
+    def test_support_queue_lists_and_resends(self):
+        o = self.buy(); bot.handle_update(photo(ALICE)); self.calls.clear()
+        bot.handle_update(msg(SUPPORT, shop.B_RECEIPTS))
+        self.assertEqual(self.last()["reply_markup"]["inline_keyboard"][0][0]["callback_data"], "r:q:%d" % o["id"])
+        bot.handle_update(cb(SUPPORT, "r:q:%d" % o["id"]))
+        self.assertEqual(self.review_copies()[-1]["chat_id"], SUPPORT)
+
+    def test_customer_cannot_use_review_buttons(self):
+        o = self.buy(); bot.handle_update(photo(ALICE))
+        bot.handle_update(cb(ALICE, "r:ok:%d" % o["id"]))
+        self.assertEqual(self.row("SELECT status FROM shop_orders")["status"], "review")
 
 
 if __name__ == "__main__":
