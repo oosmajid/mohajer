@@ -1,4 +1,4 @@
-import os, sys, sqlite3, tempfile, unittest
+import os, sys, sqlite3, tempfile, time, unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bot"))
 os.environ.setdefault("DPBOT_ENV", "/nonexistent-dpbot-env")
 import bot  # noqa: E402
@@ -603,6 +603,126 @@ class ShopWalletTests(SalesCase):
         self.assertEqual(self.last()["text"], shop.BLOCKED_TEXT)
         actions = [r["action"] for r in bot.db().execute("SELECT action FROM shop_admin_log WHERE action IN ('wallet_adjust','block')")]
         self.assertEqual(actions, ["wallet_adjust", "block"])
+
+
+class ShopServicesTests(SalesCase):
+    def setUp(self):
+        super().setUp()
+        self._bg = shop.run_bg
+        shop.run_bg = lambda fn: fn()
+
+    def tearDown(self):
+        shop.run_bg = self._bg
+        super().tearDown()
+
+    def own(self, uid=ALICE):
+        """Give uid a paid link (via wallet) and return its token."""
+        bot.handle_update(cb(ADMIN, "sa:uwal:%d:add" % uid)); bot.handle_update(msg(ADMIN, "150000 هدیه"))
+        bot.handle_update(cb(uid, "c:wpay:%d" % self.plan["id"]))
+        return self.row("SELECT token FROM shop_services WHERE tg_id=? ORDER BY created_ts DESC", (uid,))["token"]
+
+    def set_link(self, token, **cols):
+        c = bot.db()
+        c.execute("UPDATE users SET %s WHERE token=?" % ",".join("%s=?" % k for k in cols), (*cols.values(), token))
+        c.execute("UPDATE shop_services SET warn_flags=0 WHERE token=?", (token,))
+        c.commit(); c.close()
+
+    def test_empty_services_offers_buy(self):
+        bot.handle_update(msg(ALICE, shop.B_SERVICES))
+        self.assertEqual(self.last()["reply_markup"]["inline_keyboard"][0][0]["callback_data"], "c:buy")
+
+    def test_service_list_and_detail(self):
+        tok = self.own()
+        self.set_link(tok, used_bytes=12 * bot.GB, expiry_ts=int(time.time()) + 10 * 86400 + 3600)
+        c = bot.db(); c.execute("INSERT INTO usage_daily(token,day,start_used,end_used) VALUES(?,?,?,?)",
+                                (tok, bot.day_key(), 10 * bot.GB, 12 * bot.GB)); c.commit(); c.close()
+        bot.handle_update(msg(ALICE, shop.B_SERVICES))
+        button = self.last()["reply_markup"]["inline_keyboard"][0][0]
+        self.assertEqual(button["callback_data"], "c:svc:%s" % tok)
+        self.assertIn("۱۲ گیگ/۳۰ گیگ", button["text"])
+        bot.handle_update(cb(ALICE, "c:svc:%s" % tok))
+        view = self.last("editMessageText")
+        self.assertIn("باقی‌مانده: <b>۱۸ گیگ</b>", view["text"])
+        self.assertIn("▰▰▰▰▱▱▱▱▱▱ ۴۰٪", view["text"])
+        self.assertIn("مصرف امروز: ۲ گیگ", view["text"])
+        self.assertIn("۱۰ روز", view["text"])
+        callbacks = [b.get("callback_data") for row in view["reply_markup"]["inline_keyboard"] for b in row]
+        self.assertIn("c:renew:%s" % tok, callbacks); self.assertIn("c:auto:%s" % tok, callbacks)
+        bot.handle_update(cb(ALICE, "c:auto:%s" % tok))            # toggle keeps the detail keyboard
+        kb = self.last("editMessageReplyMarkup")["reply_markup"]["inline_keyboard"]
+        self.assertIn("c:svcs", [b.get("callback_data") for row in kb for b in row])
+
+    def test_disabled_detail_explains_grace_and_others_see_nothing(self):
+        tok = self.own(); self.set_link(tok, disabled_ts=int(time.time()))
+        bot.handle_update(cb(ALICE, "c:svc:%s" % tok))
+        self.assertIn("غیرفعال شده", self.last("editMessageText")["text"])
+        bot.handle_update(msg(BOB, "/start")); bot.handle_update(cb(BOB, "c:svc:%s" % tok))
+        self.assertIn("وجود نداره", self.last("editMessageText")["text"])
+
+    def test_no_warning_right_after_purchase(self):
+        tok = self.own(); self.calls.clear()
+        shop.send_service_warnings()
+        self.assertEqual(self.texts(ALICE), [])
+
+    def test_warnings_once_each_most_urgent_first(self):
+        tok = self.own(); now = int(time.time())
+        self.set_link(tok, expiry_ts=now + int(2.5 * 86400), limit_bytes=100 * bot.GB, used_bytes=0)
+        self.calls.clear()
+        shop.send_service_warnings(now); shop.send_service_warnings(now)
+        self.assertEqual(len(self.texts(ALICE)), 1); self.assertIn("۳ روز", self.texts(ALICE)[0])
+        shop.send_service_warnings(now + 2 * 86400)
+        self.assertIn("۱ روز", self.texts(ALICE)[-1])
+        c = bot.db(); c.execute("UPDATE users SET used_bytes=? WHERE token=?", (85 * bot.GB, tok)); c.commit(); c.close()
+        shop.send_service_warnings(now + 2 * 86400)
+        self.assertIn("۸۰٪", self.texts(ALICE)[-1])
+        c = bot.db(); c.execute("UPDATE users SET disabled_ts=? WHERE token=?", (now, tok)); c.commit(); c.close()
+        shop.send_service_warnings(now + 2 * 86400); shop.send_service_warnings(now + 2 * 86400)
+        self.assertEqual(len(self.texts(ALICE)), 4); self.assertIn("تموم شد", self.texts(ALICE)[-1])
+        self.assertEqual(self.last()["reply_markup"]["inline_keyboard"][0][0]["callback_data"], "c:renew:%s" % tok)
+
+    def test_quiet_customers_and_auto_renew_still_get_ended(self):
+        tok = self.own(); now = int(time.time())
+        bot.handle_update(cb(ALICE, "c:notify"))
+        self.assertEqual(shop.get_customer(ALICE)["notify"], 0)
+        self.set_link(tok, expiry_ts=now + 3600)
+        self.calls.clear(); shop.send_service_warnings(now)
+        self.assertEqual(self.texts(ALICE), [])
+        self.set_link(tok, disabled_ts=now); shop.send_service_warnings(now)
+        self.assertEqual(len(self.texts(ALICE)), 1)
+
+    def test_test_links_are_left_to_the_follow_up(self):
+        bot.handle_update(cb(ALICE, "c:test"))
+        tok = self.row("SELECT token FROM shop_services WHERE kind='test'")["token"]
+        self.set_link(tok, disabled_ts=int(time.time())); self.calls.clear()
+        shop.send_service_warnings()
+        self.assertEqual(self.texts(ALICE), [])
+
+    def test_renewal_starts_a_new_warning_period(self):
+        tok = self.own(); now = int(time.time())
+        self.set_link(tok, expiry_ts=now + 3600); shop.send_service_warnings(now)
+        self.assertNotEqual(self.row("SELECT warn_flags f FROM shop_services")["f"], 0)
+        bot.handle_update(cb(ADMIN, "sa:uwal:%d:add" % ALICE)); bot.handle_update(msg(ADMIN, "150000 هدیه"))
+        bot.handle_update(cb(ALICE, "c:wpay:%d:%s" % (self.plan["id"], tok)))
+        self.assertEqual(self.row("SELECT warn_flags f FROM shop_services")["f"], 0)   # 31 days left now
+
+    def test_outage_broadcast_and_resolved_go_to_same_people(self):
+        self.own(ALICE)
+        bot.handle_update(msg(BOB, "/start"))                     # no service: not told
+        bot.handle_update(cb(ADMIN, "sa:outage"))
+        bot.handle_update(msg(ADMIN, "همراه اول کند است"))
+        self.assertIn("پیش‌نمایش", self.last()["text"])
+        self.calls.clear()
+        bot.handle_update(cb(ADMIN, "sa:outage_send"))
+        self.assertIn("همراه اول کند است", self.texts(ALICE)[-1])
+        self.assertEqual(self.texts(BOB), [])
+        self.assertIn("۱ نفر", self.texts(ADMIN)[0])
+        bot.handle_update(cb(ADMIN, "sa:outage_send"))           # double tap does not resend
+        self.assertEqual(len(self.texts(ALICE)), 1)
+        bot.handle_update(cb(ADMIN, "sa:outage")); bot.handle_update(cb(ADMIN, "sa:outage_end"))
+        self.assertIn("برطرف شد", self.texts(ALICE)[-1])
+        self.assertFalse(shop.setting("outage"))
+        actions = [r["action"] for r in bot.db().execute("SELECT action FROM shop_admin_log WHERE action LIKE 'outage%'")]
+        self.assertEqual(actions, ["outage_start", "outage_end"])
 
 
 if __name__ == "__main__":

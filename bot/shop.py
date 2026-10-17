@@ -28,7 +28,8 @@ def init_db():
         referrer_id INTEGER, blocked INTEGER NOT NULL DEFAULT 0,
         state TEXT)""")                       # state = JSON of the customer's current input step
     _add_cols(c, "shop_customers", [("test_used_ts", "INTEGER NOT NULL DEFAULT 0"),
-                                    ("wallet", "INTEGER NOT NULL DEFAULT 0")])   # toman; only wallet_apply() changes it
+                                    ("wallet", "INTEGER NOT NULL DEFAULT 0"),    # toman; only wallet_apply() changes it
+                                    ("notify", "INTEGER NOT NULL DEFAULT 1")])   # customer wants usage/expiry warnings
     # Wallet ledger: every balance change, with the balance after it. (kind, ref) is unique so
     # a retried credit for the same order can never be applied twice.
     c.execute("""CREATE TABLE IF NOT EXISTS shop_wallet_tx(
@@ -59,7 +60,8 @@ def init_db():
     _add_cols(c, "shop_orders", [("pay_method", "TEXT NOT NULL DEFAULT 'card'")])   # card | wallet
     _add_cols(c, "shop_services", [("plan_id", "INTEGER"),                          # plan used for auto-renew
                                    ("auto_renew", "INTEGER NOT NULL DEFAULT 0"),
-                                   ("auto_note_ts", "INTEGER NOT NULL DEFAULT 0")])  # last "not enough balance" note
+                                   ("auto_note_ts", "INTEGER NOT NULL DEFAULT 0"),  # last "not enough balance" note
+                                   ("warn_flags", "INTEGER NOT NULL DEFAULT 0")])   # WARN_* already sent this period
     c.execute("CREATE INDEX IF NOT EXISTS shop_orders_status ON shop_orders(status)")
     c.execute("CREATE INDEX IF NOT EXISTS shop_orders_owner ON shop_orders(tg_id)")
     c.execute("""CREATE TABLE IF NOT EXISTS shop_staff(
@@ -126,6 +128,22 @@ def parse_amount(text):
     try: n = int(digits)
     except ValueError: return None
     return n if n > 0 else None
+
+def fa_bytes(b):
+    b = max(0, int(b or 0))
+    if b >= core.GB: return fa("%.1f گیگ" % (b / core.GB)).replace(".۰ ", " ")
+    return fa("%d مگ" % (b // (1024 * 1024)))
+
+def fa_left(ts, now=None):
+    if not ts: return "نامحدود"
+    left = ts - (int(time.time()) if now is None else now)
+    if left <= 0: return "تمام شده"
+    d, h = left // 86400, (left % 86400) // 3600
+    return fa("%d روز و %d ساعت" % (d, h) if d else ("%d ساعت" % h if h else "%d دقیقه" % max(1, left // 60)))
+
+def bar(frac, width=10):
+    n = max(0, min(width, int(round(frac * width))))
+    return "▰" * n + "▱" * (width - n)
 
 def plan_title(gb, days):
     return "%s · %s" % ("حجم نامحدود" if not gb else fa("%g گیگ" % gb),
@@ -630,8 +648,9 @@ def fulfill(o):
         try: core.refresh_usage(token)
         except Exception as e: print("shop refresh err", e, flush=True)
         core.maybe_reenable(token)
-        c = core.db(); c.execute("UPDATE shop_services SET kind='paid',plan_id=COALESCE(?,plan_id),auto_note_ts=0 WHERE token=?",
+        c = core.db(); c.execute("UPDATE shop_services SET kind='paid',plan_id=COALESCE(?,plan_id),auto_note_ts=0,warn_flags=0 WHERE token=?",
                                  (o["plan_id"], token)); c.commit(); c.close()
+        reset_warnings(token)
         return token
     # a buy - or a renewal whose link was already deleted after its grace period: mint a new one
     cust = get_customer(o["tg_id"])
@@ -642,7 +661,17 @@ def fulfill(o):
         c.execute("INSERT INTO shop_services(token,tg_id,kind,created_ts,plan_id) VALUES(?,?,'paid',?,?)",
                   (token, o["tg_id"], int(time.time()), o["plan_id"]))
         c.execute("UPDATE shop_orders SET token=? WHERE id=?", (token, o["id"])); c.commit(); c.close()
+        reset_warnings(token)
     return token
+
+def reset_warnings(token):
+    """New period after a buy/renewal: warnings that already apply (a 1-day plan is '<1 day left'
+    from the start) count as seen, so the customer is not warned right after paying."""
+    c = core.db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone()
+    if u:
+        c.execute("UPDATE shop_services SET warn_flags=? WHERE token=?", (due_warnings(u, int(time.time())) & ~WARN_ENDED, token))
+        c.commit()
+    c.close()
 
 def approve(oid, uid):
     """review -> approved exactly once, then deliver. Returns 'ok' | 'done' | 'short' | 'failed'."""
@@ -677,7 +706,7 @@ def deliver_message(o, token, head, extra=0):
     body = "سرویست تمدید شد ✅" if o["kind"] == "renew" else "سرویس جدیدت فعال شد ✅"
     text = "%s\n%s\n📦 %s\n\n🔗 <code>%s</code>" % (head, body, plan_title(o["gb"], o["days"]), core.sub_url(token))
     if extra > 0: text += "\n\n💰 %s اضافه واریز کرده بودی؛ به کیف پولت برگشت." % toman(extra)
-    core.send(o["tg_id"], text, link_kb(token, auto_kb(token)))
+    core.send(o["tg_id"], text, service_kb(token))
 
 def auto_kb(token):
     c = core.db(); r = c.execute("SELECT auto_renew FROM shop_services WHERE token=?", (token,)).fetchone(); c.close()
@@ -818,6 +847,100 @@ def expire_orders(now=None):
         core.send(r["tg_id"], "⌛️ مهلت پرداخت سفارش #%s تموم شد.\nاگه واریز کردی، تا ۲۴ ساعت هنوز می‌تونی عکس رسید رو بفرستی؛ "
                   "وگرنه دوباره از «🛒 خرید سرویس» سفارش بده." % fa(r["id"]))
 
+# --- my services ---
+def my_services(uid):
+    c = core.db()
+    rows = c.execute("SELECT u.*, s.kind, s.auto_renew FROM shop_services s JOIN users u ON u.token=s.token "
+                     "WHERE s.tg_id=? AND u.pending_delete=0 ORDER BY u.created_ts DESC", (uid,)).fetchall()
+    c.close(); return rows
+
+def services_view(uid):
+    rows = my_services(uid)
+    if not rows:
+        return ("📦 هنوز سرویسی نداری.\nمی‌تونی اول تست رایگان بگیری یا مستقیم یه سرویس بخری 👇",
+                [[{"text": "🛒 خرید سرویس", "callback_data": "c:buy"}]])
+    kb = [[{"text": "%s %s · %s/%s · %s" % ("⏸" if u["disabled_ts"] else "🟢", u["label"], fa_bytes(core.current_usage(u)),
+                                            fa_bytes(u["limit_bytes"]) if u["limit_bytes"] else "∞", fa_left(u["expiry_ts"])),
+            "callback_data": "c:svc:%s" % u["token"]}] for u in rows]
+    return "📦 <b>سرویس‌های من</b>\nروی هر سرویس بزن تا جزئیات و لینک اتصالش رو ببینی:", kb
+
+def today_usage(token):
+    c = core.db()
+    r = c.execute("SELECT max(end_used-start_used,0) FROM usage_daily WHERE token=? AND day=?", (token, core.day_key())).fetchone()
+    c.close(); return (r[0] or 0) if r else 0
+
+def service_kb(token):
+    c = core.db(); r = c.execute("SELECT kind FROM shop_services WHERE token=?", (token,)).fetchone(); c.close()
+    rows = [[{"text": "📲 باز کردن صفحهٔ اتصال", "url": core.sub_url(token)}],
+            [{"text": "🔄 بروزرسانی وضعیت", "callback_data": "c:svc:%s" % token},
+             {"text": "➕ تمدید", "callback_data": "c:renew:%s" % token}]]
+    if r and r["kind"] == "paid": rows += auto_kb(token)
+    return rows + [[{"text": "📚 آموزش اتصال", "callback_data": "c:guide"}, {"text": "بازگشت", "callback_data": "c:svcs"}]]
+
+def service_view(uid, token, now=None):
+    now = int(time.time()) if now is None else now
+    u = owned_service(uid, token)
+    if not u: return "این سرویس دیگه وجود نداره.", [[{"text": "بازگشت", "callback_data": "c:svcs"}]]
+    used, limit = core.current_usage(u), u["limit_bytes"]
+    lines = ["%s <b>%s</b>" % ("⏸" if u["disabled_ts"] else "🟢", html.escape(u["label"])), ""]
+    if u["disabled_ts"]:
+        left_h = max(0, (u["disabled_ts"] + core.GRACE_SECONDS - now) // 3600)
+        lines += ["⚠️ <b>غیرفعال شده</b>؛ تا %s ساعت دیگه با تمدید، همین لینک دوباره فعال می‌شه." % fa(left_h), ""]
+    if limit:
+        lines += ["📊 مصرف: %s از %s" % (fa_bytes(used), fa_bytes(limit)),
+                  "%s %s٪" % (bar(used / limit), fa(min(100, int(used * 100 / limit)))),
+                  "📦 باقی‌مانده: <b>%s</b>" % fa_bytes(limit - used)]
+    else:
+        lines.append("📊 مصرف: %s (حجم نامحدود)" % fa_bytes(used))
+    lines += ["📅 مصرف امروز: %s" % fa_bytes(today_usage(token)),
+              "⏳ زمان باقی‌مانده: <b>%s</b>" % fa_left(u["expiry_ts"], now) +
+              (" (تا %s)" % fa_date(u["expiry_ts"]) if u["expiry_ts"] else ""),
+              "", "🔗 <code>%s</code>" % core.sub_url(token)]
+    return "\n".join(lines), service_kb(token)
+
+# --- usage / expiry warnings ---
+WARN_USED80, WARN_DAYS3, WARN_DAYS1, WARN_ENDED = 1, 2, 4, 8
+
+def due_warnings(u, now):
+    """Bits that apply now, most urgent first; earlier stages are implied (no 3-day after a 1-day)."""
+    if u["disabled_ts"]: return WARN_ENDED | WARN_DAYS1 | WARN_DAYS3 | WARN_USED80
+    bits = 0
+    if u["expiry_ts"]:
+        left = u["expiry_ts"] - now
+        if left <= 86400: bits |= WARN_DAYS1 | WARN_DAYS3
+        elif left <= 3 * 86400: bits |= WARN_DAYS3
+    if u["limit_bytes"] and core.current_usage(u) >= 0.8 * u["limit_bytes"]: bits |= WARN_USED80
+    return bits
+
+def send_service_warnings(now=None):
+    """80% data, 3 days and 1 day left, and 'ended' - each at most once per renewal period.
+    Test links have their own follow-up; auto-renewing links skip the early warnings."""
+    now = int(time.time()) if now is None else now
+    c = core.db()
+    rows = c.execute("SELECT s.token, s.tg_id, s.warn_flags, s.auto_renew, c.notify, u.label, u.disabled_ts, u.expiry_ts, "
+                     "u.limit_bytes, u.used_bytes, u.usage_reset_bytes FROM shop_services s JOIN users u ON u.token=s.token "
+                     "JOIN shop_customers c ON c.tg_id=s.tg_id WHERE s.kind='paid' AND u.pending_delete=0 AND u.frozen=0 "
+                     "AND c.blocked=0").fetchall()
+    c.close()
+    for r in rows:
+        new = due_warnings(r, now) & ~r["warn_flags"]
+        if not new: continue
+        c = core.db(); c.execute("UPDATE shop_services SET warn_flags=warn_flags|? WHERE token=?", (new, r["token"])); c.commit(); c.close()
+        label = html.escape(r["label"])
+        if new & WARN_ENDED:
+            text = "⏸ سرویس «%s» تموم شد و غیرفعال شد.\nتا %s ساعت دیگه با تمدید، همین لینک دوباره فعال می‌شه." % (
+                label, fa(core.GRACE_SECONDS // 3600))
+        elif r["auto_renew"] or not r["notify"]:
+            continue
+        elif new & WARN_DAYS1:
+            text = "⏳ فقط کمتر از ۱ روز از سرویس «%s» مونده." % label
+        elif new & WARN_DAYS3:
+            text = "⏳ کمتر از ۳ روز از سرویس «%s» مونده." % label
+        else:
+            text = "📊 ۸۰٪ حجم سرویس «%s» مصرف شده." % label
+        core.send(r["tg_id"], text, [[{"text": "➕ تمدید", "callback_data": "c:renew:%s" % r["token"]},
+                                      {"text": "📦 جزئیات", "callback_data": "c:svc:%s" % r["token"]}]])
+
 # --- auto-renew from the wallet ---
 AUTO_BEFORE, AUTO_USED = 3600, 0.98   # renew when <1h is left, 98% of the data is used, or the link was disabled
 AUTO_NOTE_EVERY = 24 * 3600           # remind about a low balance at most once a day
@@ -865,6 +988,10 @@ def account_text(uid):
             % (html.escape(cust["first_name"] or "-"), uid, fa_date(cust["joined_ts"]), toman(cust["wallet"]), fa(paid),
                ("گرفته‌شده" if cust["test_used_ts"] else "هنوز نگرفتی")))
 
+def account_kb(uid):
+    on = get_customer(uid)["notify"]
+    return [[{"text": "🔔 اعلان‌های حجم و زمان: %s" % ("روشن ✅" if on else "خاموش"), "callback_data": "c:notify"}]]
+
 # --- connection guide ---
 GUIDE_APPS = [   # same Happ builds the subscriber page links to (subserver.HAPP_APPS)
     ("android", "📱 اندروید", "https://github.com/Happ-proxy/happ-android/releases/latest/download/Happ.apk"),
@@ -910,8 +1037,9 @@ def customer_message(chat, uid, m):
         set_state(uid, None)
         if text == B_BUY: send_plans(chat, uid); return
         if text == B_WALLET: core.send(chat, *wallet_view(uid)); return
+        if text == B_SERVICES: core.send(chat, *services_view(uid)); return
         if text == B_TEST: test_offer(chat, uid); return
-        if text == B_ACCOUNT: core.send(chat, account_text(uid)); return
+        if text == B_ACCOUNT: core.send(chat, account_text(uid), account_kb(uid)); return
         if text == B_GUIDE: core.send(chat, GUIDE_TEXT, guide_kb()); return
         say(chat, SOON_TEXT); return
     st = get_state(uid) or {}
@@ -967,6 +1095,17 @@ def customer_callback(chat, mid, uid, data, cbid, user=None):
         core.answer(cbid); lines = tx_lines(uid, 30)
         core.edit(chat, mid, "📜 <b>تراکنش‌ها</b> (آخرین ۳۰ مورد)\n\n" + ("\n".join(lines) or "هنوز تراکنشی نداری."),
                   [[{"text": "بازگشت", "callback_data": "c:wallet"}]]); return
+    if data == "c:svcs":
+        core.answer(cbid); core.edit(chat, mid, *services_view(uid)); return
+    if parts[:2] == ["c", "svc"] and len(parts) == 3:
+        core.answer(cbid, "بروز شد")
+        try: core.refresh_usage(parts[2]) if owned_service(uid, parts[2]) else None
+        except Exception as e: print("shop refresh err", e, flush=True)
+        core.edit(chat, mid, *service_view(uid, parts[2])); return
+    if data == "c:notify":
+        c = core.db(); c.execute("UPDATE shop_customers SET notify=1-notify WHERE tg_id=?", (uid,)); c.commit(); c.close()
+        core.answer(cbid, "اعلان‌ها روشن شد" if get_customer(uid)["notify"] else "اعلان‌ها خاموش شد")
+        core.edit(chat, mid, account_text(uid), account_kb(uid)); return
     if parts[:2] == ["c", "auto"] and len(parts) == 3:
         if not owned_service(uid, parts[2]): core.answer(cbid, "این سرویس پیدا نشد"); return
         c = core.db()
@@ -974,7 +1113,7 @@ def customer_callback(chat, mid, uid, data, cbid, user=None):
         c.commit(); on = c.execute("SELECT auto_renew FROM shop_services WHERE token=?", (parts[2],)).fetchone()[0]; c.close()
         core.answer(cbid, "تمدید خودکار روشن شد؛ موقع تموم شدن، از کیف پولت تمدید می‌شه" if on else "تمدید خودکار خاموش شد")
         core.tg("editMessageReplyMarkup", chat_id=chat, message_id=mid,
-                reply_markup={"inline_keyboard": link_kb(parts[2], auto_kb(parts[2]))}); return
+                reply_markup={"inline_keyboard": service_kb(parts[2])}); return
     if data == "c:report":
         core.answer(cbid, SOON_TEXT); return
     core.answer(cbid)
@@ -1042,6 +1181,7 @@ def shop_admin_kb():
               "callback_data": "sa:queue"}],
             [{"text": "📦 پلن‌ها", "callback_data": "sa:plans"}, {"text": "💳 کارت‌ها", "callback_data": "sa:cards"}],
             [{"text": "👤 کاربران", "callback_data": "sa:users"}, {"text": "🎁 تست رایگان", "callback_data": "sa:test"}],
+            [{"text": "✅ اعلام رفع اختلال" if setting("outage") else "📢 اعلان اختلال", "callback_data": "sa:outage"}],
             [{"text": "🎧 پشتیبان‌ها", "callback_data": "sa:staff"}, {"text": "📜 لاگ کارها", "callback_data": "sa:log"}],
             [{"text": "💾 بکاپ الان", "callback_data": "sa:backup"},
              {"text": ("⏹ قطع بکاپ روزانه" if flag("backup_auto") else "🔁 بکاپ روزانه"), "callback_data": "sa:backup_auto"}],
@@ -1136,6 +1276,38 @@ def user_card(tid):
           [{"text": "🔎 کاربر دیگر", "callback_data": "sa:users"}, {"text": "بازگشت", "callback_data": "sa:menu"}]]
     return text, kb
 
+def run_bg(fn):
+    """Broadcasts run off the update loop so the bot keeps answering (tests replace this)."""
+    threading.Thread(target=fn, daemon=True).start()
+
+def active_customers():
+    c = core.db()
+    ids = [r[0] for r in c.execute("SELECT DISTINCT s.tg_id FROM shop_services s JOIN users u ON u.token=s.token "
+                                   "JOIN shop_customers c ON c.tg_id=s.tg_id WHERE s.kind='paid' AND u.pending_delete=0 "
+                                   "AND u.disabled_ts=0 AND c.blocked=0")]
+    c.close(); return ids
+
+def broadcast(ids, text, kb=None, pause=0.05):
+    sent = 0
+    for i in ids:
+        if (core.send(i, text, kb) or {}).get("ok"): sent += 1
+        if pause: time.sleep(pause)   # stay under Telegram's ~30 msg/s
+    return sent
+
+def start_outage(uid, chat, text):
+    ids = active_customers()
+    set_setting("outage", json.dumps({"ids": ids, "ts": int(time.time())})); log(uid, "outage_start", len(ids), text[:100])
+    msg = "⚠️ <b>اطلاعیهٔ اختلال</b>\n\n%s\n\nداریم روش کار می‌کنیم؛ به محض رفع، همین‌جا خبرت می‌کنیم 🙏" % html.escape(text)
+    run_bg(lambda: core.send(chat, "📢 اعلان اختلال برای %s نفر فرستاده شد." % fa(broadcast(ids, msg))))
+
+def end_outage(uid, chat):
+    rec = json.loads(setting("outage") or "{}")
+    set_setting("outage", ""); log(uid, "outage_end", len(rec.get("ids", [])))
+    ids = rec.get("ids", [])
+    run_bg(lambda: core.send(chat, "✅ پیام رفع اختلال برای %s نفر فرستاده شد." % fa(broadcast(
+        ids, "✅ <b>اختلال برطرف شد</b>\nاگه هنوز وصل نمی‌شی، توی برنامه اشتراک رو آپدیت کن 🙏",
+        [[{"text": "📚 آموزش اتصال", "callback_data": "c:guide"}]]))))
+
 USERS_PROMPT = "👤 <b>کاربران</b>\nآیدی عددی یا @یوزرنیم مشتری را بفرست، یا یک پیام از او را فوروارد کن:"
 
 def log_text(limit=15):
@@ -1166,6 +1338,25 @@ def admin_callback(chat, mid, uid, data, cbid):
         core.pending[chat] = {"stage": "sa_card_add"}; core.answer(cbid)
         core.edit(chat, mid, "➕ <b>کارت جدید</b>\nشمارهٔ ۱۶ رقمی و نام صاحب کارت را بفرست:\n<code>6037991234567890 فاطمه میرخلیلی</code>",
                   [[{"text": "انصراف", "callback_data": "sa:cards"}]]); return
+    if data == "sa:outage":
+        core.answer(cbid)
+        if setting("outage"):
+            core.edit(chat, mid, "✅ پیام «اختلال برطرف شد» برای همان مشتری‌هایی که اعلان گرفتند فرستاده شود؟",
+                      [[{"text": "✅ بله، بفرست", "callback_data": "sa:outage_end"}], [{"text": "بازگشت", "callback_data": "sa:menu"}]])
+        else:
+            core.pending[chat] = {"stage": "sa_outage"}
+            core.edit(chat, mid, "📢 متن اعلان اختلال را بنویس (مثلاً «اینترنت همراه اول از ساعت ۱۸ کند شده»).\n"
+                      "برای %s مشتری فعال فرستاده می‌شود." % fa(len(active_customers())),
+                      [[{"text": "انصراف", "callback_data": "sa:menu"}]])
+        return
+    if data == "sa:outage_send":
+        draft = setting("outage_draft")
+        if not draft or setting("outage"): core.answer(cbid, "پیش‌نویسی نیست"); return
+        set_setting("outage_draft", ""); start_outage(uid, chat, draft)
+        core.answer(cbid, "در حال ارسال…"); core.edit(chat, mid, shop_admin_text(), shop_admin_kb()); return
+    if data == "sa:outage_end":
+        if not setting("outage"): core.answer(cbid); return
+        end_outage(uid, chat); core.answer(cbid, "در حال ارسال…"); core.edit(chat, mid, shop_admin_text(), shop_admin_kb()); return
     if data == "sa:users":
         core.pending[chat] = {"stage": "sa_user_find"}; core.answer(cbid)
         core.edit(chat, mid, USERS_PROMPT, [[{"text": "بازگشت", "callback_data": "sa:menu"}]]); return
@@ -1265,6 +1456,13 @@ def admin_message(chat, uid, m):
         return True
     if review_text(chat, uid, text): return True
     st = core.pending.get(chat)
+    if st and st.get("stage") == "sa_outage":
+        if not text: core.send(chat, "متن اعلان را بنویس:"); return True
+        core.pending.pop(chat, None); set_setting("outage_draft", text[:1000])
+        core.send(chat, "پیش‌نمایش:\n\n⚠️ <b>اطلاعیهٔ اختلال</b>\n\n%s\n\nبرای %s مشتری فعال بفرستم؟"
+                  % (html.escape(text[:1000]), fa(len(active_customers()))),
+                  [[{"text": "📢 ارسال", "callback_data": "sa:outage_send"}], [{"text": "انصراف", "callback_data": "sa:menu"}]])
+        return True
     if st and st.get("stage") == "sa_user_find":
         cust = find_customer(m, text)
         if not cust:
@@ -1363,6 +1561,7 @@ def tick():
     send_test_followups()
     expire_orders()
     run_auto_renewals()
+    send_service_warnings()
 
 def ticker():
     while True:
