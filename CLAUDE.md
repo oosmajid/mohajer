@@ -291,7 +291,8 @@ usage_ledger(email, token, last_raw, total_bytes)
 meta(k TEXT PRIMARY KEY, v TEXT)   -- includes clean_ips, config_recipe,
                                    -- endpoint_settings, relay_ingresses, outbounds, xray_pid,
                                    -- membership_sync_pending, outbound_sync_pending
-shop_customers(tg_id, first_name, username, joined_ts, last_seen, referrer_id, blocked, state)
+shop_customers(tg_id, first_name, username, joined_ts, last_seen, referrer_id, blocked, state, test_used_ts)
+shop_services(token, tg_id, kind, created_ts, followup_sent, feedback) -- customer <-> users.token; kind test|paid
 shop_staff(tg_id, role, added_ts, added_by)          -- role 'support'; owners = ADMIN_IDS
 shop_admin_log(id, ts, actor, action, target, detail) -- audit trail of admin/support actions
 ```

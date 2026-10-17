@@ -18,7 +18,7 @@ def cb(uid, data, mid=5):
                                "message": {"message_id": mid, "chat": {"id": uid, "type": "private"}}}}
 
 
-class ShopFoundationTests(unittest.TestCase):
+class ShopCase(unittest.TestCase):
     def setUp(self):
         fd, self.path = tempfile.mkstemp(suffix=".db"); os.close(fd)
         self._db, self._tg, self._admins = bot.DB_PATH, bot.tg, set(bot.ADMIN_IDS)
@@ -46,6 +46,9 @@ class ShopFoundationTests(unittest.TestCase):
     def row(self, sql, args=()):
         c = bot.db(); r = c.execute(sql, args).fetchone(); c.close(); return r
 
+
+
+class ShopFoundationTests(ShopCase):
     def test_init_db_is_idempotent(self):
         bot.init_db(); bot.init_db()
         for table in ("shop_customers", "shop_staff", "shop_admin_log"):
@@ -167,6 +170,111 @@ class ShopFoundationTests(unittest.TestCase):
         self.assertTrue(shop.backup_due(morning))
         shop.set_setting("backup_day", bot.day_key(morning))
         self.assertFalse(shop.backup_due(morning + 3600))
+
+
+class ShopFreeTestTests(ShopCase):
+    def setUp(self):
+        super().setUp()
+        self.minted = []
+        self._create = bot.create_user
+        bot.create_user = self.fake_create
+        bot.handle_update(msg(ALICE, "/start"))
+
+    def tearDown(self):
+        bot.create_user = self._create
+        super().tearDown()
+
+    def fake_create(self, vol_gb, dur_days, label=None):
+        token = "tok%d" % len(self.minted)
+        self.minted.append((vol_gb, dur_days, label))
+        c = bot.db()
+        c.execute("INSERT INTO users(token,uuid,email,label,limit_bytes,expiry_ts,created_ts,used_bytes) "
+                  "VALUES(?,?,?,?,?,?,?,0)", (token, "u", "u_" + token, label, int(vol_gb * bot.GB),
+                                              int(1e9 + dur_days * 86400), int(1e9)))
+        c.commit(); c.close()
+        return token
+
+    def test_free_test_is_given_once(self):
+        bot.handle_update(msg(ALICE, shop.B_TEST))
+        self.assertEqual(self.last()["reply_markup"]["inline_keyboard"][0][0]["callback_data"], "c:test")
+        bot.handle_update(cb(ALICE, "c:test"))
+        bot.handle_update(cb(ALICE, "c:test"))   # double tap
+        self.assertEqual(len(self.minted), 1)
+        vol_gb, days, label = self.minted[0]
+        self.assertAlmostEqual(vol_gb * 1024, 500); self.assertEqual(days, 1); self.assertIn("U100", label)
+        self.assertEqual(self.row("SELECT tg_id FROM shop_services WHERE token='tok0'")["tg_id"], ALICE)
+        edits = [p for m, p in self.calls if m == "editMessageText"]
+        self.assertIn(bot.sub_url("tok0"), edits[0]["text"])
+        self.assertEqual(edits[0]["reply_markup"]["inline_keyboard"][0][0]["url"], bot.sub_url("tok0"))
+        bot.handle_update(msg(ALICE, shop.B_TEST))
+        self.assertIn("قبلاً", self.last()["text"])
+
+    def test_failed_mint_gives_the_test_back(self):
+        bot.create_user = lambda *a, **k: None
+        bot.handle_update(cb(ALICE, "c:test"))
+        self.assertEqual(self.row("SELECT test_used_ts t FROM shop_customers WHERE tg_id=?", (ALICE,))["t"], 0)
+        self.assertIsNone(self.row("SELECT * FROM shop_services"))
+
+    def test_disabled_test_and_admin_settings(self):
+        bot.handle_update(cb(ADMIN, "sa:test_toggle"))
+        bot.handle_update(cb(ALICE, "c:test"))
+        self.assertEqual(self.minted, [])
+        bot.handle_update(cb(ADMIN, "sa:test_toggle"))
+        bot.handle_update(cb(ADMIN, "sa:test_mb:1024"))
+        bot.handle_update(cb(ADMIN, "sa:test_hours:48"))
+        bot.handle_update(cb(ADMIN, "sa:test_mb:999"))        # not an offered choice
+        self.assertEqual((shop.test_mb(), shop.test_hours()), (1024, 48))
+        bot.handle_update(cb(ALICE, "c:test"))
+        self.assertAlmostEqual(self.minted[0][0], 1.0); self.assertEqual(self.minted[0][1], 2)
+        actions = [r["action"] for r in bot.db().execute("SELECT action FROM shop_admin_log ORDER BY id")]
+        self.assertEqual(actions, ["test_off", "test_on", "test_mb", "test_hours"])
+
+    def test_followup_once_near_end_and_feedback(self):
+        bot.handle_update(cb(ALICE, "c:test"))
+        expiry = self.row("SELECT expiry_ts e FROM users WHERE token='tok0'")["e"]
+        self.calls.clear()
+        shop.send_test_followups(now=expiry - 10 * 3600)       # plenty of time left
+        self.assertEqual(self.calls, [])
+        shop.send_test_followups(now=expiry - 3600)
+        shop.send_test_followups(now=expiry - 60)
+        self.assertEqual(len(self.texts(ALICE)), 1)
+        bot.handle_update(cb(ALICE, "c:fb:bad:tok0"))
+        bot.handle_update(cb(ALICE, "c:fb:bad:tok0"))
+        self.assertEqual(self.row("SELECT feedback f FROM shop_services")["f"], "bad")
+        self.assertEqual(len(self.texts(ADMIN)), 1)            # owner told once
+        bot.handle_update(cb(BOB, "c:fb:good:tok0"))           # someone else's link
+        self.assertEqual(self.row("SELECT feedback f FROM shop_services")["f"], "bad")
+
+    def test_followup_on_data_use_and_skips_deleted_links(self):
+        bot.handle_update(cb(ALICE, "c:test"))
+        c = bot.db(); c.execute("UPDATE users SET used_bytes=limit_bytes*0.9 WHERE token='tok0'"); c.commit(); c.close()
+        self.calls.clear(); shop.send_test_followups(now=int(1e9))
+        self.assertEqual(len(self.texts(ALICE)), 1)
+        c = bot.db(); c.execute("INSERT INTO shop_services(token,tg_id,kind,created_ts) VALUES('gone',?,'test',0)", (BOB,))
+        c.commit(); c.close()
+        self.calls.clear(); shop.send_test_followups(now=int(1e9))
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.row("SELECT followup_sent f FROM shop_services WHERE token='gone'")["f"], 1)
+
+    def test_account_page(self):
+        bot.handle_update(msg(ALICE, shop.B_ACCOUNT))
+        text = self.last()["text"]
+        self.assertIn(str(ALICE), text); self.assertIn("هنوز نگرفتی", text)
+
+    def test_guide_flow(self):
+        bot.handle_update(msg(ALICE, shop.B_GUIDE))
+        keys = [b["callback_data"] for row in self.last()["reply_markup"]["inline_keyboard"] for b in row]
+        self.assertEqual(keys, ["c:guide:android", "c:guide:ios", "c:guide:windows", "c:guide:mac"])
+        bot.handle_update(cb(ALICE, "c:guide:ios"))
+        edit = self.last("editMessageText")
+        self.assertIn("apps.apple.com", edit["reply_markup"]["inline_keyboard"][0][0]["url"])
+        bot.handle_update(cb(ALICE, "c:guides"))
+        self.assertEqual(self.last("editMessageText")["text"], shop.GUIDE_TEXT)
+
+    def test_jalali_dates(self):
+        self.assertEqual(shop.jalali(1792195200), (1405, 7, 25))   # 2026-10-17
+        self.assertEqual(shop.jalali(1773952200), (1404, 12, 29))  # 2026-03-20 Iran time
+        self.assertEqual(shop.fa_date(1792195200), "۱۴۰۵/۰۷/۲۵")
 
 
 if __name__ == "__main__":

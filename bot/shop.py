@@ -27,6 +27,12 @@ def init_db():
         joined_ts INTEGER NOT NULL, last_seen INTEGER NOT NULL DEFAULT 0,
         referrer_id INTEGER, blocked INTEGER NOT NULL DEFAULT 0,
         state TEXT)""")                       # state = JSON of the customer's current input step
+    _add_cols(c, "shop_customers", [("test_used_ts", "INTEGER NOT NULL DEFAULT 0")])
+    # Which customer owns which mohajer link (users.token). kind = test | paid.
+    c.execute("""CREATE TABLE IF NOT EXISTS shop_services(
+        token TEXT PRIMARY KEY, tg_id INTEGER NOT NULL, kind TEXT NOT NULL,
+        created_ts INTEGER NOT NULL, followup_sent INTEGER NOT NULL DEFAULT 0, feedback TEXT)""")
+    c.execute("CREATE INDEX IF NOT EXISTS shop_services_owner ON shop_services(tg_id)")
     c.execute("""CREATE TABLE IF NOT EXISTS shop_staff(
         tg_id INTEGER PRIMARY KEY, role TEXT NOT NULL, added_ts INTEGER NOT NULL, added_by INTEGER)""")
     c.execute("""CREATE TABLE IF NOT EXISTS shop_admin_log(
@@ -41,8 +47,37 @@ def setting(key, default=None):
 def set_setting(key, value):
     core.meta_set("shop_" + key, value)
 
-def flag(key):
-    return setting(key, "0") == "1"
+def flag(key, default="0"):
+    return setting(key, default) == "1"
+
+# ---------------- formatting ----------------
+_FA_DIGITS = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
+
+def fa(x):
+    return str(x).translate(_FA_DIGITS)
+
+def jalali(ts):
+    """Unix ts -> (year, month, day) in the Persian calendar, Iran time."""
+    g = time.gmtime(ts + core.IRAN_OFFSET); gy, gm, gd = g.tm_year, g.tm_mon, g.tm_mday
+    g_d_m = (0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334)
+    gy2 = gy + 1 if gm > 2 else gy
+    days = 355666 + 365 * gy + (gy2 + 3) // 4 - (gy2 + 99) // 100 + (gy2 + 399) // 400 + gd + g_d_m[gm - 1]
+    jy = -1595 + 33 * (days // 12053); days %= 12053
+    jy += 4 * (days // 1461); days %= 1461
+    if days > 365:
+        jy += (days - 1) // 365; days = (days - 1) % 365
+    if days < 186: jm, jd = 1 + days // 31, 1 + days % 31
+    else: jm, jd = 7 + (days - 186) // 30, 1 + (days - 186) % 30
+    return jy, jm, jd
+
+def fa_date(ts):
+    return fa("%d/%02d/%02d" % jalali(ts))
+
+def fa_size(mb):
+    return fa("%g گیگ" % (mb / 1024)) if mb >= 1024 else fa("%d مگ" % mb)
+
+def fa_hours(h):
+    return fa("%g روز" % (h / 24)) if h >= 24 and h % 24 == 0 else fa("%d ساعت" % h)
 
 # ---------------- roles ----------------
 ROLE_SUPPORT = "support"   # sees receipts + tickets; no settings, plans or staff
@@ -169,6 +204,133 @@ def welcome_text(name):
 def customer_menu(chat, text="از منوی پایین یکی رو انتخاب کن 👇"):
     say(chat, text, reply_kb(CUSTOMER_MENU))
 
+def link_kb(token, extra=None):
+    """Open-in-browser page = QR + copy + one-tap import into Happ/v2rayNG (subserver.py)."""
+    rows = [[{"text": "📲 باز کردن صفحهٔ اتصال", "url": core.sub_url(token)}],
+            [{"text": "📚 آموزش اتصال", "callback_data": "c:guide"}]]
+    return rows + (extra or [])
+
+# --- free test ---
+TEST_DEFAULT_MB, TEST_DEFAULT_HOURS = 500, 24
+
+def test_mb():    return int(setting("test_mb", TEST_DEFAULT_MB))
+def test_hours(): return int(setting("test_hours", TEST_DEFAULT_HOURS))
+def test_enabled(): return flag("test_enabled", "1")
+
+def test_offer(chat, uid):
+    cust = get_customer(uid)
+    if cust["test_used_ts"]:
+        core.send(chat, "🎁 تست رایگانت رو قبلاً گرفتی (%s).\nبرای ادامه می‌تونی یه سرویس بخری 👇" % fa_date(cust["test_used_ts"]),
+                  [[{"text": "🛒 خرید سرویس", "callback_data": "c:buy"}]]); return
+    if not test_enabled():
+        say(chat, "🎁 فعلاً تست رایگان نداریم؛ به‌زودی دوباره فعال می‌شه."); return
+    core.send(chat, "🎁 <b>تست رایگان</b>\n\n📦 %s · ⏳ %s\nهر حساب فقط یک بار می‌تونه تست بگیره."
+              % (fa_size(test_mb()), fa_hours(test_hours())),
+              [[{"text": "✅ دریافت تست", "callback_data": "c:test"}]])
+
+def claim_test(chat, mid, uid, first_name):
+    """One test per Telegram account: the claim is an atomic UPDATE, undone if minting fails."""
+    if not test_enabled():
+        core.edit(chat, mid, "🎁 فعلاً تست رایگان نداریم."); return
+    now = int(time.time())
+    c = core.db()
+    claimed = c.execute("UPDATE shop_customers SET test_used_ts=? WHERE tg_id=? AND test_used_ts=0", (now, uid)).rowcount
+    c.commit(); c.close()
+    if not claimed:
+        core.edit(chat, mid, "🎁 تست رایگانت رو قبلاً گرفتی."); return
+    token = None
+    try: token = core.create_user(test_mb() / 1024, test_hours() / 24, label=("تست %s" % (first_name or uid))[:40])
+    except Exception as e: print("shop test err", e, flush=True)
+    c = core.db()
+    if token:
+        c.execute("INSERT INTO shop_services(token,tg_id,kind,created_ts) VALUES(?,?,'test',?)", (token, uid, now))
+    else:
+        c.execute("UPDATE shop_customers SET test_used_ts=0 WHERE tg_id=?", (uid,))
+    c.commit(); c.close()
+    if not token:
+        core.edit(chat, mid, "❌ ساخت تست الان ممکن نشد؛ چند دقیقهٔ دیگه دوباره امتحان کن."); return
+    core.edit(chat, mid, "✅ <b>تست رایگانت آماده‌ست!</b>\n📦 %s · ⏳ %s\n\n🔗 <code>%s</code>\n\n"
+              "روی «باز کردن صفحهٔ اتصال» بزن تا با یک لمس به برنامه اضافه بشه."
+              % (fa_size(test_mb()), fa_hours(test_hours()), core.sub_url(token)), link_kb(token))
+
+# --- follow-up before a test ends ---
+FOLLOWUP_HOURS, FOLLOWUP_USED = 3, 0.8   # ask when <3h are left or 80% of the data is used
+
+def followup_due(u, now):
+    if u["disabled_ts"]: return True
+    if u["expiry_ts"] and u["expiry_ts"] - now <= FOLLOWUP_HOURS * 3600: return True
+    return bool(u["limit_bytes"]) and core.current_usage(u) >= FOLLOWUP_USED * u["limit_bytes"]
+
+def send_test_followups(now=None):
+    now = int(time.time()) if now is None else now
+    c = core.db()
+    rows = c.execute("SELECT s.token, s.tg_id, u.token AS live, u.disabled_ts, u.expiry_ts, u.limit_bytes, "
+                     "u.used_bytes, u.usage_reset_bytes FROM shop_services s LEFT JOIN users u ON u.token=s.token "
+                     "WHERE s.kind='test' AND s.followup_sent=0").fetchall()
+    c.close()
+    for r in rows:
+        if r["live"] and not followup_due(r, now): continue
+        c = core.db()   # mark first: a crash must never make us ask twice
+        c.execute("UPDATE shop_services SET followup_sent=1 WHERE token=?", (r["token"],)); c.commit(); c.close()
+        if not r["live"]: continue   # link already gone; too late to ask
+        core.send(r["tg_id"], "⏳ تست رایگانت داره تموم می‌شه.\nراضی بودی؟",
+                  [[{"text": "👍 عالی بود", "callback_data": "c:fb:good:%s" % r["token"]},
+                    {"text": "👎 مشکل داشتم", "callback_data": "c:fb:bad:%s" % r["token"]}]])
+
+def record_feedback(chat, mid, uid, data):
+    _, _, kind, token = data.split(":", 3)
+    c = core.db()
+    done = c.execute("UPDATE shop_services SET feedback=? WHERE token=? AND tg_id=? AND feedback IS NULL",
+                     (kind, token, uid)).rowcount
+    c.commit(); c.close()
+    if kind == "good":
+        core.edit(chat, mid, "😍 خوشحالیم که راضی بودی!\nبا خرید سرویس، همین کیفیت رو با حجم و زمان بیشتر داری.",
+                  [[{"text": "🛒 خرید سرویس", "callback_data": "c:buy"}]])
+    else:
+        core.edit(chat, mid, "😔 متأسفیم که اذیت شدی.\nبگو چی شد تا بررسی کنیم؛ معمولاً با یه تنظیم ساده درست می‌شه.",
+                  [[{"text": "🛠 گزارش اختلال", "callback_data": "c:report"}],
+                   [{"text": "📚 آموزش اتصال", "callback_data": "c:guide"}]])
+        if done:
+            cust = get_customer(uid)
+            for a in owner_ids():
+                core.send(a, "👎 یک مشتری از تست رایگان راضی نبود: %s · <code>%d</code>"
+                          % (html.escape(cust["first_name"] or ""), uid))
+
+# --- account ---
+def account_text(uid):
+    cust = get_customer(uid)
+    c = core.db()
+    paid = c.execute("SELECT COUNT(*) FROM shop_services WHERE tg_id=? AND kind='paid'", (uid,)).fetchone()[0]
+    c.close()
+    return ("👤 <b>حساب من</b>\n\n🙂 %s\n🆔 آیدی عددی: <code>%d</code>\n📅 عضویت: %s\n🛍 تعداد خرید: %s\n🎁 تست رایگان: %s"
+            % (html.escape(cust["first_name"] or "-"), uid, fa_date(cust["joined_ts"]), fa(paid),
+               ("گرفته‌شده" if cust["test_used_ts"] else "هنوز نگرفتی")))
+
+# --- connection guide ---
+GUIDE_APPS = [   # same Happ builds the subscriber page links to (subserver.HAPP_APPS)
+    ("android", "📱 اندروید", "https://github.com/Happ-proxy/happ-android/releases/latest/download/Happ.apk"),
+    ("ios", "🍏 آیفون", "https://apps.apple.com/us/app/happ-proxy-utility/id6504287215"),
+    ("windows", "💻 ویندوز", "https://github.com/Happ-proxy/happ-desktop/releases/latest/download/setup-Happ.x64.exe"),
+    ("mac", "🖥 مک", "https://github.com/Happ-proxy/happ-desktop/releases/latest/download/Happ.macOS.universal.dmg"),
+]
+
+def guide_kb():
+    rows = [[{"text": t, "callback_data": "c:guide:%s" % k} for k, t, _ in GUIDE_APPS[i:i + 2]] for i in (0, 2)]
+    return rows
+
+GUIDE_TEXT = "📚 <b>آموزش اتصال</b>\nدستگاهت رو انتخاب کن:"
+
+def guide_steps(key):
+    _, title, url = next(g for g in GUIDE_APPS if g[0] == key)
+    return ("📚 <b>آموزش اتصال · %s</b>\n\n"
+            "۱. برنامهٔ <b>Happ</b> رو از دکمهٔ پایین نصب کن.\n"
+            "۲. از «📦 سرویس‌های من» روی «📲 باز کردن صفحهٔ اتصال» بزن.\n"
+            "۳. توی صفحه‌ای که باز می‌شه «افزودن به Happ» رو بزن.\n"
+            "۴. توی Happ دکمهٔ اتصال رو بزن ✅\n\n"
+            "💡 اگه وصل نشد، توی Happ گزینهٔ آپدیت اشتراک رو بزن." % title,
+            [[{"text": "⬇️ دانلود Happ", "url": url}], [{"text": "بازگشت", "callback_data": "c:guides"}]])
+
+# --- routing ---
 def customer_message(chat, uid, m):
     text = (m.get("text") or "").strip()
     if text.startswith("/start"):
@@ -176,10 +338,25 @@ def customer_message(chat, uid, m):
         customer_menu(chat, welcome_text(m["from"].get("first_name"))); return
     if text in {b for row in CUSTOMER_MENU for b in row}:
         set_state(uid, None)
+        if text == B_TEST: test_offer(chat, uid); return
+        if text == B_ACCOUNT: core.send(chat, account_text(uid)); return
+        if text == B_GUIDE: core.send(chat, GUIDE_TEXT, guide_kb()); return
         say(chat, SOON_TEXT); return
     customer_menu(chat)
 
-def customer_callback(chat, mid, uid, data, cbid):
+def customer_callback(chat, mid, uid, data, cbid, user=None):
+    if data == "c:test":
+        core.answer(cbid); claim_test(chat, mid, uid, (user or {}).get("first_name")); return
+    if data == "c:guide":
+        core.answer(cbid); core.send(chat, GUIDE_TEXT, guide_kb()); return   # keeps the link message above
+    if data == "c:guides":
+        core.answer(cbid); core.edit(chat, mid, GUIDE_TEXT, guide_kb()); return
+    if data.startswith("c:guide:") and data[8:] in {g[0] for g in GUIDE_APPS}:
+        core.answer(cbid); text, kb = guide_steps(data[8:]); core.edit(chat, mid, text, kb); return
+    if data.startswith("c:fb:") and data.count(":") == 3:
+        core.answer(cbid); record_feedback(chat, mid, uid, data); return
+    if data in ("c:buy", "c:report"):
+        core.answer(cbid, SOON_TEXT); return
     core.answer(cbid)
 
 # ---------------- support staff UI ----------------
@@ -206,7 +383,7 @@ def on_update(up):
         cust = touch_customer(user)
         if cust["blocked"]: core.answer(cq["id"], BLOCKED_TEXT); return
         if flag("maintenance"): core.answer(cq["id"], "🛠 در حال به‌روزرسانی هستیم"); return
-        customer_callback(chat, mid, uid, cq.get("data", ""), cq["id"]); return
+        customer_callback(chat, mid, uid, cq.get("data", ""), cq["id"], user); return
     m = up.get("message")
     if not m or "from" not in m or m.get("chat", {}).get("type") != "private": return
     uid = m["from"]["id"]; chat = m["chat"]["id"]
@@ -237,6 +414,7 @@ def shop_admin_text():
 
 def shop_admin_kb():
     return [[{"text": ("✅ خاموش کردن تعمیرات" if flag("maintenance") else "🛠 روشن کردن تعمیرات"), "callback_data": "sa:maint"}],
+            [{"text": "🎁 تست رایگان", "callback_data": "sa:test"}],
             [{"text": "🎧 پشتیبان‌ها", "callback_data": "sa:staff"}, {"text": "📜 لاگ کارها", "callback_data": "sa:log"}],
             [{"text": "💾 بکاپ الان", "callback_data": "sa:backup"},
              {"text": ("⏹ قطع بکاپ روزانه" if flag("backup_auto") else "🔁 بکاپ روزانه"), "callback_data": "sa:backup_auto"}],
@@ -253,6 +431,26 @@ def staff_kb():
 
 STAFF_TEXT = ("🎧 <b>پشتیبان‌ها</b>\nپشتیبان فقط رسیدها و تیکت‌ها را می‌بیند؛ به تنظیمات و پلن‌ها دسترسی ندارد.\n"
               "برای حذف، روی اسمش بزن.")
+
+TEST_MB_CHOICES = (200, 500, 1024, 2048)
+TEST_HOUR_CHOICES = (6, 12, 24, 48)
+
+def test_admin_text():
+    c = core.db(); given = c.execute("SELECT COUNT(*) FROM shop_services WHERE kind='test'").fetchone()[0]
+    liked = c.execute("SELECT COUNT(*) FROM shop_services WHERE kind='test' AND feedback='good'").fetchone()[0]
+    disliked = c.execute("SELECT COUNT(*) FROM shop_services WHERE kind='test' AND feedback='bad'").fetchone()[0]
+    c.close()
+    return ("🎁 <b>تست رایگان</b>\n\nوضعیت: <b>%s</b>\nحجم: <b>%s</b> · زمان: <b>%s</b>\n\n"
+            "تست‌های داده‌شده: %s · 👍 %s · 👎 %s\n\nهر حساب تلگرام فقط یک بار تست می‌گیرد."
+            % ("روشن" if test_enabled() else "خاموش", fa_size(test_mb()), fa_hours(test_hours()),
+               fa(given), fa(liked), fa(disliked)))
+
+def test_admin_kb():
+    mark = lambda on, t: ("✅ " + t) if on else t
+    return [[{"text": ("⏸ خاموش کردن تست" if test_enabled() else "▶️ روشن کردن تست"), "callback_data": "sa:test_toggle"}],
+            [{"text": mark(mb == test_mb(), fa_size(mb)), "callback_data": "sa:test_mb:%d" % mb} for mb in TEST_MB_CHOICES],
+            [{"text": mark(h == test_hours(), fa_hours(h)), "callback_data": "sa:test_hours:%d" % h} for h in TEST_HOUR_CHOICES],
+            [{"text": "بازگشت", "callback_data": "sa:menu"}]]
 
 def log_text(limit=15):
     c = core.db(); rows = c.execute("SELECT * FROM shop_admin_log ORDER BY id DESC LIMIT ?", (limit,)).fetchall(); c.close()
@@ -281,6 +479,19 @@ def admin_callback(chat, mid, uid, data, cbid):
         ok = send_backup(chat); log(uid, "backup_sent" if ok else "backup_failed")
         if not ok: core.send(chat, "❌ ارسال بکاپ ناموفق بود.")
         return
+    if data == "sa:test":
+        core.answer(cbid); core.edit(chat, mid, test_admin_text(), test_admin_kb()); return
+    if data == "sa:test_toggle":
+        on = not test_enabled(); set_setting("test_enabled", "1" if on else "0")
+        log(uid, "test_on" if on else "test_off")
+        core.answer(cbid); core.edit(chat, mid, test_admin_text(), test_admin_kb()); return
+    for key, choices in (("test_mb", TEST_MB_CHOICES), ("test_hours", TEST_HOUR_CHOICES)):
+        if data.startswith("sa:%s:" % key):
+            v = int(data.rsplit(":", 1)[1])
+            if v in choices and str(v) != setting(key):
+                set_setting(key, v); log(uid, key, v)
+                core.edit(chat, mid, test_admin_text(), test_admin_kb())
+            core.answer(cbid); return
     if data == "sa:log":
         core.answer(cbid); core.edit(chat, mid, log_text(), [[{"text": "بازگشت", "callback_data": "sa:menu"}]]); return
     if data == "sa:staff":
@@ -349,15 +560,20 @@ def backup_due(now=None):
     hour = time.gmtime(now + core.IRAN_OFFSET).tm_hour
     return flag("backup_auto") and hour >= BACKUP_HOUR and setting("backup_day") != core.day_key(now)
 
-def backup_loop():
+# ---------------- background ticker ----------------
+TICK_SECONDS = 60
+
+def tick():
+    if backup_due():
+        set_setting("backup_day", core.day_key())
+        for a in owner_ids(): send_backup(a)
+    send_test_followups()
+
+def ticker():
     while True:
-        try:
-            if backup_due():
-                set_setting("backup_day", core.day_key())
-                for a in owner_ids(): send_backup(a)
-        except Exception as e:
-            print("backup err", e, flush=True)
-        time.sleep(600)
+        try: tick()
+        except Exception as e: print("shop tick err", e, flush=True)
+        time.sleep(TICK_SECONDS)
 
 def start_threads():
-    threading.Thread(target=backup_loop, daemon=True).start()
+    threading.Thread(target=ticker, daemon=True).start()
