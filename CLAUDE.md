@@ -253,6 +253,8 @@ On all four panel hosts, the active `xray.service` reads
   the in-memory `pending` dict, which stays admin-only. Shop settings are `meta.shop_*`.
 - **Shop orders:** approval flips `review -> approved` inside `BEGIN IMMEDIATE` before minting, so a
   double click or two reviewers can never deliver twice; a failed mint puts it back to `review`.
+- **Wallet:** change balances ONLY via `wallet_apply` (inside a transaction) / `wallet_change`. They
+  refuse to go negative and write the ledger row; `(kind, ref)` is unique so a retried credit is a no-op.
 - **Inspect state:** `sqlite3 <db> "SELECT label,used_bytes,max(used_bytes-usage_reset_bytes,0) AS current_used,limit_bytes,expiry_ts FROM users"`.
 
 ## 6. Verifying a change without breaking prod
@@ -293,11 +295,13 @@ usage_ledger(email, token, last_raw, total_bytes)
 meta(k TEXT PRIMARY KEY, v TEXT)   -- includes clean_ips, config_recipe,
                                    -- endpoint_settings, relay_ingresses, outbounds, xray_pid,
                                    -- membership_sync_pending, outbound_sync_pending
-shop_customers(tg_id, first_name, username, joined_ts, last_seen, referrer_id, blocked, state, test_used_ts)
-shop_services(token, tg_id, kind, created_ts, followup_sent, feedback) -- customer <-> users.token; kind test|paid
+shop_customers(tg_id, first_name, username, joined_ts, last_seen, referrer_id, blocked, state, test_used_ts, wallet)
+shop_wallet_tx(id, tg_id, delta, balance, kind, ref, note, actor, ts) -- ledger; UNIQUE(kind, ref)
+shop_services(token, tg_id, kind, created_ts, followup_sent, feedback, plan_id, auto_renew, auto_note_ts)
+                                                    -- customer <-> users.token; kind test|paid
 shop_plans(id, gb, days, price, active, popular)    -- 0 gb/days = unlimited
 shop_cards(id, number, holder, active)              -- card-to-card destinations, one picked per invoice
-shop_orders(id, tg_id, kind buy|renew, token, gb, days, price, amount, paid_amount, card_id, status,
+shop_orders(id, tg_id, kind buy|renew|topup, pay_method card|wallet, token, gb, days, price, amount, paid_amount, card_id, status,
             receipt_file, receipt_uid UNIQUE, ..., review_msgs) -- awaiting->review->approved|rejected; expired|cancelled
 shop_staff(tg_id, role, added_ts, added_by)          -- role 'support'; owners = ADMIN_IDS
 shop_admin_log(id, ts, actor, action, target, detail) -- audit trail of admin/support actions

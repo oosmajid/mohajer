@@ -286,8 +286,8 @@ def photo(uid, uniq="r1"):
                                   {"file_id": "big-" + uniq, "file_unique_id": uniq}]}}
 
 
-class ShopSalesTests(ShopCase):
-    """Plans, card-to-card invoices, receipts and their review."""
+class SalesCase(ShopCase):
+    """One plan, one card, a support member and customer Alice; link minting is faked."""
 
     def setUp(self):
         super().setUp()
@@ -316,6 +316,11 @@ class ShopSalesTests(ShopCase):
 
     def review_copies(self):
         return [p for m, p in self.calls if m == "sendPhoto"]
+
+
+
+class ShopSalesTests(SalesCase):
+    """Plans, card-to-card invoices, receipts and their review."""
 
     def test_admin_inputs_parse_persian_digits_and_separators(self):
         self.assertEqual((self.plan["gb"], self.plan["days"], self.plan["price"]), (30, 30, 150000))
@@ -465,6 +470,139 @@ class ShopSalesTests(ShopCase):
         o = self.buy(); bot.handle_update(photo(ALICE))
         bot.handle_update(cb(ALICE, "r:ok:%d" % o["id"]))
         self.assertEqual(self.row("SELECT status FROM shop_orders")["status"], "review")
+
+
+class ShopWalletTests(SalesCase):
+    def topup(self, amount, uid=ALICE, uniq="t1"):
+        bot.handle_update(cb(uid, "c:topup_amt:%d" % amount))
+        o = self.row("SELECT * FROM shop_orders WHERE tg_id=? ORDER BY id DESC", (uid,))
+        bot.handle_update(photo(uid, uniq)); bot.handle_update(cb(ADMIN, "r:ok:%d" % o["id"]))
+        return self.row("SELECT * FROM shop_orders WHERE id=?", (o["id"],))
+
+    def ledger(self, uid=ALICE):
+        return [tuple(r) for r in bot.db().execute("SELECT kind, delta, balance FROM shop_wallet_tx WHERE tg_id=? ORDER BY id", (uid,))]
+
+    def test_topup_by_card_credits_what_was_paid(self):
+        bot.handle_update(msg(ALICE, shop.B_WALLET))
+        self.assertIn("۰ تومان", self.last()["text"])
+        o = self.topup(200000)
+        self.assertEqual(o["kind"], "topup"); self.assertEqual(o["status"], "approved")
+        self.assertEqual(shop.balance(ALICE), o["amount"])
+        self.assertIn("شارژ شد", self.texts(ALICE)[-1])
+        self.assertNotIn("📦", self.review_copies()[-1]["caption"])
+        bot.handle_update(cb(ALICE, "c:topup_amt:100000"))       # short top-up is still credited, as paid
+        o = self.row("SELECT * FROM shop_orders ORDER BY id DESC")
+        bot.handle_update(photo(ALICE, "t2"))
+        bot.handle_update(cb(ADMIN, "r:amt:%d" % o["id"])); bot.handle_update(msg(ADMIN, "90000"))
+        bot.handle_update(cb(ADMIN, "r:ok:%d" % o["id"]))
+        self.assertEqual([k for k, _, _ in self.ledger()], ["topup", "topup"])
+        self.assertEqual(self.ledger()[-1][1], 90000)
+
+    def test_custom_topup_amount_is_stored_step_and_validated(self):
+        bot.handle_update(cb(ALICE, "c:topup_custom"))
+        self.assertEqual(shop.get_state(ALICE), {"stage": "topup_amount"})
+        bot.handle_update(msg(ALICE, "سلام"))
+        self.assertIn("به تومان", self.last()["text"])
+        bot.handle_update(msg(ALICE, "۵۰۰"))                      # below minimum
+        self.assertIsNone(self.row("SELECT * FROM shop_orders"))
+        bot.handle_update(cb(ALICE, "c:topup_custom")); bot.handle_update(msg(ALICE, "۳۰۰٬۰۰۰"))
+        o = self.row("SELECT * FROM shop_orders")
+        self.assertEqual((o["kind"], o["price"]), ("topup", 300000))
+
+    def test_wallet_purchase_is_instant_and_atomic(self):
+        self.topup(200000)
+        bot.handle_update(cb(ALICE, "c:plan:%d" % self.plan["id"]))
+        kb = self.last("editMessageText")["reply_markup"]["inline_keyboard"]
+        self.assertEqual(kb[0][0]["callback_data"], "c:wpay:%d" % self.plan["id"])
+        before = shop.balance(ALICE)
+        bot.handle_update(cb(ALICE, "c:wpay:%d" % self.plan["id"]))
+        self.assertEqual(shop.balance(ALICE), before - 150000)
+        o = self.row("SELECT * FROM shop_orders ORDER BY id DESC")
+        self.assertEqual((o["pay_method"], o["status"], o["token"]), ("wallet", "approved", "tok0"))
+        self.assertTrue(any(bot.sub_url("tok0") in t for t in self.texts(ALICE)))
+        bot.handle_update(cb(ALICE, "c:wpay:%d" % self.plan["id"]))  # not enough left
+        self.assertIn("کافی نیست", self.last("editMessageText")["text"])
+        self.assertEqual(len(self.minted), 1)
+
+    def test_short_balance_offers_exact_topup(self):
+        bot.handle_update(cb(ADMIN, "sa:uwal:%d:add" % ALICE)); bot.handle_update(msg(ADMIN, "100000 هدیه"))
+        bot.handle_update(cb(ALICE, "c:plan:%d" % self.plan["id"]))
+        kb = self.last("editMessageText")["reply_markup"]["inline_keyboard"]
+        self.assertEqual(kb[0][0]["callback_data"], "c:topup_amt:50000")
+
+    def test_failed_wallet_delivery_is_refunded(self):
+        self.topup(200000); start = shop.balance(ALICE)
+        bot.create_user = lambda *a, **k: None
+        bot.handle_update(cb(ALICE, "c:wpay:%d" % self.plan["id"]))
+        self.assertEqual(shop.balance(ALICE), start)
+        self.assertEqual([k for k, _, _ in self.ledger()][-2:], ["purchase", "refund"])
+        self.assertEqual(self.row("SELECT status FROM shop_orders ORDER BY id DESC")["status"], "failed")
+
+    def test_card_overpayment_goes_to_wallet(self):
+        o = self.buy(); bot.handle_update(photo(ALICE))
+        bot.handle_update(cb(ADMIN, "r:ok:%d" % o["id"]))
+        self.assertEqual(shop.balance(ALICE), o["amount"] - 150000)  # the unique-amount tomans come back
+        self.assertEqual(self.ledger()[0][0], "overpay")
+        bot.handle_update(cb(ADMIN, "r:ok:%d" % o["id"]))            # second click credits nothing
+        self.assertEqual(len(self.ledger()), 1)
+
+    def test_ledger_never_goes_negative_and_refs_are_unique(self):
+        self.assertIsNone(shop.wallet_change(ALICE, -1, "admin"))
+        self.assertEqual(shop.wallet_change(ALICE, 500, "topup", ref="order:1"), 500)
+        self.assertIsNone(shop.wallet_change(ALICE, 500, "topup", ref="order:1"))
+        self.assertEqual(shop.balance(ALICE), 500)
+
+    def test_auto_renew_from_wallet(self):
+        self.topup(400000)
+        bot.handle_update(cb(ALICE, "c:wpay:%d" % self.plan["id"]))
+        bot.handle_update(cb(ALICE, "c:auto:tok0"))
+        self.assertEqual(self.row("SELECT auto_renew FROM shop_services WHERE token='tok0'")["auto_renew"], 1)
+        u = self.row("SELECT * FROM users WHERE token='tok0'")
+        shop.run_auto_renewals(now=u["expiry_ts"] - 5 * 3600)         # not due yet
+        self.assertEqual(len(self.ledger()), 2)
+        shop.run_auto_renewals(now=u["expiry_ts"] - 600)
+        after = self.row("SELECT * FROM users WHERE token='tok0'")
+        self.assertEqual(after["limit_bytes"] - u["limit_bytes"], 30 * bot.GB)
+        self.assertEqual(self.ledger()[-1][0], "auto")
+        self.assertEqual(len(self.minted), 1)
+        self.assertIn("تمدید خودکار انجام شد", self.texts(ALICE)[-1])
+
+    def test_auto_renew_low_balance_reminds_once_a_day(self):
+        self.topup(200000)
+        bot.handle_update(cb(ALICE, "c:wpay:%d" % self.plan["id"]))
+        bot.handle_update(cb(ALICE, "c:auto:tok0"))
+        c = bot.db(); c.execute("UPDATE users SET disabled_ts=1 WHERE token='tok0'"); c.commit(); c.close()
+        self.calls.clear()
+        shop.run_auto_renewals(now=10**9); shop.run_auto_renewals(now=10**9 + 3600)
+        self.assertEqual(len(self.texts(ALICE)), 1)
+        self.assertIn("کافی نیست", self.texts(ALICE)[0])
+        shop.run_auto_renewals(now=10**9 + shop.AUTO_NOTE_EVERY + 1)
+        self.assertEqual(len(self.texts(ALICE)), 2)
+
+    def test_others_cannot_toggle_auto_renew(self):
+        self.topup(200000); bot.handle_update(cb(ALICE, "c:wpay:%d" % self.plan["id"]))
+        bot.handle_update(msg(BOB, "/start")); bot.handle_update(cb(BOB, "c:auto:tok0"))
+        self.assertEqual(self.row("SELECT auto_renew FROM shop_services WHERE token='tok0'")["auto_renew"], 0)
+
+    def test_admin_user_page_adjusts_wallet_and_blocks(self):
+        bot.handle_update(cb(ADMIN, "sa:users"))
+        bot.handle_update(msg(ADMIN, "@nobody"))
+        self.assertIn("پیدا نشد", self.last()["text"])
+        bot.handle_update(msg(ADMIN, "۱۰۰"))
+        self.assertIn("<code>100</code>", self.last()["text"])
+        bot.handle_update(cb(ADMIN, "sa:uwal:%d:sub" % ALICE)); bot.handle_update(msg(ADMIN, "1000 اشتباه"))
+        self.assertIn("کمتر", self.last()["text"])
+        bot.handle_update(msg(ADMIN, "50000"))                         # reason missing
+        self.assertIn("دلیل", self.last()["text"])
+        bot.handle_update(cb(ADMIN, "sa:uwal:%d:add" % ALICE)); bot.handle_update(msg(ADMIN, "50000 بازگشت وجه"))
+        self.assertEqual(shop.balance(ALICE), 50000)
+        self.assertIn("بازگشت وجه", self.texts(ALICE)[-1])
+        self.assertEqual(self.row("SELECT actor,note FROM shop_wallet_tx")[:], (ADMIN, "بازگشت وجه"))
+        bot.handle_update(cb(ADMIN, "sa:ublock:%d" % ALICE))
+        bot.handle_update(msg(ALICE, shop.B_WALLET))
+        self.assertEqual(self.last()["text"], shop.BLOCKED_TEXT)
+        actions = [r["action"] for r in bot.db().execute("SELECT action FROM shop_admin_log WHERE action IN ('wallet_adjust','block')")]
+        self.assertEqual(actions, ["wallet_adjust", "block"])
 
 
 if __name__ == "__main__":

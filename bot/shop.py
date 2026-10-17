@@ -27,7 +27,15 @@ def init_db():
         joined_ts INTEGER NOT NULL, last_seen INTEGER NOT NULL DEFAULT 0,
         referrer_id INTEGER, blocked INTEGER NOT NULL DEFAULT 0,
         state TEXT)""")                       # state = JSON of the customer's current input step
-    _add_cols(c, "shop_customers", [("test_used_ts", "INTEGER NOT NULL DEFAULT 0")])
+    _add_cols(c, "shop_customers", [("test_used_ts", "INTEGER NOT NULL DEFAULT 0"),
+                                    ("wallet", "INTEGER NOT NULL DEFAULT 0")])   # toman; only wallet_apply() changes it
+    # Wallet ledger: every balance change, with the balance after it. (kind, ref) is unique so
+    # a retried credit for the same order can never be applied twice.
+    c.execute("""CREATE TABLE IF NOT EXISTS shop_wallet_tx(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, tg_id INTEGER NOT NULL, delta INTEGER NOT NULL,
+        balance INTEGER NOT NULL, kind TEXT NOT NULL, ref TEXT, note TEXT, actor INTEGER, ts INTEGER NOT NULL)""")
+    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS shop_wallet_tx_ref ON shop_wallet_tx(kind, ref) WHERE ref IS NOT NULL")
+    c.execute("CREATE INDEX IF NOT EXISTS shop_wallet_tx_owner ON shop_wallet_tx(tg_id)")
     # Which customer owns which mohajer link (users.token). kind = test | paid.
     c.execute("""CREATE TABLE IF NOT EXISTS shop_services(
         token TEXT PRIMARY KEY, tg_id INTEGER NOT NULL, kind TEXT NOT NULL,
@@ -48,6 +56,10 @@ def init_db():
         amount INTEGER NOT NULL, paid_amount INTEGER, card_id INTEGER, status TEXT NOT NULL,
         receipt_file TEXT, receipt_uid TEXT UNIQUE, created_ts INTEGER NOT NULL, receipt_ts INTEGER,
         decided_ts INTEGER, decided_by INTEGER, note TEXT, review_msgs TEXT)""")
+    _add_cols(c, "shop_orders", [("pay_method", "TEXT NOT NULL DEFAULT 'card'")])   # card | wallet
+    _add_cols(c, "shop_services", [("plan_id", "INTEGER"),                          # plan used for auto-renew
+                                   ("auto_renew", "INTEGER NOT NULL DEFAULT 0"),
+                                   ("auto_note_ts", "INTEGER NOT NULL DEFAULT 0")])  # last "not enough balance" note
     c.execute("CREATE INDEX IF NOT EXISTS shop_orders_status ON shop_orders(status)")
     c.execute("CREATE INDEX IF NOT EXISTS shop_orders_owner ON shop_orders(tg_id)")
     c.execute("""CREATE TABLE IF NOT EXISTS shop_staff(
@@ -336,6 +348,78 @@ def record_feedback(chat, mid, uid, data):
                 core.send(a, "👎 یک مشتری از تست رایگان راضی نبود: %s · <code>%d</code>"
                           % (html.escape(cust["first_name"] or ""), uid))
 
+# --- wallet ---
+class InsufficientFunds(Exception):
+    pass
+
+def wallet_apply(c, uid, delta, kind, ref=None, note=None, actor=None):
+    """Change a balance inside the caller's open transaction and record it in the ledger.
+    Raises InsufficientFunds rather than going negative; returns the new balance."""
+    row = c.execute("SELECT wallet FROM shop_customers WHERE tg_id=?", (uid,)).fetchone()
+    if not row: raise InsufficientFunds()
+    bal = row[0] + int(delta)
+    if bal < 0: raise InsufficientFunds()
+    c.execute("UPDATE shop_customers SET wallet=? WHERE tg_id=?", (bal, uid))
+    c.execute("INSERT INTO shop_wallet_tx(tg_id,delta,balance,kind,ref,note,actor,ts) VALUES(?,?,?,?,?,?,?,?)",
+              (uid, int(delta), bal, kind, ref, note, actor, int(time.time())))
+    return bal
+
+def wallet_change(uid, delta, kind, ref=None, note=None, actor=None):
+    """Standalone credit/debit. Returns the new balance, or None if refused (funds / already applied)."""
+    c = core.db()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        bal = wallet_apply(c, uid, delta, kind, ref, note, actor)
+        c.commit(); return bal
+    except (InsufficientFunds, sqlite3.IntegrityError):
+        c.rollback(); return None
+    finally:
+        c.close()
+
+def balance(uid):
+    r = get_customer(uid); return r["wallet"] if r else 0
+
+TX_LABELS = {"topup": "شارژ کیف پول", "purchase": "خرید", "auto": "تمدید خودکار", "refund": "بازگشت وجه",
+             "overpay": "مبلغ اضافهٔ واریزی", "admin": "تغییر توسط پشتیبانی", "referral": "پاداش دعوت"}
+
+def tx_lines(uid, limit):
+    c = core.db()
+    rows = c.execute("SELECT * FROM shop_wallet_tx WHERE tg_id=? ORDER BY id DESC LIMIT ?", (uid, limit)).fetchall()
+    c.close()
+    return ["%s %s · %s%s · %s" % ("🟢" if r["delta"] > 0 else "🔴", fa_date(r["ts"]), "+" if r["delta"] > 0 else "−",
+                                   toman(abs(r["delta"])), TX_LABELS.get(r["kind"], r["kind"]) +
+                                   (" (%s)" % html.escape(r["note"]) if r["note"] and r["kind"] == "admin" else ""))
+            for r in rows]
+
+def wallet_view(uid):
+    lines = tx_lines(uid, 5)
+    text = "💰 <b>کیف پول</b>\n\nموجودی: <b>%s</b>" % toman(balance(uid))
+    text += ("\n\n<b>آخرین تراکنش‌ها</b>\n" + "\n".join(lines)) if lines else "\n\nهنوز تراکنشی نداری."
+    text += "\n\n💡 با موجودی کیف پول، خرید و تمدید فوری انجام می‌شه و منتظر تأیید رسید نمی‌مونی."
+    kb = [[{"text": "➕ شارژ کیف پول", "callback_data": "c:topup"}]]
+    if lines: kb.append([{"text": "📜 همهٔ تراکنش‌ها", "callback_data": "c:tx"}])
+    return text, kb
+
+TOPUP_CHOICES = (100000, 200000, 500000, 1000000)
+TOPUP_MIN, TOPUP_MAX = 10000, 50000000
+
+def topup_view():
+    kb = [[{"text": toman(a), "callback_data": "c:topup_amt:%d" % a} for a in TOPUP_CHOICES[i:i + 2]] for i in (0, 2)]
+    kb += [[{"text": "✏️ مبلغ دلخواه", "callback_data": "c:topup_custom"}], [{"text": "بازگشت", "callback_data": "c:wallet"}]]
+    return "➕ <b>شارژ کیف پول</b>\nچقدر شارژ کنیم؟", kb
+
+def start_topup(chat, uid, amount, mid=None):
+    if not (TOPUP_MIN <= amount <= TOPUP_MAX):
+        core.send(chat, "مبلغ شارژ باید بین %s و %s باشد." % (toman(TOPUP_MIN), toman(TOPUP_MAX))); return
+    o = create_order(uid, "topup", amount)
+    if not o:
+        text, kb = "😔 پرداخت کارت‌به‌کارت موقتاً در دسترس نیست؛ کمی بعد دوباره امتحان کن.", None
+        for a in owner_ids(): core.send(a, "⚠️ مشتری می‌خواست کیف پولش را شارژ کند ولی هیچ کارت فعالی تعریف نشده است.")
+    else:
+        text, kb = payment_text(o), [[{"text": "❌ لغو سفارش", "callback_data": "c:cancel:%d" % o["id"]}]]
+    if mid: core.edit(chat, mid, text, kb)
+    else: core.send(chat, text, kb)
+
 # --- plans & buying ---
 def get_plan(pid):
     c = core.db(); r = c.execute("SELECT * FROM shop_plans WHERE id=?", (pid,)).fetchone(); c.close(); return r
@@ -373,12 +457,20 @@ def send_plans(chat, uid, token=None, mid=None):
     if mid: core.edit(chat, mid, text, kb)
     else: core.send(chat, text, kb)
 
-def invoice_view(plan, token=None):
+def invoice_view(plan, token=None, bal=0):
     suffix = (":" + token) if token else ""
-    text = ("🧾 <b>پیش‌فاکتور</b>\n\n📦 %s\n%s💰 مبلغ: <b>%s</b>"
-            % (plan_title(plan["gb"], plan["days"]), "🔄 تمدید سرویس فعلی\n" if token else "", toman(plan["price"])))
-    kb = [[{"text": "💳 پرداخت کارت‌به‌کارت", "callback_data": "c:pay:%d%s" % (plan["id"], suffix)}],
-          [{"text": "بازگشت", "callback_data": "c:plans%s" % suffix}]]
+    text = ("🧾 <b>پیش‌فاکتور</b>\n\n📦 %s\n%s💰 مبلغ: <b>%s</b>\n👛 موجودی کیف پول: %s"
+            % (plan_title(plan["gb"], plan["days"]), "🔄 تمدید سرویس فعلی\n" if token else "", toman(plan["price"]), toman(bal)))
+    kb = []
+    if bal >= plan["price"]:
+        kb.append([{"text": "💰 پرداخت از کیف پول (فوری)", "callback_data": "c:wpay:%d%s" % (plan["id"], suffix)}])
+    elif bal > 0:
+        short = -(-(plan["price"] - bal) // 1000) * 1000          # round the shortfall up to 1,000
+        short = max(short, TOPUP_MIN)
+        text += "\n\nبا شارژ %s می‌تونی از کیف پول پرداخت کنی." % toman(short)
+        kb.append([{"text": "➕ شارژ %s" % toman(short), "callback_data": "c:topup_amt:%d" % short}])
+    kb += [[{"text": "💳 پرداخت کارت‌به‌کارت", "callback_data": "c:pay:%d%s" % (plan["id"], suffix)}],
+           [{"text": "بازگشت", "callback_data": "c:plans%s" % suffix}]]
     return text, kb
 
 ORDER_TTL = 3600            # an invoice waits this long for its receipt
@@ -388,9 +480,9 @@ OPEN = ("awaiting", "review")
 def get_order(oid):
     c = core.db(); r = c.execute("SELECT * FROM shop_orders WHERE id=?", (oid,)).fetchone(); c.close(); return r
 
-def create_order(uid, plan, token=None, now=None):
-    """New card-to-card invoice with a unique amount (price + a few random tomans) so the
-    reviewer can match the bank SMS to it. Older unpaid invoices of the customer are cancelled."""
+def create_order(uid, kind, price, plan=None, token=None, now=None):
+    """New card-to-card invoice (kind buy | renew | topup) with a unique amount (price + a few
+    random tomans) so the reviewer can match the bank SMS. Older unpaid invoices are cancelled."""
     now = int(time.time()) if now is None else now
     c = core.db()
     try:
@@ -399,31 +491,35 @@ def create_order(uid, plan, token=None, now=None):
         if not cards: c.rollback(); return None
         c.execute("UPDATE shop_orders SET status='cancelled' WHERE tg_id=? AND status='awaiting'", (uid,))
         taken = {r[0] for r in c.execute("SELECT amount FROM shop_orders WHERE status IN ('awaiting','review')")}
-        amount = plan["price"] + 1 + secrets.randbelow(999)
+        amount = price + 1 + secrets.randbelow(999)
         for _ in range(50):
             if amount not in taken: break
-            amount = plan["price"] + 1 + secrets.randbelow(999)
+            amount = price + 1 + secrets.randbelow(999)
         oid = c.execute("INSERT INTO shop_orders(tg_id,kind,token,plan_id,gb,days,price,amount,card_id,status,created_ts) "
                         "VALUES(?,?,?,?,?,?,?,?,?,'awaiting',?)",
-                        (uid, "renew" if token else "buy", token, plan["id"], plan["gb"], plan["days"], plan["price"],
-                         amount, secrets.choice(cards)[0], now)).lastrowid
+                        (uid, kind, token, plan["id"] if plan else None, plan["gb"] if plan else 0,
+                         plan["days"] if plan else 0, price, amount, secrets.choice(cards)[0], now)).lastrowid
         c.commit()
     finally:
         c.close()
     return get_order(oid)
+
+def plan_order(uid, plan, token=None):
+    return create_order(uid, "renew" if token else "buy", plan["price"], plan, token)
 
 def get_card(cid):
     c = core.db(); r = c.execute("SELECT * FROM shop_cards WHERE id=?", (cid,)).fetchone(); c.close(); return r
 
 def payment_text(o):
     card = get_card(o["card_id"])
-    return ("💳 <b>پرداخت کارت‌به‌کارت · سفارش #%s</b>\n\n"
+    return ("💳 <b>%s · سفارش #%s</b>\n\n"
             "مبلغ دقیق: <b>%s</b>\n<code>%d</code>\n\n"
             "به این کارت:\n<code>%s</code>\nبه نام <b>%s</b>\n\n"
             "⏳ مهلت پرداخت: تا ساعت %s\n"
             "📸 بعد از واریز، <b>عکس رسید</b> رو همین‌جا بفرست.\n\n"
             "⚠️ لطفاً دقیقاً همین مبلغ رو واریز کن تا پرداختت زودتر شناسایی بشه."
-            % (fa(o["id"]), toman(o["amount"]), o["amount"], card["number"] if card else "-",
+            % ("شارژ کیف پول" if o["kind"] == "topup" else "پرداخت کارت‌به‌کارت",
+               fa(o["id"]), toman(o["amount"]), o["amount"], card["number"] if card else "-",
                html.escape(card["holder"] if card else "-"), fa_clock(o["created_ts"] + ORDER_TTL)))
 
 def start_payment(chat, mid, uid, plan_id, token=None):
@@ -432,7 +528,7 @@ def start_payment(chat, mid, uid, plan_id, token=None):
         core.edit(chat, mid, "این پلن دیگه موجود نیست.", [[{"text": "🛒 پلن‌ها", "callback_data": "c:plans"}]]); return
     if token and not owned_service(uid, token):
         core.edit(chat, mid, "این سرویس پیدا نشد."); return
-    o = create_order(uid, plan, token)
+    o = plan_order(uid, plan, token)
     if not o:
         core.edit(chat, mid, "😔 پرداخت کارت‌به‌کارت موقتاً در دسترس نیست؛ کمی بعد دوباره امتحان کن.")
         for a in owner_ids(): core.send(a, "⚠️ مشتری می‌خواست بخرد ولی هیچ کارت فعالی تعریف نشده است.")
@@ -472,14 +568,16 @@ def reviewers():
     c = core.db(); staff = [r[0] for r in c.execute("SELECT tg_id FROM shop_staff")]; c.close()
     return owner_ids() + [s for s in staff if s not in owner_ids()]
 
+ORDER_KINDS = {"buy": "خرید", "renew": "تمدید", "topup": "شارژ کیف پول"}
+
 def review_caption(o):
     cust = get_customer(o["tg_id"]); card = get_card(o["card_id"])
     late = o["receipt_ts"] and o["receipt_ts"] > o["created_ts"] + ORDER_TTL
-    what = "خرید" if o["kind"] == "buy" else "تمدید"
+    what = ORDER_KINDS.get(o["kind"], o["kind"])
     lines = ["🧾 <b>رسید · سفارش #%d</b> (%s)%s" % (o["id"], what, " ⏰ دیرتر از مهلت" if late else ""), "",
-             "👤 %s · <code>%d</code>" % (html.escape(cust["first_name"] or "-") if cust else "-", o["tg_id"]),
-             "📦 %s" % plan_title(o["gb"], o["days"]),
-             "💰 مبلغ فاکتور: <b>%s</b>" % toman(o["amount"])]
+             "👤 %s · <code>%d</code>" % (html.escape(cust["first_name"] or "-") if cust else "-", o["tg_id"])]
+    if o["kind"] != "topup": lines.append("📦 %s" % plan_title(o["gb"], o["days"]))
+    lines.append("💰 مبلغ فاکتور: <b>%s</b>" % toman(o["amount"]))
     if o["paid_amount"] is not None:
         lines.append("✏️ مبلغ واریزی: <b>%s</b>" % toman(o["paid_amount"]))
     lines.append("💳 کارت: %s (%s)" % (("…" + card["number"][-4:]) if card else "-", html.escape(card["holder"]) if card else "-"))
@@ -513,8 +611,15 @@ def refresh_review(oid):
         core.tg("editMessageCaption", chat_id=chat, message_id=mid, caption=review_caption(o), parse_mode="HTML",
                 reply_markup={"inline_keyboard": review_kb(o)})
 
+def paid_of(o):
+    return o["paid_amount"] if o["paid_amount"] is not None else o["amount"]
+
 def fulfill(o):
-    """Create or extend the customer's link for an approved order. Returns the token or None."""
+    """Deliver an approved order: credit the wallet (topup), or create/extend the customer's link.
+    Returns the token ('wallet' for a top-up) or None on failure."""
+    if o["kind"] == "topup":
+        wallet_change(o["tg_id"], paid_of(o), "topup", ref="order:%d" % o["id"])   # None = already credited
+        return "wallet"
     token = o["token"]
     c = core.db(); live = token and c.execute("SELECT 1 FROM users WHERE token=?", (token,)).fetchone(); c.close()
     if o["kind"] == "renew" and live:
@@ -525,7 +630,8 @@ def fulfill(o):
         try: core.refresh_usage(token)
         except Exception as e: print("shop refresh err", e, flush=True)
         core.maybe_reenable(token)
-        c = core.db(); c.execute("UPDATE shop_services SET kind='paid' WHERE token=?", (token,)); c.commit(); c.close()
+        c = core.db(); c.execute("UPDATE shop_services SET kind='paid',plan_id=COALESCE(?,plan_id),auto_note_ts=0 WHERE token=?",
+                                 (o["plan_id"], token)); c.commit(); c.close()
         return token
     # a buy - or a renewal whose link was already deleted after its grace period: mint a new one
     cust = get_customer(o["tg_id"])
@@ -533,7 +639,8 @@ def fulfill(o):
                                                                       plan_title(o["gb"], o["days"])))[:40])
     if token:
         c = core.db()
-        c.execute("INSERT INTO shop_services(token,tg_id,kind,created_ts) VALUES(?,?,'paid',?)", (token, o["tg_id"], int(time.time())))
+        c.execute("INSERT INTO shop_services(token,tg_id,kind,created_ts,plan_id) VALUES(?,?,'paid',?,?)",
+                  (token, o["tg_id"], int(time.time()), o["plan_id"]))
         c.execute("UPDATE shop_orders SET token=? WHERE id=?", (token, o["id"])); c.commit(); c.close()
     return token
 
@@ -544,7 +651,7 @@ def approve(oid, uid):
         c.execute("BEGIN IMMEDIATE")
         o = c.execute("SELECT * FROM shop_orders WHERE id=?", (oid,)).fetchone()
         if not o or o["status"] != "review": c.rollback(); return "done"
-        if o["paid_amount"] is not None and o["paid_amount"] < o["amount"]: c.rollback(); return "short"
+        if o["kind"] != "topup" and paid_of(o) < o["amount"]: c.rollback(); return "short"   # a top-up credits what was paid
         c.execute("UPDATE shop_orders SET status='approved',decided_ts=?,decided_by=? WHERE id=?", (int(time.time()), uid, oid))
         c.commit()
     finally:
@@ -555,12 +662,73 @@ def approve(oid, uid):
     if not token:   # give the order back to the queue so someone can retry
         c = core.db(); c.execute("UPDATE shop_orders SET status='review',decided_ts=NULL,decided_by=NULL WHERE id=?", (oid,))
         c.commit(); c.close(); return "failed"
-    o = get_order(oid); log(uid, "order_approve", oid, o["paid_amount"] if o["paid_amount"] is not None else o["amount"])
-    head = "🎉 <b>پرداختت تأیید شد!</b>\n" + ("سرویست تمدید شد ✅" if o["kind"] == "renew" else "سرویس جدیدت فعال شد ✅")
-    core.send(o["tg_id"], "%s\n📦 %s\n\n🔗 <code>%s</code>" % (head, plan_title(o["gb"], o["days"]), core.sub_url(token)),
-              link_kb(token))
+    o = get_order(oid); log(uid, "order_approve", oid, paid_of(o))
+    extra = paid_of(o) - o["price"] if o["kind"] != "topup" else 0
+    if extra > 0: wallet_change(o["tg_id"], extra, "overpay", ref="order:%d" % oid)   # incl. the unique-amount tomans
+    if o["kind"] == "topup":
+        core.send(o["tg_id"], "💰 <b>کیف پولت %s شارژ شد!</b>\nموجودی: <b>%s</b>" % (toman(paid_of(o)), toman(balance(o["tg_id"]))),
+                  [[{"text": "🛒 خرید سرویس", "callback_data": "c:buy"}]])
+    else:
+        deliver_message(o, token, "🎉 <b>پرداختت تأیید شد!</b>", extra)
     refresh_review(oid)
     return "ok"
+
+def deliver_message(o, token, head, extra=0):
+    body = "سرویست تمدید شد ✅" if o["kind"] == "renew" else "سرویس جدیدت فعال شد ✅"
+    text = "%s\n%s\n📦 %s\n\n🔗 <code>%s</code>" % (head, body, plan_title(o["gb"], o["days"]), core.sub_url(token))
+    if extra > 0: text += "\n\n💰 %s اضافه واریز کرده بودی؛ به کیف پولت برگشت." % toman(extra)
+    core.send(o["tg_id"], text, link_kb(token, auto_kb(token)))
+
+def auto_kb(token):
+    c = core.db(); r = c.execute("SELECT auto_renew FROM shop_services WHERE token=?", (token,)).fetchone(); c.close()
+    on = bool(r and r[0])
+    return [[{"text": "🔁 تمدید خودکار: %s" % ("روشن ✅" if on else "خاموش"), "callback_data": "c:auto:%s" % token}]]
+
+def wallet_buy(uid, plan, token=None, kind="purchase"):
+    """Pay a plan from the wallet: debit + order row in one transaction, then deliver; a failed
+    delivery is refunded. Returns (status, order, token); status ok | funds | failed."""
+    now = int(time.time())
+    c = core.db()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        oid = c.execute("INSERT INTO shop_orders(tg_id,kind,token,plan_id,gb,days,price,amount,status,created_ts,decided_ts,"
+                        "decided_by,pay_method) VALUES(?,?,?,?,?,?,?,?,'approved',?,?,?,'wallet')",
+                        (uid, "renew" if token else "buy", token, plan["id"], plan["gb"], plan["days"], plan["price"],
+                         plan["price"], now, now, uid)).lastrowid
+        wallet_apply(c, uid, -plan["price"], kind, ref="order:%d" % oid)
+        c.commit()
+    except InsufficientFunds:
+        c.rollback(); return "funds", None, None
+    finally:
+        c.close()
+    o = get_order(oid); tok = None
+    try: tok = fulfill(o)
+    except Exception as e: print("shop wallet fulfill err", e, flush=True)
+    if not tok:
+        c = core.db()
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            wallet_apply(c, uid, plan["price"], "refund", ref="order:%d" % oid)
+            c.execute("UPDATE shop_orders SET status='failed' WHERE id=?", (oid,))
+            c.commit()
+        finally:
+            c.close()
+        return "failed", o, None
+    return "ok", get_order(oid), tok
+
+def wallet_pay(chat, mid, uid, plan_id, token=None):
+    plan = get_plan(plan_id)
+    if not plan or not plan["active"]:
+        core.edit(chat, mid, "این پلن دیگه موجود نیست.", [[{"text": "🛒 پلن‌ها", "callback_data": "c:plans"}]]); return
+    if token and not owned_service(uid, token):
+        core.edit(chat, mid, "این سرویس پیدا نشد."); return
+    status, o, tok = wallet_buy(uid, plan, token)
+    if status == "funds":
+        text, kb = invoice_view(plan, token, balance(uid)); core.edit(chat, mid, "⚠️ موجودی کافی نیست.\n\n" + text, kb); return
+    if status == "failed":
+        core.edit(chat, mid, "❌ ساخت سرویس الان ممکن نشد؛ مبلغ به کیف پولت برگشت. چند دقیقهٔ دیگه دوباره امتحان کن."); return
+    core.edit(chat, mid, "✅ از کیف پولت %s کم شد. موجودی: %s" % (toman(plan["price"]), toman(balance(uid))))
+    deliver_message(o, tok, "🎉 <b>خریدت انجام شد!</b>")
 
 REJECT_REASONS = ["مبلغ واریزی با فاکتور یکی نیست", "رسید ناخوانا یا نامعتبر است", "واریزی به حساب ما نرسیده", "رسید تکراری است"]
 
@@ -650,14 +818,51 @@ def expire_orders(now=None):
         core.send(r["tg_id"], "⌛️ مهلت پرداخت سفارش #%s تموم شد.\nاگه واریز کردی، تا ۲۴ ساعت هنوز می‌تونی عکس رسید رو بفرستی؛ "
                   "وگرنه دوباره از «🛒 خرید سرویس» سفارش بده." % fa(r["id"]))
 
+# --- auto-renew from the wallet ---
+AUTO_BEFORE, AUTO_USED = 3600, 0.98   # renew when <1h is left, 98% of the data is used, or the link was disabled
+AUTO_NOTE_EVERY = 24 * 3600           # remind about a low balance at most once a day
+
+def auto_renew_due(u, now):
+    if u["disabled_ts"]: return True
+    if u["expiry_ts"] and u["expiry_ts"] - now <= AUTO_BEFORE: return True
+    return bool(u["limit_bytes"]) and core.current_usage(u) >= AUTO_USED * u["limit_bytes"]
+
+def _auto_note(r, now, text, kb):
+    if now - r["auto_note_ts"] < AUTO_NOTE_EVERY: return
+    c = core.db(); c.execute("UPDATE shop_services SET auto_note_ts=? WHERE token=?", (now, r["token"])); c.commit(); c.close()
+    core.send(r["tg_id"], text, kb)
+
+def run_auto_renewals(now=None):
+    now = int(time.time()) if now is None else now
+    c = core.db()
+    rows = c.execute("SELECT s.token AS token, s.tg_id, s.plan_id, s.auto_note_ts, u.label, u.disabled_ts, u.expiry_ts, "
+                     "u.limit_bytes, u.used_bytes, u.usage_reset_bytes FROM shop_services s JOIN users u ON u.token=s.token "
+                     "WHERE s.auto_renew=1 AND u.pending_delete=0 AND u.frozen=0").fetchall()
+    c.close()
+    for r in rows:
+        if not auto_renew_due(r, now): continue
+        renew_btn = [{"text": "🔄 تمدید دستی", "callback_data": "c:renew:%s" % r["token"]}]
+        plan = get_plan(r["plan_id"]) if r["plan_id"] else None
+        if not plan or not plan["active"]:
+            _auto_note(r, now, "🔁 تمدید خودکار «%s» انجام نشد: پلن قبلی دیگه فروخته نمی‌شه.\nیه پلن جدید انتخاب کن 👇"
+                       % html.escape(r["label"]), [renew_btn]); continue
+        status, o, tok = wallet_buy(r["tg_id"], plan, r["token"], kind="auto")
+        if status == "ok":
+            deliver_message(o, tok, "🔁 <b>تمدید خودکار انجام شد</b> (%s از کیف پولت)" % toman(plan["price"]))
+        elif status == "funds":
+            short = max(TOPUP_MIN, -(-(plan["price"] - balance(r["tg_id"])) // 1000) * 1000)
+            _auto_note(r, now, "🔁 سرویس «%s» داره تموم می‌شه ولی موجودی کیف پولت برای تمدید خودکار کافی نیست.\n"
+                       "مبلغ تمدید: %s · موجودی: %s" % (html.escape(r["label"]), toman(plan["price"]), toman(balance(r["tg_id"]))),
+                       [[{"text": "➕ شارژ %s" % toman(short), "callback_data": "c:topup_amt:%d" % short}], renew_btn])
+
 # --- account ---
 def account_text(uid):
     cust = get_customer(uid)
     c = core.db()
     paid = c.execute("SELECT COUNT(*) FROM shop_orders WHERE tg_id=? AND status='approved'", (uid,)).fetchone()[0]
     c.close()
-    return ("👤 <b>حساب من</b>\n\n🙂 %s\n🆔 آیدی عددی: <code>%d</code>\n📅 عضویت: %s\n🛍 تعداد خرید: %s\n🎁 تست رایگان: %s"
-            % (html.escape(cust["first_name"] or "-"), uid, fa_date(cust["joined_ts"]), fa(paid),
+    return ("👤 <b>حساب من</b>\n\n🙂 %s\n🆔 آیدی عددی: <code>%d</code>\n📅 عضویت: %s\n💰 موجودی: %s\n🛍 تعداد خرید: %s\n🎁 تست رایگان: %s"
+            % (html.escape(cust["first_name"] or "-"), uid, fa_date(cust["joined_ts"]), toman(cust["wallet"]), fa(paid),
                ("گرفته‌شده" if cust["test_used_ts"] else "هنوز نگرفتی")))
 
 # --- connection guide ---
@@ -704,10 +909,17 @@ def customer_message(chat, uid, m):
     if text in {b for row in CUSTOMER_MENU for b in row}:
         set_state(uid, None)
         if text == B_BUY: send_plans(chat, uid); return
+        if text == B_WALLET: core.send(chat, *wallet_view(uid)); return
         if text == B_TEST: test_offer(chat, uid); return
         if text == B_ACCOUNT: core.send(chat, account_text(uid)); return
         if text == B_GUIDE: core.send(chat, GUIDE_TEXT, guide_kb()); return
         say(chat, SOON_TEXT); return
+    st = get_state(uid) or {}
+    if st.get("stage") == "topup_amount":
+        n = parse_amount(text)
+        if not n:
+            core.send(chat, "مبلغ رو به تومان بفرست، مثلاً <code>300000</code>:"); return
+        set_state(uid, None); start_topup(chat, uid, n); return
     customer_menu(chat)
 
 def customer_callback(chat, mid, uid, data, cbid, user=None):
@@ -732,14 +944,37 @@ def customer_callback(chat, mid, uid, data, cbid, user=None):
         return
     if parts[:2] == ["c", "plans"]:
         core.answer(cbid); send_plans(chat, uid, parts[2] if len(parts) == 3 else None, mid); return
-    if parts[:2] in (["c", "plan"], ["c", "pay"]) and len(parts) in (3, 4) and parts[2].isdigit():
+    if parts[:2] in (["c", "plan"], ["c", "pay"], ["c", "wpay"]) and len(parts) in (3, 4) and parts[2].isdigit():
         core.answer(cbid)
         if parts[1] == "pay": start_payment(chat, mid, uid, int(parts[2]), token); return
+        if parts[1] == "wpay": wallet_pay(chat, mid, uid, int(parts[2]), token); return
         plan = get_plan(int(parts[2]))
         if not plan or not plan["active"]: send_plans(chat, uid, token, mid); return
-        text, kb = invoice_view(plan, token); core.edit(chat, mid, text, kb); return
+        text, kb = invoice_view(plan, token, balance(uid)); core.edit(chat, mid, text, kb); return
     if parts[:2] == ["c", "cancel"] and len(parts) == 3 and parts[2].isdigit():
         core.answer(cbid); cancel_order(chat, mid, uid, int(parts[2])); return
+    if data == "c:wallet":
+        core.answer(cbid); core.edit(chat, mid, *wallet_view(uid)); return
+    if data == "c:topup":
+        core.answer(cbid); core.edit(chat, mid, *topup_view()); return
+    if data == "c:topup_custom":
+        core.answer(cbid); set_state(uid, {"stage": "topup_amount"})
+        core.edit(chat, mid, "✏️ مبلغ شارژ رو به تومان بفرست (حداقل %s):" % toman(TOPUP_MIN),
+                  [[{"text": "انصراف", "callback_data": "c:wallet"}]]); return
+    if parts[:2] == ["c", "topup_amt"] and len(parts) == 3 and parts[2].isdigit():
+        core.answer(cbid); start_topup(chat, uid, int(parts[2]), mid); return
+    if data == "c:tx":
+        core.answer(cbid); lines = tx_lines(uid, 30)
+        core.edit(chat, mid, "📜 <b>تراکنش‌ها</b> (آخرین ۳۰ مورد)\n\n" + ("\n".join(lines) or "هنوز تراکنشی نداری."),
+                  [[{"text": "بازگشت", "callback_data": "c:wallet"}]]); return
+    if parts[:2] == ["c", "auto"] and len(parts) == 3:
+        if not owned_service(uid, parts[2]): core.answer(cbid, "این سرویس پیدا نشد"); return
+        c = core.db()
+        c.execute("UPDATE shop_services SET auto_renew=1-auto_renew,auto_note_ts=0 WHERE token=? AND tg_id=?", (parts[2], uid))
+        c.commit(); on = c.execute("SELECT auto_renew FROM shop_services WHERE token=?", (parts[2],)).fetchone()[0]; c.close()
+        core.answer(cbid, "تمدید خودکار روشن شد؛ موقع تموم شدن، از کیف پولت تمدید می‌شه" if on else "تمدید خودکار خاموش شد")
+        core.tg("editMessageReplyMarkup", chat_id=chat, message_id=mid,
+                reply_markup={"inline_keyboard": link_kb(parts[2], auto_kb(parts[2]))}); return
     if data == "c:report":
         core.answer(cbid, SOON_TEXT); return
     core.answer(cbid)
@@ -806,7 +1041,7 @@ def shop_admin_kb():
             [{"text": "🧾 رسیدهای در انتظار (%s)" % fa(_count("SELECT COUNT(*) FROM shop_orders WHERE status='review'")),
               "callback_data": "sa:queue"}],
             [{"text": "📦 پلن‌ها", "callback_data": "sa:plans"}, {"text": "💳 کارت‌ها", "callback_data": "sa:cards"}],
-            [{"text": "🎁 تست رایگان", "callback_data": "sa:test"}],
+            [{"text": "👤 کاربران", "callback_data": "sa:users"}, {"text": "🎁 تست رایگان", "callback_data": "sa:test"}],
             [{"text": "🎧 پشتیبان‌ها", "callback_data": "sa:staff"}, {"text": "📜 لاگ کارها", "callback_data": "sa:log"}],
             [{"text": "💾 بکاپ الان", "callback_data": "sa:backup"},
              {"text": ("⏹ قطع بکاپ روزانه" if flag("backup_auto") else "🔁 بکاپ روزانه"), "callback_data": "sa:backup_auto"}],
@@ -873,6 +1108,36 @@ def cards_admin():
     return ("💳 <b>کارت‌ها</b>\nبرای هر سفارش یکی از کارت‌های فعال به‌صورت تصادفی نمایش داده می‌شود.\n"
             "روی کارت بزن تا فعال/غیرفعال شود." if cards else "💳 <b>کارت‌ها</b>\nهنوز کارتی اضافه نکردی؛ بدون کارت فعال، خرید ممکن نیست."), kb
 
+def find_customer(m, text):
+    tid = _forwarded_user_id(m)
+    t = to_ascii(text).strip()
+    if not tid and t.isdigit(): tid = int(t)
+    c = core.db()
+    if tid: r = c.execute("SELECT * FROM shop_customers WHERE tg_id=?", (tid,)).fetchone()
+    else: r = c.execute("SELECT * FROM shop_customers WHERE lower(username)=?", (t.lstrip("@").lower(),)).fetchone()
+    c.close(); return r
+
+def user_card(tid):
+    cust = get_customer(tid)
+    c = core.db()
+    services = c.execute("SELECT COUNT(*) FROM shop_services s JOIN users u ON u.token=s.token WHERE s.tg_id=?", (tid,)).fetchone()[0]
+    bought = c.execute("SELECT COUNT(*), COALESCE(SUM(price),0) FROM shop_orders WHERE tg_id=? AND status='approved' "
+                       "AND kind!='topup'", (tid,)).fetchone()
+    invited = c.execute("SELECT COUNT(*) FROM shop_customers WHERE referrer_id=?", (tid,)).fetchone()[0]
+    c.close()
+    text = ("👤 <b>%s</b>%s\n🆔 <code>%d</code>\n📅 عضویت: %s · آخرین بازدید: %s\n💰 موجودی: <b>%s</b>\n"
+            "📦 سرویس‌های زنده: %s · 🛍 خریدها: %s (%s)\n👥 دعوت‌شده‌ها: %s%s"
+            % (html.escape(cust["first_name"] or "-"), (" · @" + html.escape(cust["username"])) if cust["username"] else "",
+               tid, fa_date(cust["joined_ts"]), fa_date(cust["last_seen"]), toman(cust["wallet"]), fa(services),
+               fa(bought[0]), toman(bought[1]), fa(invited), "\n🚫 <b>مسدود</b>" if cust["blocked"] else ""))
+    kb = [[{"text": "➕ افزایش موجودی", "callback_data": "sa:uwal:%d:add" % tid},
+           {"text": "➖ کسر موجودی", "callback_data": "sa:uwal:%d:sub" % tid}],
+          [{"text": "✅ رفع مسدودی" if cust["blocked"] else "🚫 مسدود کن", "callback_data": "sa:ublock:%d" % tid}],
+          [{"text": "🔎 کاربر دیگر", "callback_data": "sa:users"}, {"text": "بازگشت", "callback_data": "sa:menu"}]]
+    return text, kb
+
+USERS_PROMPT = "👤 <b>کاربران</b>\nآیدی عددی یا @یوزرنیم مشتری را بفرست، یا یک پیام از او را فوروارد کن:"
+
 def log_text(limit=15):
     c = core.db(); rows = c.execute("SELECT * FROM shop_admin_log ORDER BY id DESC LIMIT ?", (limit,)).fetchall(); c.close()
     if not rows: return "📜 <b>لاگ کارها</b>\n\nهنوز کاری ثبت نشده."
@@ -901,7 +1166,22 @@ def admin_callback(chat, mid, uid, data, cbid):
         core.pending[chat] = {"stage": "sa_card_add"}; core.answer(cbid)
         core.edit(chat, mid, "➕ <b>کارت جدید</b>\nشمارهٔ ۱۶ رقمی و نام صاحب کارت را بفرست:\n<code>6037991234567890 فاطمه میرخلیلی</code>",
                   [[{"text": "انصراف", "callback_data": "sa:cards"}]]); return
+    if data == "sa:users":
+        core.pending[chat] = {"stage": "sa_user_find"}; core.answer(cbid)
+        core.edit(chat, mid, USERS_PROMPT, [[{"text": "بازگشت", "callback_data": "sa:menu"}]]); return
     parts = data.split(":")
+    if parts[1:2] == ["uwal"] and len(parts) == 4 and parts[2].isdigit() and parts[3] in ("add", "sub"):
+        tid = int(parts[2])
+        if not get_customer(tid): core.answer(cbid, "پیدا نشد"); return
+        core.pending[chat] = {"stage": "sa_wallet", "id": tid, "sign": 1 if parts[3] == "add" else -1}; core.answer(cbid)
+        core.send(chat, "%s موجودی <code>%d</code>: مبلغ (تومان) و بعد دلیل را بفرست:\n<code>50000 بازگشت وجه سفارش ۱۲</code>"
+                  % ("➕ افزایش" if parts[3] == "add" else "➖ کسر", tid)); return
+    if parts[1:2] == ["ublock"] and len(parts) == 3 and parts[2].isdigit():
+        tid = int(parts[2]); cust = get_customer(tid)
+        if not cust: core.answer(cbid, "پیدا نشد"); return
+        c = core.db(); c.execute("UPDATE shop_customers SET blocked=1-blocked WHERE tg_id=?", (tid,)); c.commit(); c.close()
+        log(uid, "unblock" if cust["blocked"] else "block", tid)
+        core.answer(cbid, "رفع مسدودی شد" if cust["blocked"] else "مسدود شد"); core.edit(chat, mid, *user_card(tid)); return
     if len(parts) == 3 and parts[2].isdigit():
         what, rid = parts[1], int(parts[2])
         if what in ("plan", "plan_act", "plan_pop", "plan_price", "plan_del"):
@@ -985,6 +1265,25 @@ def admin_message(chat, uid, m):
         return True
     if review_text(chat, uid, text): return True
     st = core.pending.get(chat)
+    if st and st.get("stage") == "sa_user_find":
+        cust = find_customer(m, text)
+        if not cust:
+            core.send(chat, "مشتری پیدا نشد. آیدی عددی، @یوزرنیم یا یک پیام فورواردی بفرست:",
+                      [[{"text": "بازگشت", "callback_data": "sa:menu"}]]); return True
+        core.pending.pop(chat, None); core.send(chat, *user_card(cust["tg_id"])); return True
+    if st and st.get("stage") == "sa_wallet":
+        words = text.split(maxsplit=1)
+        n = parse_amount(words[0]) if words else None
+        if not n or len(words) < 2:
+            core.send(chat, "مبلغ و دلیل را بفرست، مثلاً <code>50000 بازگشت وجه</code>:"); return True
+        tid, delta, note = st["id"], st["sign"] * n, words[1].strip()[:100]
+        bal = wallet_change(tid, delta, "admin", note=note, actor=uid)
+        if bal is None:
+            core.send(chat, "❌ موجودی مشتری کمتر از این مبلغ است."); return True
+        core.pending.pop(chat, None); log(uid, "wallet_adjust", tid, "%+d %s" % (delta, note))
+        core.send(tid, "💰 %s %s کیف پولت توسط پشتیبانی.\nدلیل: %s\nموجودی: <b>%s</b>"
+                  % (toman(abs(delta)), "اضافه شد به" if delta > 0 else "کم شد از", html.escape(note), toman(bal)))
+        core.send(chat, "✅ انجام شد.\n\n" + user_card(tid)[0], user_card(tid)[1]); return True
     if st and st.get("stage") == "sa_plan_add":
         nums = to_ascii(text).split()
         try:
@@ -1063,6 +1362,7 @@ def tick():
         for a in owner_ids(): send_backup(a)
     send_test_followups()
     expire_orders()
+    run_auto_renewals()
 
 def ticker():
     while True:
