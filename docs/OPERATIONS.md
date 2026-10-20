@@ -9,6 +9,7 @@ Production server: `ssh -p 49531 root@23.94.29.30` (512MB RAM). Live unit names 
 |------|-----|
 | Tail bot logs | `journalctl -u dpbot -f` |
 | Restart bot | `systemctl restart dpbot` (safe; users unaffected) |
+| Upgrade bot code | copy **both** `bot/bot.py` and `bot/shop.py` to `/opt/dpbot/` (flat, next to each other), then `cd /opt/dpbot && python3 -m py_compile bot.py shop.py && python3 -c "import shop"`, then `systemctl restart dpbot`. Only `bot.py` copied ⇒ `ImportError: shop` ⇒ restart loop. |
 | Restart xray | `systemctl restart xray` (users auto-resync on next poll) |
 | List links | bot → 📋 لیست لینک‌ها, or `sqlite3 /opt/dpbot/dpbot.db "SELECT label,used_bytes,max(used_bytes-usage_reset_bytes,0) AS current_used,limit_bytes,expiry_ts FROM users"` |
 | Change CDN dial addresses | bot → 🌐 آدرس‌های CDN → ✏️ ویرایش (live, no restart) |

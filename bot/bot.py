@@ -5,7 +5,7 @@
 # All config comes from bot.env (see config/bot.env.example). Single-file, runs under systemd.
 import os, re, sys, json, time, html, base64, socket, sqlite3, secrets, threading, subprocess, math, tempfile, ipaddress
 import uuid as uuidlib
-import urllib.request, urllib.parse, ssl
+import urllib.request, urllib.parse, urllib.error, ssl
 import http.cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -160,6 +160,13 @@ def tg(method, **params):
     try:
         with urllib.request.urlopen(urllib.request.Request(API_URL + method, data=data), timeout=60, context=SSLCTX) as r:
             return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        # Telegram answers 4xx with a JSON body ({"ok":false,"error_code":429,"parameters":{"retry_after":..}}):
+        # hand it back so callers can tell "blocked by user" / "flood wait" from a network failure.
+        try: body = json.loads(e.read().decode())
+        except Exception: body = {}
+        print("tg err", method, e, (body.get("description") or "")[:120], flush=True)
+        return body if isinstance(body, dict) and "ok" in body else {}
     except Exception as e:
         print("tg err", method, e, flush=True); return {}
 
@@ -2068,6 +2075,7 @@ def handle_update(up):
         if not is_admin(uid): shop.on_update(up); return   # customers + support staff
         chat = cq["message"]["chat"]["id"]; mid = cq["message"]["message_id"]
         if cq["data"].startswith(("sa:", "r:", "t:")): shop.admin_callback(chat, mid, uid, cq["data"], cq["id"]); return
+        shop.clear_admin_state(chat, uid)   # a legacy-menu tap means the admin left any shop prompt
         route_cb(chat, mid, cq["data"], cq["id"]); return
     if "message" not in up or "from" not in up["message"]: return
     m = up["message"]; uid = m["from"]["id"]; chat = m["chat"]["id"]; text = m.get("text", "")
@@ -2171,15 +2179,19 @@ def enforcer():
                 if reason:
                     if not cur["disabled_ts"]:                       # just ran out -> disable + notify, start 48h grace
                         if disable_user(cur["token"]):
-                            notify_admin("⏸ لینک «%s» غیرفعال شد (%s).\nتا ۴۸ ساعت قابل تمدید است؛ بعد از آن خودکار حذف می‌شود." % (cur["label"], reason))
+                            notify_admin("⏸ لینک «%s» غیرفعال شد (%s).\nتا ۴۸ ساعت قابل تمدید است؛ بعد از آن خودکار حذف می‌شود." % (html.escape(cur["label"] or ""), reason))
                         else:
-                            notify_admin("⚠️ غیرفعال‌سازی لینک «%s» در Xray کامل نشد؛ پنل دوباره تلاش می‌کند." % cur["label"])
+                            notify_admin("⚠️ غیرفعال‌سازی لینک «%s» در Xray کامل نشد؛ پنل دوباره تلاش می‌کند." % html.escape(cur["label"] or ""))
                     elif now - cur["disabled_ts"] >= GRACE_SECONDS:  # grace over -> delete + notify
+                        # Re-read first: a shop renewal may have landed since this pass took its snapshot.
+                        c = db(); fresh = c.execute("SELECT * FROM users WHERE token=?", (cur["token"],)).fetchone(); c.close()
+                        if not fresh or fresh["disabled_ts"] != cur["disabled_ts"] or not exhaust_reason(fresh, int(time.time())):
+                            continue
                         if delete_user(cur["token"]):
-                            notify_admin("🗑 لینک «%s» پس از ۴۸ ساعت مهلتِ تمدید، خودکار حذف شد." % cur["label"])
+                            notify_admin("🗑 لینک «%s» پس از ۴۸ ساعت مهلتِ تمدید، خودکار حذف شد." % html.escape(cur["label"] or ""))
                 elif cur["disabled_ts"]:                             # got renewed -> bring back live + notify
                     if reenable_user(cur["token"]):
-                        notify_admin("▶️ لینک «%s» تمدید شد و دوباره فعال شد." % cur["label"])
+                        notify_admin("▶️ لینک «%s» تمدید شد و دوباره فعال شد." % html.escape(cur["label"] or ""))
         except Exception as e:
             print("enforcer err", e, flush=True)
         time.sleep(POLL)

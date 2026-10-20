@@ -28,9 +28,14 @@
 
 ## Process responsibilities
 
-### bot.py (two threads)
-- **Main thread**: Telegram long-poll loop (`getUpdates`, 50s timeout) → `handle_update`
-  → inline-keyboard router `route_cb` and text-stage handler. Admin-gated by `is_admin`.
+### bot.py (three threads) + shop.py
+- **Main thread**: Telegram long-poll loop (`getUpdates`, 50s timeout) → `handle_update`.
+  Admins (`is_admin`) go to the inline-keyboard router `route_cb` / text-stage handler
+  (plus the shop's `sa:`/`r:`/`t:` admin callbacks); every other update goes to
+  `shop.on_update` (customers + support staff) in `bot/shop.py`, which must be deployed
+  next to `bot.py`.
+- **Shop ticker thread** (`shop.ticker`, every 60s): backup, test follow-ups, invoice expiry,
+  delivery retries, wallet auto-renewals, usage/expiry warnings, daily housekeeping.
 - **Enforcer thread** (`enforcer`, every `POLL_SECONDS`):
   1. If xray's `MainPID` changed (restart/reboot) → `resync_all()` re-adds every user
      to the running xray and rewrites their sub files.

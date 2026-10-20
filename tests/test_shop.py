@@ -26,7 +26,7 @@ class ShopCase(unittest.TestCase):
         bot.ADMIN_IDS.clear(); bot.ADMIN_IDS.add(ADMIN)
         self.calls, self.minted = [], []
         bot.tg = self.fake_tg
-        bot.pending.clear(); shop._hits.clear(); shop.review_pending.clear()
+        bot.pending.clear(); shop._hits.clear(); shop.review_pending.clear(); shop.ticket_pending.clear()
 
     def fake_tg(self, method, **p):
         self.calls.append((method, p))
@@ -35,18 +35,20 @@ class ShopCase(unittest.TestCase):
     def tearDown(self):
         bot.tg = self._tg; bot.DB_PATH = self._db
         bot.ADMIN_IDS.clear(); bot.ADMIN_IDS.update(self._admins)
-        bot.pending.clear(); shop._hits.clear(); shop.review_pending.clear()
+        bot.pending.clear(); shop._hits.clear(); shop.review_pending.clear(); shop.ticket_pending.clear()
         for suffix in ("", "-wal", "-shm"):
             try: os.unlink(self.path + suffix)
             except OSError: pass  # Windows may still hold the handle
 
     def fake_create(self, vol_gb, dur_days, label=None):
+        """Same row create_user() writes (0 = unlimited, expiry from NOW), minus the xray/sub-file side."""
         token = "tok%d" % len(self.minted)
         self.minted.append((vol_gb, dur_days, label))
+        now = int(time.time())
         c = bot.db()
-        c.execute("INSERT INTO users(token,uuid,email,label,limit_bytes,expiry_ts,created_ts,used_bytes) "
-                  "VALUES(?,?,?,?,?,?,?,0)", (token, "u", "u_" + token, label, int(vol_gb * bot.GB),
-                                              int(1e9 + dur_days * 86400), int(1e9)))
+        c.execute("INSERT INTO users(token,uuid,email,label,limit_bytes,expiry_ts,created_ts,used_bytes,usage_anchor) "
+                  "VALUES(?,?,?,?,?,?,?,0,0)", (token, "u", "u_" + token, label, int(vol_gb * bot.GB),
+                                                int(now + dur_days * 86400) if dur_days else 0, now))
         c.commit(); c.close()
         return token
 
@@ -59,6 +61,9 @@ class ShopCase(unittest.TestCase):
 
     def row(self, sql, args=()):
         c = bot.db(); r = c.execute(sql, args).fetchone(); c.close(); return r
+
+    def q(self, sql, args=()):
+        c = bot.db(); rows = c.execute(sql, args).fetchall(); c.close(); return rows
 
 
 
@@ -114,7 +119,7 @@ class ShopFoundationTests(ShopCase):
         self.assertEqual(self.last()["text"], bot.WELCOME)
         bot.handle_update(cb(ADMIN, "sa:maint"))
         self.assertFalse(shop.flag("maintenance"))
-        actions = [r["action"] for r in bot.db().execute("SELECT action FROM shop_admin_log ORDER BY id")]
+        actions = [r["action"] for r in self.q("SELECT action FROM shop_admin_log ORDER BY id")]
         self.assertEqual(actions, ["maintenance_on", "maintenance_off"])
 
     def test_blocked_customer_gets_blocked_message(self):
@@ -136,7 +141,7 @@ class ShopFoundationTests(ShopCase):
         self.assertIsNone(shop.get_customer(SUPPORT))       # staff are not counted as customers
         bot.handle_update(cb(ADMIN, "sa:staff_rm:%d" % SUPPORT))
         self.assertIsNone(shop.staff_role(SUPPORT))
-        actions = [r["action"] for r in bot.db().execute("SELECT action FROM shop_admin_log ORDER BY id")]
+        actions = [r["action"] for r in self.q("SELECT action FROM shop_admin_log ORDER BY id")]
         self.assertEqual(actions, ["staff_add", "staff_add", "staff_remove"])
 
     def test_admin_cannot_add_self_as_support(self):
@@ -229,7 +234,7 @@ class ShopFreeTestTests(ShopCase):
         self.assertEqual((shop.test_mb(), shop.test_hours()), (1024, 48))
         bot.handle_update(cb(ALICE, "c:test"))
         self.assertAlmostEqual(self.minted[0][0], 1.0); self.assertEqual(self.minted[0][1], 2)
-        actions = [r["action"] for r in bot.db().execute("SELECT action FROM shop_admin_log ORDER BY id")]
+        actions = [r["action"] for r in self.q("SELECT action FROM shop_admin_log ORDER BY id")]
         self.assertEqual(actions, ["test_off", "test_on", "test_mb", "test_hours"])
 
     def test_followup_once_near_end_and_feedback(self):
@@ -373,8 +378,8 @@ class ShopSalesTests(SalesCase):
         self.assertEqual(len([m for m, _ in self.calls if m == "editMessageCaption"]), 2)   # both copies updated
         bot.handle_update(cb(ADMIN, "r:ok:%d" % o["id"]))                                   # late second click
         self.assertEqual(len(self.minted), 1)
-        actions = [r["action"] for r in bot.db().execute("SELECT action FROM shop_admin_log WHERE action LIKE 'order%'")]
-        self.assertEqual(actions, ["order_approve"])
+        actions = [r["action"] for r in self.q("SELECT action FROM shop_admin_log WHERE action LIKE 'order%'")]
+        self.assertEqual(actions, ["order_approve", "order_deliver"])
 
     def test_duplicate_receipt_and_receipt_without_order(self):
         bot.handle_update(photo(ALICE))
@@ -408,13 +413,23 @@ class ShopSalesTests(SalesCase):
         bot.handle_update(cb(ADMIN, "r:ok:%d" % o["id"]))
         self.assertEqual(self.row("SELECT status,paid_amount FROM shop_orders")[:], ("approved", 200000))
 
-    def test_failed_delivery_returns_order_to_queue(self):
+    def test_failed_delivery_is_retried_not_requeued(self):
         o = self.buy(); bot.handle_update(photo(ALICE))
-        bot.create_user = lambda *a, **k: None
+        bot.create_user = lambda *a, **k: None                       # xray down: nothing can be minted
         bot.handle_update(cb(ADMIN, "r:ok:%d" % o["id"]))
-        self.assertEqual(self.row("SELECT status,decided_by FROM shop_orders")[:], ("review", None))
-        bot.handle_update(msg(ADMIN, shop.B_SHOP))
-        self.assertIn("(۱)", self.last()["reply_markup"]["inline_keyboard"][1][0]["text"])
+        self.assertEqual(self.row("SELECT status,decided_by,delivered_ts FROM shop_orders")[:], ("approved", ADMIN, None))
+        self.assertTrue(any("ساخت سرویس الان انجام نشد" in t for t in self.texts(ADMIN)))
+        bot.handle_update(cb(ADMIN, "r:ok:%d" % o["id"]))             # a second click cannot re-approve
+        self.assertEqual(self.minted, [])
+        shop.retry_deliveries(now=int(time.time()) + 10)              # too early: nothing yet
+        self.assertEqual(self.minted, [])
+        bot.create_user = self.fake_create
+        shop.retry_deliveries(now=int(time.time()) + shop.RETRY_AFTER + 1)
+        self.assertEqual(len(self.minted), 1)
+        self.assertIsNotNone(self.row("SELECT delivered_ts FROM shop_orders")["delivered_ts"])
+        self.assertTrue(any(bot.sub_url("tok0") in t for t in self.texts(ALICE)))
+        shop.retry_deliveries(now=int(time.time()) + shop.RETRY_AFTER + 1)   # idempotent
+        self.assertEqual(len(self.minted), 1)
 
     def test_expiry_and_late_receipt(self):
         o = self.buy()
@@ -480,7 +495,7 @@ class ShopWalletTests(SalesCase):
         return self.row("SELECT * FROM shop_orders WHERE id=?", (o["id"],))
 
     def ledger(self, uid=ALICE):
-        return [tuple(r) for r in bot.db().execute("SELECT kind, delta, balance FROM shop_wallet_tx WHERE tg_id=? ORDER BY id", (uid,))]
+        return [tuple(r) for r in self.q("SELECT kind, delta, balance FROM shop_wallet_tx WHERE tg_id=? ORDER BY id", (uid,))]
 
     def test_topup_by_card_credits_what_was_paid(self):
         bot.handle_update(msg(ALICE, shop.B_WALLET))
@@ -520,7 +535,11 @@ class ShopWalletTests(SalesCase):
         o = self.row("SELECT * FROM shop_orders ORDER BY id DESC")
         self.assertEqual((o["pay_method"], o["status"], o["token"]), ("wallet", "approved", "tok0"))
         self.assertTrue(any(bot.sub_url("tok0") in t for t in self.texts(ALICE)))
-        bot.handle_update(cb(ALICE, "c:wpay:%d" % self.plan["id"]))  # not enough left
+        bot.handle_update(cb(ALICE, "c:wpay:%d" % self.plan["id"]))  # right away: a double tap, not a new order
+        self.assertIn("چند لحظه پیش", self.last("editMessageText")["text"])
+        shop.DUP_WINDOW, dw = 0, shop.DUP_WINDOW
+        try: bot.handle_update(cb(ALICE, "c:wpay:%d" % self.plan["id"]))  # later: a real attempt, not enough left
+        finally: shop.DUP_WINDOW = dw
         self.assertIn("کافی نیست", self.last("editMessageText")["text"])
         self.assertEqual(len(self.minted), 1)
 
@@ -571,12 +590,13 @@ class ShopWalletTests(SalesCase):
         self.topup(200000)
         bot.handle_update(cb(ALICE, "c:wpay:%d" % self.plan["id"]))
         bot.handle_update(cb(ALICE, "c:auto:tok0"))
-        c = bot.db(); c.execute("UPDATE users SET disabled_ts=1 WHERE token='tok0'"); c.commit(); c.close()
+        now = int(time.time())
+        c = bot.db(); c.execute("UPDATE users SET expiry_ts=? WHERE token='tok0'", (now + 600,)); c.commit(); c.close()
         self.calls.clear()
-        shop.run_auto_renewals(now=10**9); shop.run_auto_renewals(now=10**9 + 3600)
+        shop.run_auto_renewals(now=now); shop.run_auto_renewals(now=now + 3600)
         self.assertEqual(len(self.texts(ALICE)), 1)
         self.assertIn("کافی نیست", self.texts(ALICE)[0])
-        shop.run_auto_renewals(now=10**9 + shop.AUTO_NOTE_EVERY + 1)
+        shop.run_auto_renewals(now=now + shop.AUTO_NOTE_EVERY + 1)
         self.assertEqual(len(self.texts(ALICE)), 2)
 
     def test_others_cannot_toggle_auto_renew(self):
@@ -601,7 +621,7 @@ class ShopWalletTests(SalesCase):
         bot.handle_update(cb(ADMIN, "sa:ublock:%d" % ALICE))
         bot.handle_update(msg(ALICE, shop.B_WALLET))
         self.assertEqual(self.last()["text"], shop.BLOCKED_TEXT)
-        actions = [r["action"] for r in bot.db().execute("SELECT action FROM shop_admin_log WHERE action IN ('wallet_adjust','block')")]
+        actions = [r["action"] for r in self.q("SELECT action FROM shop_admin_log WHERE action IN ('wallet_adjust','block')")]
         self.assertEqual(actions, ["wallet_adjust", "block"])
 
 
@@ -721,7 +741,7 @@ class ShopServicesTests(SalesCase):
         bot.handle_update(cb(ADMIN, "sa:outage")); bot.handle_update(cb(ADMIN, "sa:outage_end"))
         self.assertIn("برطرف شد", self.texts(ALICE)[-1])
         self.assertFalse(shop.setting("outage"))
-        actions = [r["action"] for r in bot.db().execute("SELECT action FROM shop_admin_log WHERE action LIKE 'outage%'")]
+        actions = [r["action"] for r in self.q("SELECT action FROM shop_admin_log WHERE action LIKE 'outage%'")]
         self.assertEqual(actions, ["outage_start", "outage_end"])
 
 
@@ -735,8 +755,12 @@ class ShopReferralTests(SalesCase):
     def gift(self, uid, amount):
         bot.handle_update(cb(ADMIN, "sa:uwal:%d:add" % uid)); bot.handle_update(msg(ADMIN, "%d هدیه" % amount))
 
+    def alice_buys(self):
+        """Rewards only ever go to a paying customer, so most tests make Alice one first."""
+        self.gift(ALICE, 150000); bot.handle_update(cb(ALICE, "c:wpay:%d" % self.plan["id"])); self.calls.clear()
+
     def ledger(self, uid):
-        return [tuple(r) for r in bot.db().execute("SELECT kind, delta FROM shop_wallet_tx WHERE tg_id=? ORDER BY id", (uid,))]
+        return [tuple(r) for r in self.q("SELECT kind, delta FROM shop_wallet_tx WHERE tg_id=? AND kind='referral' ORDER BY id", (uid,))]
 
     def test_invite_page_link_share_and_stats(self):
         bot.handle_update(msg(ALICE, shop.B_INVITE))
@@ -768,7 +792,13 @@ class ShopReferralTests(SalesCase):
         bot.handle_update(msg(ALICE, shop.B_BUY))                   # not invited: full price
         self.assertNotIn("تخفیف", self.last()["text"])
 
+    def test_inviter_who_never_bought_gets_no_reward(self):
+        o = self.buy(BOB); bot.handle_update(photo(BOB)); bot.handle_update(cb(ADMIN, "r:ok:%d" % o["id"]))
+        self.assertEqual(self.ledger(ALICE), [])                   # Alice has not bought anything herself
+        self.assertEqual((o["price"], o["discount"]), (135000, 15000))   # Bob's discount still applies
+
     def test_inviter_rewarded_once_after_first_real_purchase(self):
+        self.alice_buys()
         bot.handle_update(cb(BOB, "c:test"))                        # a free test is not a purchase
         self.assertEqual(self.ledger(ALICE), [])
         o = self.buy(BOB); bot.handle_update(photo(BOB)); bot.handle_update(cb(ADMIN, "r:ok:%d" % o["id"]))
@@ -780,7 +810,7 @@ class ShopReferralTests(SalesCase):
         self.assertIn("خریدارها: ۱", self.last()["text"]); self.assertIn("۱۳٬۵۰۰ تومان", self.last()["text"])
 
     def test_wallet_first_purchase_also_rewards_and_discounts(self):
-        self.gift(BOB, 135000)
+        self.alice_buys(); self.gift(BOB, 135000)
         bot.handle_update(cb(BOB, "c:plan:%d" % self.plan["id"]))
         self.assertEqual(self.last("editMessageText")["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
                          "c:wpay:%d" % self.plan["id"])
@@ -801,11 +831,11 @@ class ShopReferralTests(SalesCase):
         bot.handle_update(cb(ADMIN, "sa:ref_reward:20")); bot.handle_update(cb(ADMIN, "sa:ref_discount:0"))
         bot.handle_update(cb(ADMIN, "sa:ref_reward:7"))           # not a choice
         self.assertEqual((shop.ref_reward_pct(), shop.ref_discount_pct()), (20, 0))
-        o = self.buy(BOB)
+        self.alice_buys(); o = self.buy(BOB)
         self.assertEqual(o["price"], 150000)
         bot.handle_update(photo(BOB)); bot.handle_update(cb(ADMIN, "r:ok:%d" % o["id"]))
         self.assertEqual(self.ledger(ALICE), [("referral", 30000)])
-        actions = [r["action"] for r in bot.db().execute("SELECT action FROM shop_admin_log WHERE action LIKE 'ref_%'")]
+        actions = [r["action"] for r in self.q("SELECT action FROM shop_admin_log WHERE action LIKE 'ref_%'")]
         self.assertEqual(actions, ["ref_reward", "ref_discount"])
 
 
@@ -891,7 +921,7 @@ class ShopTicketTests(SalesCase):
         self.assertEqual(shop.get_state(ALICE), {"stage": "tk_reply", "id": t["id"]})
         bot.handle_update(cb(ALICE, "c:tkr:%d:1" % t["id"]))         # rating is given once
         self.assertEqual(self.row("SELECT rating FROM shop_tickets")["rating"], 0)
-        msgs = [tuple(r) for r in bot.db().execute("SELECT role, text FROM shop_ticket_msgs ORDER BY id")]
+        msgs = [tuple(r) for r in self.q("SELECT role, text FROM shop_ticket_msgs ORDER BY id")]
         self.assertEqual([r for r, _ in msgs], ["customer", "staff", "customer", "staff"])
 
     def test_customer_closes_when_solved(self):
@@ -937,3 +967,247 @@ class ShopTicketTests(SalesCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ShopHardeningTests(SalesCase):
+    """Review findings of PR #1: money can only move once, staff stay in their lane, state never leaks."""
+
+    def set_link(self, token, **cols):
+        c = bot.db()
+        c.execute("UPDATE users SET %s WHERE token=?" % ",".join("%s=?" % k for k in cols), (*cols.values(), token))
+        c.commit(); c.close()
+
+    def own(self, uid=ALICE):
+        bot.handle_update(cb(ADMIN, "sa:uwal:%d:add" % uid)); bot.handle_update(msg(ADMIN, "150000 هدیه"))
+        bot.handle_update(cb(uid, "c:wpay:%d" % self.plan["id"]))
+        return self.row("SELECT token FROM shop_services WHERE tg_id=? ORDER BY created_ts DESC", (uid,))["token"]
+
+    def test_parse_amount_rejects_decimals_and_junk(self):
+        for ok, n in (("150000", 150000), ("150,000", 150000), ("۱۵۰٬۰۰۰", 150000), ("150.000 تومان", 150000), ("1,500,000", 1500000)):
+            self.assertEqual(shop.parse_amount(ok), n, ok)
+        for bad in ("1.5", "150000.5", "100k", "1,5", "-5000", "0", "1 میلیون", "", "10000000000"):
+            self.assertIsNone(shop.parse_amount(bad), bad)
+        self.assertIsNone(shop._int("²")); self.assertIsNone(shop._int("1" * 20)); self.assertEqual(shop._int("۱۲"), 12)
+        bot.handle_update(msg(BOB, "/start ref_²"))                  # must not crash the update
+        self.assertIsNotNone(shop.get_customer(BOB))
+
+    def test_support_cannot_change_or_approve_a_corrected_amount(self):
+        o = self.buy(); bot.handle_update(photo(ALICE))
+        bot.handle_update(cb(SUPPORT, "r:amt:%d" % o["id"])); bot.handle_update(msg(SUPPORT, "999999"))
+        self.assertIsNone(self.row("SELECT paid_amount FROM shop_orders")["paid_amount"])
+        bot.handle_update(cb(ADMIN, "r:amt:%d" % o["id"])); bot.handle_update(msg(ADMIN, "9999999"))   # > 2x invoice
+        self.assertIsNone(self.row("SELECT paid_amount FROM shop_orders")["paid_amount"])
+        self.assertIn("برابر فاکتور", self.texts(ADMIN)[-1])
+        bot.handle_update(msg(ADMIN, "200000"))
+        self.assertEqual(self.row("SELECT paid_amount FROM shop_orders")["paid_amount"], 200000)
+        bot.handle_update(cb(SUPPORT, "r:ok:%d" % o["id"]))          # corrected -> owner only
+        self.assertEqual(self.row("SELECT status FROM shop_orders")["status"], "review")
+        bot.handle_update(cb(ADMIN, "r:ok:%d" % o["id"]))
+        self.assertEqual(self.row("SELECT status FROM shop_orders")["status"], "approved")
+        self.assertEqual(shop.balance(ALICE), 50000)                  # the overpay, bounded by the cap
+
+    def test_support_can_still_approve_an_untouched_invoice(self):
+        o = self.buy(); bot.handle_update(photo(ALICE))
+        bot.handle_update(cb(SUPPORT, "r:ok:%d" % o["id"]))
+        self.assertEqual(self.row("SELECT status FROM shop_orders")["status"], "approved")
+
+    def test_double_tap_wallet_purchase_buys_once(self):
+        bot.handle_update(cb(ADMIN, "sa:uwal:%d:add" % ALICE)); bot.handle_update(msg(ADMIN, "400000 هدیه"))
+        bot.handle_update(cb(ALICE, "c:wpay:%d" % self.plan["id"]))
+        bot.handle_update(cb(ALICE, "c:wpay:%d" % self.plan["id"]))
+        self.assertEqual(len(self.minted), 1); self.assertEqual(shop.balance(ALICE), 250000)
+        self.assertIn("چند لحظه پیش", self.last("editMessageText")["text"])
+
+    def test_renewal_is_delivered_once_even_if_a_later_step_fails(self):
+        tok = self.own(); before = self.row("SELECT * FROM users WHERE token=?", (tok,))
+        o = self.buy(token=tok); bot.handle_update(photo(ALICE))
+        real = shop.reset_warnings
+        shop.reset_warnings = lambda token: (_ for _ in ()).throw(RuntimeError("db locked"))
+        try: bot.handle_update(cb(ADMIN, "r:ok:%d" % o["id"]))
+        finally: shop.reset_warnings = real
+        o = self.row("SELECT * FROM shop_orders WHERE id=?", (o["id"],))
+        self.assertEqual(o["status"], "approved"); self.assertIsNotNone(o["delivered_ts"])   # the extension is committed
+        after = self.row("SELECT * FROM users WHERE token=?", (tok,))
+        self.assertEqual(after["limit_bytes"] - before["limit_bytes"], 30 * bot.GB)
+        shop.retry_deliveries(now=int(time.time()) + shop.RETRY_AFTER + 1); bot.handle_update(cb(ADMIN, "r:ok:%d" % o["id"]))
+        self.assertEqual(self.row("SELECT limit_bytes FROM users WHERE token=?", (tok,))["limit_bytes"], after["limit_bytes"])
+        self.assertEqual(len(self.minted), 1)
+
+    def test_auto_renew_never_charges_twice_for_a_link_that_stays_disabled(self):
+        tok = self.own(); bot.handle_update(cb(ALICE, "c:auto:%s" % tok))
+        bot.handle_update(cb(ADMIN, "sa:uwal:%d:add" % ALICE)); bot.handle_update(msg(ADMIN, "450000 هدیه"))
+        now = int(time.time())
+        self.set_link(tok, expiry_ts=now - 10, disabled_ts=now - 5)   # expired and disabled; xray never re-adds it in tests
+        shop.run_auto_renewals(now=now)
+        self.assertEqual(shop.balance(ALICE), 300000)
+        for dt in (60, 120, 3600, 7200):
+            shop.run_auto_renewals(now=now + dt)
+        self.assertEqual(shop.balance(ALICE), 300000)                 # one renewal, however often the ticker runs
+        self.assertEqual(self.row("SELECT COUNT(*) n FROM shop_orders WHERE kind='renew'")["n"], 1)
+        u = self.row("SELECT * FROM users WHERE token=?", (tok,))
+        self.assertGreater(u["expiry_ts"], now + 29 * 86400)
+
+    def test_blocked_customers_are_not_auto_renewed(self):
+        tok = self.own(); bot.handle_update(cb(ALICE, "c:auto:%s" % tok))
+        bot.handle_update(cb(ADMIN, "sa:uwal:%d:add" % ALICE)); bot.handle_update(msg(ADMIN, "150000 هدیه"))
+        bot.handle_update(cb(ADMIN, "sa:ublock:%d" % ALICE))
+        now = int(time.time()); self.set_link(tok, expiry_ts=now + 60)
+        shop.run_auto_renewals(now=now)
+        self.assertEqual(shop.balance(ALICE), 150000)
+
+    def test_renewal_keeps_unlimited_and_covers_overshoot(self):
+        tok = self.own()
+        self.set_link(tok, limit_bytes=0)                             # admin made it unlimited
+        bot.handle_update(cb(ADMIN, "sa:uwal:%d:add" % ALICE)); bot.handle_update(msg(ADMIN, "300000 هدیه"))
+        bot.handle_update(cb(ALICE, "c:wpay:%d:%s" % (self.plan["id"], tok)))
+        self.assertEqual(self.row("SELECT limit_bytes FROM users WHERE token=?", (tok,))["limit_bytes"], 0)
+        self.set_link(tok, limit_bytes=10 * bot.GB, used_bytes=12 * bot.GB)   # overshot by 2GB
+        bot.handle_update(cb(ALICE, "c:renew:%s" % tok)); time.sleep(0)
+        shop.DUP_WINDOW, dw = 0, shop.DUP_WINDOW
+        try: bot.handle_update(cb(ALICE, "c:wpay:%d:%s" % (self.plan["id"], tok)))
+        finally: shop.DUP_WINDOW = dw
+        self.assertEqual(self.row("SELECT limit_bytes FROM users WHERE token=?", (tok,))["limit_bytes"], 42 * bot.GB)
+
+    def test_link_being_deleted_cannot_be_renewed(self):
+        tok = self.own(); self.set_link(tok, pending_delete=1)
+        bot.handle_update(cb(ALICE, "c:renew:%s" % tok))
+        self.assertIn("دیگه وجود نداره", self.last()["text"])
+        bot.handle_update(msg(ALICE, shop.B_SERVICES))
+        self.assertIn("هنوز سرویسی نداری", self.last()["text"])
+
+    def test_receipt_photo_wins_over_a_pending_ticket_prompt(self):
+        bot.handle_update(cb(ALICE, "c:report")); bot.handle_update(cb(ALICE, "c:rep_go"))
+        bot.handle_update(cb(ALICE, "c:rs:-")); bot.handle_update(cb(ALICE, "c:rc:pay"))
+        self.assertEqual(shop.get_state(ALICE)["stage"], "tk_text")
+        o = self.buy(); bot.handle_update(photo(ALICE))
+        self.assertEqual(self.row("SELECT status FROM shop_orders WHERE id=?", (o["id"],))["status"], "review")
+        self.assertEqual(self.row("SELECT COUNT(*) n FROM shop_tickets")["n"], 0)
+        self.assertIsNone(shop.get_state(ALICE))
+
+    def test_receipt_for_several_old_invoices_asks_which(self):
+        o1 = self.buy(); shop.expire_orders(now=int(time.time()) + shop.ORDER_TTL + 1)
+        o2 = self.buy(); shop.expire_orders(now=int(time.time()) + shop.ORDER_TTL + 1)
+        bot.handle_update(photo(ALICE))
+        kb = self.last()["reply_markup"]["inline_keyboard"]
+        self.assertEqual([r[0]["callback_data"] for r in kb], ["c:rcpt:%d" % o2["id"], "c:rcpt:%d" % o1["id"]])
+        bot.handle_update(cb(ALICE, "c:rcpt:%d" % o1["id"]))
+        self.assertEqual(self.row("SELECT status FROM shop_orders WHERE id=?", (o1["id"],))["status"], "review")
+        self.assertEqual(self.row("SELECT status FROM shop_orders WHERE id=?", (o2["id"],))["status"], "expired")
+
+    def test_rejected_invoice_accepts_a_clearer_receipt(self):
+        o = self.buy(); bot.handle_update(photo(ALICE)); bot.handle_update(cb(ADMIN, "r:nor:%d:1" % o["id"]))
+        bot.handle_update(photo(ALICE, "clear"))
+        self.assertEqual(self.row("SELECT status,note FROM shop_orders WHERE id=?", (o["id"],))[:], ("review", None))
+
+    def test_stale_staff_prompt_never_eats_a_command_or_expires(self):
+        bot.handle_update(cb(ALICE, "c:report")); bot.handle_update(cb(ALICE, "c:rep_go"))
+        bot.handle_update(cb(ALICE, "c:rs:-")); bot.handle_update(cb(ALICE, "c:rc:other")); bot.handle_update(msg(ALICE, "سلام"))
+        tid = self.row("SELECT id FROM shop_tickets")["id"]
+        bot.handle_update(cb(ADMIN, "t:r:%d" % tid)); bot.handle_update(msg(ADMIN, "/start"))
+        self.assertEqual(self.row("SELECT COUNT(*) n FROM shop_ticket_msgs WHERE role='staff'")["n"], 0)
+        self.assertEqual(shop.ticket_pending, {})
+        bot.handle_update(cb(ADMIN, "t:r:%d" % tid)); bot.handle_update(cb(ADMIN, "list"))   # legacy menu tap
+        self.assertEqual(shop.ticket_pending, {})
+        bot.handle_update(cb(ADMIN, "t:r:%d" % tid)); shop.ticket_pending[ADMIN]["ts"] -= shop.PENDING_TTL + 1
+        bot.handle_update(msg(ADMIN, "دیر شد"))
+        self.assertEqual(self.row("SELECT COUNT(*) n FROM shop_ticket_msgs WHERE role='staff'")["n"], 0)
+        o = self.buy(); bot.handle_update(photo(ALICE))
+        bot.handle_update(cb(ADMIN, "r:nox:%d" % o["id"])); bot.handle_update(msg(ADMIN, "/admin"))
+        self.assertEqual(self.row("SELECT status FROM shop_orders WHERE id=?", (o["id"],))["status"], "review")
+        self.assertIn("/a/login/", self.last()["text"])              # and /admin itself still works
+
+    def test_admin_keyboard_has_web_login_and_queue_buttons(self):
+        bot.handle_update(msg(ADMIN, "/start"))
+        buttons = [b["text"] for row in [p for m, p in self.calls if m == "sendMessage"][-2]["reply_markup"]["keyboard"] for b in row]
+        self.assertEqual(buttons, [shop.B_LINKS, shop.B_SHOP, shop.B_RECEIPTS, shop.B_TICKETS, shop.B_WEB])
+        bot.handle_update(msg(ADMIN, shop.B_WEB)); self.assertIn("/a/login/", self.last()["text"])
+        bot.handle_update(msg(ADMIN, shop.B_RECEIPTS)); self.assertIn("رسیدی در انتظار", self.last()["text"])
+        bot.handle_update(cb(ADMIN, "sa:users")); bot.handle_update(msg(ADMIN, "/admin"))
+        self.assertIn("/a/login/", self.last()["text"])              # a shop prompt never swallows a command
+
+    def test_backup_contains_no_admin_sessions(self):
+        bot.meta_set("sess_abc", '{"csrf":"x"}'); bot.meta_set("clean_ips", "1.1.1.1")
+        data = shop.make_backup()
+        fd, path = tempfile.mkstemp(suffix=".db"); os.close(fd)
+        try:
+            with open(path, "wb") as f: f.write(data)
+            c = sqlite3.connect(path)
+            keys = [r[0] for r in c.execute("SELECT k FROM meta")]
+            self.assertNotIn("sess_abc", keys); self.assertIn("clean_ips", keys)
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM shop_plans").fetchone()[0], 1)
+            c.close()
+        finally:
+            os.unlink(path)
+        self.assertNotIn(b"sess_abc", data)                           # VACUUM really dropped the page
+
+    def test_ticket_card_stays_under_telegram_limit_and_caps_messages(self):
+        bot.handle_update(cb(ALICE, "c:report")); bot.handle_update(cb(ALICE, "c:rep_go"))
+        bot.handle_update(cb(ALICE, "c:rs:-")); bot.handle_update(cb(ALICE, "c:rc:other")); bot.handle_update(msg(ALICE, "x" * 3000))
+        tid = self.row("SELECT id FROM shop_tickets")["id"]
+        for i in range(shop.MAX_TICKET_MSGS + 5):
+            shop._hits.clear()   # the per-user flood limit is a separate guard; this test is about the DB caps
+            shop.set_state(ALICE, {"stage": "tk_reply", "id": tid}); bot.handle_update(msg(ALICE, "y" * 3000))
+        self.assertLessEqual(self.row("SELECT COUNT(*) n FROM shop_ticket_msgs")["n"], shop.MAX_DAILY_MSGS)
+        self.assertIn("زیادی فرستادی", self.texts(ALICE)[-1])
+        card = shop.ticket_card(shop.get_ticket(tid), history=10)
+        self.assertLessEqual(len(card), 4096)
+        self.assertEqual(self.row("SELECT MAX(LENGTH(text)) n FROM shop_ticket_msgs")["n"], shop.MSG_CHARS)
+
+    def test_open_ticket_cap_holds_on_a_stale_keyboard(self):
+        for _ in range(shop.MAX_OPEN_TICKETS):
+            bot.handle_update(cb(ALICE, "c:report")); bot.handle_update(cb(ALICE, "c:rep_go"))
+            bot.handle_update(cb(ALICE, "c:rs:-")); bot.handle_update(cb(ALICE, "c:rc:other")); bot.handle_update(msg(ALICE, "مشکل"))
+        bot.handle_update(cb(ALICE, "c:rs:-")); bot.handle_update(cb(ALICE, "c:rc:other")); bot.handle_update(msg(ALICE, "چهارمی"))
+        self.assertEqual(self.row("SELECT COUNT(*) n FROM shop_tickets")["n"], shop.MAX_OPEN_TICKETS)
+
+    def test_closed_ticket_is_not_reopened_by_a_stale_customer_state(self):
+        bot.handle_update(cb(ALICE, "c:report")); bot.handle_update(cb(ALICE, "c:rep_go"))
+        bot.handle_update(cb(ALICE, "c:rs:-")); bot.handle_update(cb(ALICE, "c:rc:other")); bot.handle_update(msg(ALICE, "مشکل"))
+        tid = self.row("SELECT id FROM shop_tickets")["id"]
+        shop.set_state(ALICE, {"stage": "tk_reply", "id": tid})
+        bot.handle_update(cb(ADMIN, "t:x:%d" % tid))
+        bot.handle_update(msg(ALICE, "هنوز هستم"))
+        self.assertEqual(self.row("SELECT status FROM shop_tickets")["status"], "closed")
+        bot.handle_update(cb(ALICE, "c:tkr:%d:0" % tid))             # "not solved" on a closed ticket reopens it
+        self.assertEqual(self.row("SELECT status FROM shop_tickets")["status"], "open")
+
+    def test_staff_cannot_be_blocked_before_removal(self):
+        bot.handle_update(msg(SUPPORT, "/start"))
+        c = bot.db(); c.execute("INSERT OR IGNORE INTO shop_customers(tg_id,first_name,joined_ts) VALUES(?,?,0)", (SUPPORT, "s")); c.commit(); c.close()
+        bot.handle_update(cb(ADMIN, "sa:ublock:%d" % SUPPORT))
+        self.assertEqual(self.row("SELECT blocked FROM shop_customers WHERE tg_id=?", (SUPPORT,))["blocked"], 0)
+
+    def test_plan_add_rejects_nan_and_duplicate_cards(self):
+        bot.handle_update(cb(ADMIN, "sa:plan_add")); bot.handle_update(msg(ADMIN, "nan 30 150000"))
+        self.assertEqual(self.row("SELECT COUNT(*) n FROM shop_plans")["n"], 1)
+        bot.handle_update(cb(ADMIN, "sa:card_add")); bot.handle_update(msg(ADMIN, "6037991234567890 کسی دیگر"))
+        self.assertEqual(self.row("SELECT COUNT(*) n FROM shop_cards")["n"], 1)
+        self.assertIn("قبلاً اضافه شده", self.last()["text"])
+
+    def test_services_tap_does_not_query_xray(self):
+        tok = self.own()
+        bot.refresh_usage = lambda token: (_ for _ in ()).throw(AssertionError("xray must not be called"))
+        bot.handle_update(cb(ALICE, "c:svc:%s" % tok))
+        self.assertIn(bot.sub_url(tok), self.last("editMessageText")["text"])
+
+    def test_housekeeping_turns_off_auto_renew_of_deleted_links(self):
+        tok = self.own(); bot.handle_update(cb(ALICE, "c:auto:%s" % tok))
+        c = bot.db(); c.execute("DELETE FROM users WHERE token=?", (tok,)); c.commit(); c.close()
+        self.calls.clear(); shop.housekeeping()
+        self.assertEqual(self.row("SELECT auto_renew FROM shop_services WHERE token=?", (tok,))["auto_renew"], 0)
+        self.assertIn("حذف شد", self.texts(ALICE)[-1])
+        shop.housekeeping(); self.assertEqual(len(self.texts(ALICE)), 1)   # once a day
+
+    def test_broadcast_reports_failures_and_waits_on_flood(self):
+        self.own(ALICE); bot.handle_update(msg(BOB, "/start")); self.own(BOB)
+        slept, real_sleep = [], time.sleep
+        def flaky(method, **p):
+            self.calls.append((method, p))
+            if method == "sendMessage" and p.get("chat_id") == BOB and not any(c == "retried" for c in slept):
+                slept.append("retried"); return {"ok": False, "error_code": 429, "parameters": {"retry_after": 1}}
+            if method == "sendMessage" and p.get("chat_id") == ALICE: return {"ok": False, "error_code": 403}
+            return {"ok": True, "result": {"message_id": 1}}
+        bot.tg = flaky; time.sleep = lambda s: slept.append(s)
+        try: sent, failed = shop.broadcast([ALICE, BOB], "hi", pause=0)
+        finally: time.sleep = real_sleep
+        self.assertEqual((sent, failed), (1, 1)); self.assertIn(1, slept)

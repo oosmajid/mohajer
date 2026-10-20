@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Click through the Telegram shop on a laptop - no VPS, no xray, no cloudflared.
 
-The real bot code runs against a real (TEST) Telegram bot, but every xray call is
-replaced by a no-op, so links, credentials and subscription files are created in a
-local sqlite DB and never connect. Use a separate bot from @BotFather - NEVER the
-production token or database.
+The real bot code runs against a real (TEST) Telegram bot, but the xray user/resync
+calls are replaced by no-ops, so links, credentials and subscription files are created
+in a local sqlite DB and never connect (usage reads still shell out to `xray` and simply
+fail when it is not installed). Use a separate bot from @BotFather - NEVER the production
+token or database; the runner refuses paths outside <repo>/dev and the production token.
 
     cp config/dev.env.example dev/dev.env      # then put the test bot token + your id in it
     python scripts/dev_shop.py                 # run the bot (Ctrl+C to stop)
@@ -29,6 +30,19 @@ import bot  # noqa: E402  (reads DPBOT_ENV at import)
 
 if bot.ENV.get("DEV_SHOP") != "1":
     sys.exit("refusing to run: %s must contain DEV_SHOP=1 (this runner fakes xray)" % os.environ["DPBOT_ENV"])
+# The runner fakes xray and steals getUpdates, so it must never see a production DB, sub dir or token:
+# every path has to live under <repo>/dev and the token must not be the one in a real bot.env.
+DEV_DIR = os.path.join(ROOT, "dev")
+for what, path in (("DB", bot.DB_PATH), ("SUB_DIR", bot.SUB_DIR)):
+    if not os.path.realpath(path).startswith(DEV_DIR + os.sep):
+        sys.exit("refusing to run: %s=%s is outside %s (would touch a real install)" % (what, path, DEV_DIR))
+for prod_env in ("/opt/dpbot/bot.env", "/opt/mohajer/bot.env"):
+    try:
+        with open(prod_env) as f:
+            if bot.TOKEN and ("BOT_TOKEN=%s" % bot.TOKEN) in f.read():
+                sys.exit("refusing to run: BOT_TOKEN is the production token from %s" % prod_env)
+    except OSError:
+        pass
 
 # ---- no xray here: pretend every proxy operation worked ----
 bot._adu = lambda ep, secret, email: True

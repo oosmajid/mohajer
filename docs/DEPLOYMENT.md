@@ -75,7 +75,8 @@ chmod 600 /opt/mohajer/bot.env
 $EDITOR /opt/mohajer/bot.env    # token, ADMIN_IDS, DOMAIN, SUB_BASE_URL, ENDPOINTS, IPS
 sudo bash scripts/install.sh
 ```
-`install.sh` lays down `bot.py`, `subserver.py`, the two systemd units, and starts them.
+`install.sh` lays down `bot.py`, `shop.py` (the customer storefront — `bot.py` will not start
+without it next to itself), `subserver.py`, the two systemd units, and starts them.
 
 ## 4. Verify
 ```bash
