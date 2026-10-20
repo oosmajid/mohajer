@@ -13,9 +13,15 @@ A single-VPS V2Ray subscription panel driven entirely from one Telegram bot. Two
 small Python processes + `xray-core` + a `cloudflared` tunnel. No pip deps, no web
 framework, no DB server. Everything is configured through one env file (`bot.env`).
 
-- **`bot/bot.py`** — the admin-only Telegram bot. Long-polls `getUpdates`, renders
-  inline-keyboard menus, mints/lists/deletes subscription links, edits clean IPs,
-  and runs a background **enforcer** thread (quota/expiry/resync).
+- **`bot/bot.py`** — the Telegram bot's admin side + core. Long-polls `getUpdates`, renders
+  the admin inline-keyboard menus, mints/lists/deletes subscription links, edits clean IPs,
+  and runs a background **enforcer** thread (quota/expiry/resync). Non-admin updates are
+  handed to `shop.py` (below).
+- **`bot/shop.py`** — the customer storefront inside the same bot. `bot.py` hands every
+  non-admin update to `shop.on_update` (customers + support staff); admin reply buttons
+  and `sa:*` callbacks also land there. It calls back into `bot.py` via `shop.core`
+  (bound at the end of `bot.py`) and owns the `shop_*` tables. Roadmap: `docs/SHOP.md`.
+  **Always deploy it next to `bot.py`** — the bot will not start without it.
 - **`sub/subserver.py`** — read-only HTTP server on `127.0.0.1:8090`. Serves each
   `sub-u-<token>` file as raw base64 to proxy clients (+ `Subscription-Userinfo`
   header) or as a mobile HTML copy-page to browsers (UA sniff on `"Mozilla"`).
@@ -168,8 +174,9 @@ On all four panel hosts, the active `xray.service` reads
 - **Endpoint `tag` must match three places**: `xray.config.json` inbound tag,
   `bot.env` `ENDPOINTS[].tag`, and is what `adu/rmu/statsquery` key off. Same for
   `path` (xray inbound ↔ ENDPOINTS ↔ cloudflared ingress rule).
-- **Single admin assumption** keeps the in-memory `pending` dict tiny (≈1 entry).
-  Don't turn this into a multi-tenant service without revisiting that.
+- **Single admin assumption** keeps the in-memory `pending` dict tiny (≈1 entry): only
+  admins/support get entries there. Customers (`shop.py`) keep their step in
+  `shop_customers.state` (sqlite) and are rate-limited per user, so they never grow it.
 - **Per-user email format starts `u_<token>.<tag>`**. Port-scoped emails add a
   `.tls<port>`, `.none<port>`, or `.reality<port>` suffix and a generation. Usage
   must still be summed across the `user>>>u_<token>` stats prefix. The per-email
@@ -276,8 +283,41 @@ On all four panel hosts, the active `xray.service` reads
   is a `:root[data-theme=dark]{…}` override of the same tokens. The admin panel uses
   blue action and chart tokens; the subscriber page uses the same blue palette. Charts
   use `currentColor` so bars follow the theme. Use palette tokens on themeable surfaces.
-- **Edit bot logic:** it's one file, stdlib only. After editing, copy to the server
-  path (see table) and `systemctl restart dpbot` (live) / `mohajer-bot` (fresh).
+- **Edit bot logic:** `bot.py` + `shop.py`, stdlib only. After editing, copy BOTH to the
+  server path (see table; on the flat live layout that is `/opt/dpbot/shop.py` next to
+  `/opt/dpbot/bot.py`), run `cd /opt/dpbot && python3 -c "import shop"` to be sure the
+  import resolves, then `systemctl restart dpbot` (live) / `mohajer-bot` (fresh). A box
+  that gets only `bot.py` crash-loops on `import shop`.
+- **Admin bot UX:** `/start` shows one reply keyboard — 🔗 لینک‌ها (the legacy inline menu:
+  new link / list / CDN IPs), 🛍 فروشگاه (shop admin), 🧾 رسیدها, 🎫 تیکت‌ها, 🌐 پنل وب
+  (same as `/admin`: one-time web-panel login link). Any `/command` first drops every shop
+  prompt (`shop.clear_admin_state`), so a stale "type the reply" prompt can never swallow it.
+- **Shop state:** customer input steps live in `shop_customers.state` (sqlite), never in
+  the in-memory `pending` dict, which stays admin-only. Shop settings are `meta.shop_*`.
+- **Shop orders:** approval flips `review -> approved` inside `BEGIN IMMEDIATE`; delivery
+  (`fulfill`) is idempotent on `shop_orders.delivered_ts` — the link extension and the marker
+  are one transaction, so a double click, two reviewers, a crash or an xray error can never
+  deliver twice. An approved order NEVER goes back to `review`; `retry_deliveries` (ticker)
+  re-runs undelivered ones and alerts the owners. Support may approve only an untouched
+  invoice; correcting the paid amount (≤ 2× invoice) is owner-only, because the difference
+  becomes spendable wallet credit. A renewal keeps an unlimited dimension unlimited and adds
+  the plan on top of real usage (`_extend_link`).
+- **Auto-renew:** due only on expiry/usage (never on `disabled_ts` alone) and at most once per
+  hour per link (`AUTO_GAP`), otherwise a link xray fails to re-add would be charged every tick.
+- **Wallet:** change balances ONLY via `wallet_apply` (inside a transaction) / `wallet_change`. They
+  refuse to go negative and write the ledger row; `(kind, ref)` is unique so a retried credit is a no-op.
+- **Shop ticker** (`shop.tick`, every 60s): daily backup, test follow-ups, expiring unpaid invoices,
+  wallet auto-renewals, then usage/expiry warnings (`warn_flags` bits, reset on every buy/renewal).
+- **Referrals:** `referrer_id` is only set when a customer is first created. Invitees get
+  `meta.shop_ref_discount`% off until their first approved purchase (`priced()`); the inviter gets
+  `meta.shop_ref_reward`% of it once, guarded by the unique ledger ref `ref:<invitee id>`.
+- **Tickets:** `shop_tickets` (open -> answered -> closed) + `shop_ticket_msgs`. A photo sent while
+  an invoice is open is a receipt even if a ticket prompt is pending; otherwise it is a ticket
+  attachment. Cards are clipped (`CARD_MAX_CHARS`) so they never exceed Telegram's 4096; per-ticket,
+  per-day and open-ticket caps keep the DB small; closed tickets older than 90 days are pruned.
+  3+ customers reporting the same carrier within 30 min alerts the owners (at most hourly).
+- **Backups:** the daily/`sa:backup` sqlite copy has the `meta.sess_*` web-panel sessions removed
+  (and is VACUUMed) before upload — a backup file must never double as a panel login.
 - **Inspect state:** `sqlite3 <db> "SELECT label,used_bytes,max(used_bytes-usage_reset_bytes,0) AS current_used,limit_bytes,expiry_ts FROM users"`.
 
 ## 6. Verifying a change without breaking prod
@@ -318,6 +358,18 @@ usage_ledger(email, token, last_raw, total_bytes)
 meta(k TEXT PRIMARY KEY, v TEXT)   -- includes clean_ips, config_recipe,
                                    -- endpoint_settings, relay_ingresses, outbounds, xray_pid,
                                    -- membership_sync_pending, outbound_sync_pending
+shop_customers(tg_id, first_name, username, joined_ts, last_seen, referrer_id, blocked, state, test_used_ts, wallet, notify)
+shop_wallet_tx(id, tg_id, delta, balance, kind, ref, note, actor, ts) -- ledger; UNIQUE(kind, ref)
+shop_services(token, tg_id, kind, created_ts, followup_sent, feedback, plan_id, auto_renew, auto_note_ts, warn_flags)
+                                                    -- customer <-> users.token; kind test|paid
+shop_plans(id, gb, days, price, active, popular)    -- 0 gb/days = unlimited
+shop_cards(id, number, holder, active)              -- card-to-card destinations, one picked per invoice
+shop_orders(id, tg_id, kind buy|renew|topup, pay_method card|wallet, discount, token, gb, days, price, amount, paid_amount, card_id, status,
+            receipt_file, receipt_uid UNIQUE, ..., review_msgs) -- awaiting->review->approved|rejected; expired|cancelled
+shop_staff(tg_id, role, added_ts, added_by)          -- role 'support'; owners = ADMIN_IDS
+shop_admin_log(id, ts, actor, action, target, detail) -- audit trail of admin/support actions
+shop_tickets(id, tg_id, token, category, carrier, status, rating, created_ts, updated_ts)
+shop_ticket_msgs(id, ticket_id, sender, role customer|staff, text, file, ts)
 ```
 
 See `docs/ARCHITECTURE.md` for the full flow diagrams and `docs/OPERATIONS.md` for

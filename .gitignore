@@ -20,3 +20,6 @@ __pycache__/
 # local export scratch
 mhx/
 *.tgz
+
+# local shop click-through (scripts/dev_shop.py)
+dev/
