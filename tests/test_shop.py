@@ -398,6 +398,7 @@ class ShopSalesTests(SalesCase):
         self.assertEqual(self.row("SELECT status,note FROM shop_orders")[:], ("rejected", shop.REJECT_REASONS[2]))
         self.assertIn(shop.REJECT_REASONS[2], self.texts(ALICE)[-1])
         o = self.buy(); bot.handle_update(photo(ALICE, "r2"))
+        bot.handle_update(cb(ALICE, "c:rcpt:%d" % o["id"]))          # the rejected invoice is still a candidate: pick
         bot.handle_update(cb(SUPPORT, "r:nox:%d" % o["id"]))
         bot.handle_update(msg(SUPPORT, "اسم صاحب حساب فرق دارد"))
         self.assertEqual(self.row("SELECT note FROM shop_orders WHERE id=?", (o["id"],))["note"], "اسم صاحب حساب فرق دارد")
@@ -1211,3 +1212,84 @@ class ShopHardeningTests(SalesCase):
         try: sent, failed = shop.broadcast([ALICE, BOB], "hi", pause=0)
         finally: time.sleep = real_sleep
         self.assertEqual((sent, failed), (1, 1)); self.assertIn(1, slept)
+
+
+class ShopSecondReviewTests(SalesCase):
+    """Follow-ups from the independent review of the hardening commit."""
+
+    def own(self, uid=ALICE):
+        bot.handle_update(cb(ADMIN, "sa:uwal:%d:add" % uid)); bot.handle_update(msg(ADMIN, "150000 هدیه"))
+        bot.handle_update(cb(uid, "c:wpay:%d" % self.plan["id"]))
+        return self.row("SELECT token FROM shop_services WHERE tg_id=? ORDER BY created_ts DESC", (uid,))["token"]
+
+    def test_failure_after_the_delivery_commit_never_refunds(self):
+        bot.handle_update(cb(ADMIN, "sa:uwal:%d:add" % ALICE)); bot.handle_update(msg(ADMIN, "150000 هدیه"))
+        real = shop.deliver_message
+        shop.deliver_message = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("telegram down"))
+        try: bot.handle_update(cb(ALICE, "c:wpay:%d" % self.plan["id"]))
+        finally: shop.deliver_message = real
+        o = self.row("SELECT * FROM shop_orders")
+        self.assertEqual((o["status"], o["token"]), ("approved", "tok0")); self.assertIsNotNone(o["delivered_ts"])
+        self.assertEqual(shop.balance(ALICE), 0)                      # paid once, delivered once, no refund
+        self.assertIn("از کیف پولت", self.last("editMessageText")["text"])
+
+    def test_refund_is_refused_once_delivered(self):
+        tok = self.own(); o = self.row("SELECT * FROM shop_orders")
+        self.assertFalse(shop.refund_undelivered(o["id"], ALICE, o["price"]))
+        self.assertEqual(shop.balance(ALICE), 0)
+
+    def test_undeliverable_wallet_order_is_refunded_after_a_day(self):
+        bot.handle_update(cb(ADMIN, "sa:uwal:%d:add" % ALICE)); bot.handle_update(msg(ADMIN, "150000 هدیه"))
+        bot.create_user = lambda *a, **k: None
+        c = bot.db(); c.execute("UPDATE shop_customers SET wallet=0 WHERE tg_id=?", (ALICE,)); c.commit(); c.close()
+        # simulate a crash right after the debit: approved, undelivered, wallet already charged
+        now = int(time.time())
+        c = bot.db()
+        c.execute("INSERT INTO shop_orders(tg_id,kind,plan_id,gb,days,price,amount,status,created_ts,decided_ts,pay_method) "
+                  "VALUES(?,?,?,?,?,?,?,'approved',?,?,'wallet')", (ALICE, "buy", self.plan["id"], 30, 30, 150000, 150000, now - 90000, now - 90000))
+        c.commit(); c.close()
+        shop.retry_deliveries(now=now - 80000)                        # still inside the retry window: nothing
+        self.assertEqual(self.row("SELECT status FROM shop_orders ORDER BY id DESC")["status"], "approved")
+        shop.retry_deliveries(now=now)
+        self.assertEqual(self.row("SELECT status FROM shop_orders ORDER BY id DESC")["status"], "failed")
+        self.assertEqual(shop.balance(ALICE), 150000)
+        self.assertIn("برگشت", self.texts(ALICE)[-1])
+
+    def test_admin_prompt_expires(self):
+        bot.handle_update(cb(ADMIN, "sa:uwal:%d:add" % ALICE))
+        bot.pending[ADMIN]["ts"] -= shop.PENDING_TTL + 1
+        bot.handle_update(msg(ADMIN, "50000 بازگشت وجه"))
+        self.assertEqual(shop.balance(ALICE), 0); self.assertNotIn(ADMIN, bot.pending)
+
+    def test_receipt_asks_when_a_previous_invoice_was_auto_cancelled(self):
+        o1 = self.buy(); o2 = self.buy()                                 # buying again cancels o1, but it may have been paid
+        self.assertEqual(self.row("SELECT status FROM shop_orders WHERE id=?", (o1["id"],))["status"], "cancelled")
+        bot.handle_update(photo(ALICE))
+        kb = self.last()["reply_markup"]["inline_keyboard"]
+        self.assertEqual([r[0]["callback_data"] for r in kb], ["c:rcpt:%d" % o2["id"], "c:rcpt:%d" % o1["id"]])
+        bot.handle_update(cb(ALICE, "c:rcpt:%d" % o1["id"]))
+        self.assertEqual(self.row("SELECT status FROM shop_orders WHERE id=?", (o1["id"],))["status"], "review")
+
+    def test_daily_backup_is_built_once_and_sent_to_every_owner(self):
+        bot.ADMIN_IDS.update({ADMIN, 2}); shop.set_setting("backup_auto", "1")
+        builds, sent = [], []
+        real_make, real_upload = shop.make_backup, shop.upload
+        shop.make_backup = lambda: builds.append(1) or b"db"
+        shop.upload = lambda method, chat, *a, **k: sent.append(chat) or {"ok": chat != ADMIN}   # first owner fails
+        try:
+            shop._tick_backup(); shop._tick_backup()
+        finally:
+            shop.make_backup, shop.upload = real_make, real_upload
+        self.assertEqual(len(builds), 1); self.assertEqual(sent, [ADMIN, 2])
+        self.assertEqual(shop.setting("backup_day"), bot.day_key())
+
+    def test_outage_end_waits_for_the_running_broadcast(self):
+        self.own(ALICE)
+        bot.handle_update(cb(ADMIN, "sa:outage")); bot.handle_update(msg(ADMIN, "کند است"))
+        real_bg = shop.run_bg; shop.run_bg = lambda fn: None             # the sending thread never runs: lock stays held
+        try:
+            bot.handle_update(cb(ADMIN, "sa:outage_send"))
+            bot.handle_update(cb(ADMIN, "sa:outage")); bot.handle_update(cb(ADMIN, "sa:outage_end"))
+            self.assertTrue(any("هنوز تمام نشده" in t for t in self.texts(ADMIN))); self.assertTrue(shop.setting("outage"))
+        finally:
+            shop.run_bg = real_bg; shop._bc_lock.release()

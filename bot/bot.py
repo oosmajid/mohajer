@@ -2165,7 +2165,7 @@ def enforcer():
             for cur in rows:
                 if cur["pending_delete"]:
                     if delete_user(cur["token"]):
-                        notify_admin("🗑 لینک «%s» پس از تلاش دوباره حذف شد." % cur["label"])
+                        notify_admin("🗑 لینک «%s» پس از تلاش دوباره حذف شد." % html.escape(cur["label"] or ""))
                     continue
                 if cur["auth_pending"]:
                     tags = tags_to_cut_for_user(cur["token"])
@@ -3472,6 +3472,8 @@ def main():
             params = {"timeout": 50, "allowed_updates": ["message", "callback_query"]}
             if offset: params["offset"] = offset
             r = tg("getUpdates", **params)
+            if r.get("ok") is False:   # 401 bad token / 409 another poller: back off instead of hammering the API
+                print("getUpdates refused:", r.get("description"), flush=True); time.sleep(10); continue
             for up in r.get("result", []):
                 offset = up["update_id"] + 1
                 try: handle_update(up)
