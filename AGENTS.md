@@ -46,23 +46,36 @@ framework, no DB server. Everything is configured through one env file (`bot.env
 4. Quota/expiry are enforced by the **enforcer thread**, not by xray. xray just
    counts bytes; the bot reads the counters and deletes the user when over limit.
 
-## 3. Production servers (verified 2026-10-01)
+## 3. Production servers (updated 2026-10-04)
 
 There are **four active Mohajer panels**. CDN3 users were merged into CDN2 on
-2026-10-01 (50 total links). CDN3 now runs only a relay for this service; its
-panel and proxy units were retired into a root-only recoverable backup. Other
-applications on CDN3, including nginx and SSH, must remain intact.
+2026-10-01 (50 total links at migration). The operator deleted the old CDN3 VPS
+on 2026-10-03. Do not use `130.185.121.65` as an SSH target or jump host. The
+old CDN3 hostnames and subscriptions still terminate on CDN2 and must be preserved.
+The operator requested removal of **all relays** on 2026-10-04. Nicol at
+`root@188.121.104.169:22` is retired: its relay unit and private key were archived,
+TCP 8443 is closed, and its restricted SSH key on CDN2 was revoked. The VPS itself
+still exists; do not restore a relay without a new operator request. The failed
+earlier Nicol at `95.38.190.210` is also not an active relay target.
+All four panels have no global or custom relay ingress entries. CDN2 has 46 links,
+all using public settings; 92 Nicol URIs were removed. Each now contains 24 CDN
+configs plus two direct REALITY configs, with two status rows added by the sub
+server. Remaining URIs, credentials, quotas and subscription URLs were preserved.
+Refresh the existing subscription URL in clients to remove cached Nicol configs.
 
 | Public hostname | SSH target | Bot/env/DB | Bot/sub services |
 |-----------------|------------|------------|------------------|
 | `cdn.delplayer.ir` | `delplayer` (`root@23.94.29.30:49531`) | `/opt/dpbot/{bot.py,bot.env,dpbot.db}` | `dpbot` / `dpsub` (`/opt/dpsub`) |
 | `cdn2.delplayer.ir` | `ubuntu@130.185.122.107` (sudo) | `/opt/mohajer/{bot/bot.py,bot.env,dpbot.db}` | `mohajer-bot` / `mohajer-sub` |
-| `cdn3.delplayer.ir` | `ubuntu@130.185.121.65` (sudo) | Users/subscriptions served by CDN2 | `mohajer-relay` only; no panel |
+| `cdn3.delplayer.ir` | Old VPS deleted; no SSH target | Users/subscriptions served by CDN2 | CDN2 `cloudflared-cdn3`; no standalone panel |
+| `nicol` (retired relay VPS) | `nicol` (`root@188.121.104.169:22`) | No panel/DB; relay keys archived root-only | No relay unit; public TCP 8443 closed |
 | `cdn4.delplayer.ir` | `root@149.112.84.49:40273` | `/opt/mohajer/{bot/bot.py,bot.env,dpbot.db}` | `mohajer-bot` / `mohajer-sub` |
 | `cdn5.delplayer.ir` | `root@23.94.29.30:50035` | `/opt/mohajer/{bot/bot.py,bot.env,dpbot.db}` | `mohajer-bot` / `mohajer-sub` |
 
 The cdn2 password is in macOS Keychain service `codex-ssh-cdn2` (account `ubuntu`);
-cdn5 uses Keychain service `ssh-cdn5` (account `root`). Other SSH credentials also
+cdn5 uses Keychain service `ssh-cdn5` (account `root`). Nicol uses Keychain service
+`codex-ssh-nicol` (account `root`), with SSH alias `nicol`. Never store its password
+in repository files or handoffs. Other SSH credentials also
 stay in Keychain/SSH config, never in this repository.
 SSH from the operator's laptop may require SOCKS5 `127.0.0.1:10808`:
 `-o "ProxyCommand=nc -x 127.0.0.1:10808 -X 5 %h %p"`.
@@ -73,7 +86,7 @@ All original public hostnames retain parallel old `cdn[2-5].delplayer.ir` and ne
 as `DOMAIN` and `SUB_BASE_URL`. (For the first box the hostname is `cdn`.)
 `HOST_PROFILES` permits the matching new hostname on each bot. CDN2 also has
 the imported CDN3 Host/SNI pairs and inbounds. cdn and cdn2 have REALITY
-provisioned; cdn4/cdn5 do not. CDN3 forwards native REALITY to CDN2.
+provisioned; cdn4/cdn5 do not. The former CDN3 REALITY relay is retired.
 On all four panel hosts, the active `xray.service` reads
 `/usr/local/etc/xray/config.json` (verified 2026-09-29). Always recheck
 `bot.env` and the unit's `ExecStart` before a future deployment.
@@ -87,9 +100,30 @@ On all four panel hosts, the active `xray.service` reads
 - CDN2 runs `cloudflared-cdn3.service` alongside its original connector, using the
   same old tunnel and hostnames; imported paths terminate on ports 10200–10203.
   Imported REALITY terminates on loopback 10443 with its original keys.
-- CDN3 `mohajer-relay.service` forwards public TCP 8443 over a pinned, restricted
-  SSH connection to CDN2 loopback 10443. Its target key only permits that forward.
-  Source IP/name belong to deployment settings, never product code constants.
+- Nicol previously forwarded public TCP 8443 over restricted SSH to CDN2 loopback
+  10443. That route was removed on 2026-10-04 through the normal panel save flow,
+  including revocation of the unused backend identities. `meta.relay_ingresses`
+  is empty on all four panels; no custom link contains relay routes. Nicol's
+  `mohajer-relay.service` is disabled and removed, and its private key is archived.
+  CDN2's `mohajer-relay` account is password-locked with an empty authorized_keys;
+  the restrictive sshd Match block remains. Imported backend configuration stays
+  prepared but its recipe is disabled/count 0 and its old Nicol dial address is
+  historical metadata, not an active route. Source IP/name belong to deployment
+  settings, never product code constants. All panel, Xray and Cloudflare service
+  PIDs were unchanged during removal.
+- Removal backups: CDN2 `/var/backups/mohajer-remove-relays-20261004-093700`
+  (DB, subscriptions, environment, bot, Xray and before/after snapshots), Nicol
+  `/var/backups/mohajer-relay-retired-20261004-093750` (unit and SSH keys), and CDN2
+  `/var/backups/mohajer-relay-auth-retired-20261004-093753` (revoked key and sshd
+  restriction). Backups are root-only; restore only on an explicit operator request.
+- Current nicol setup backup on CDN2: `/var/backups/mohajer-nicol-20261003-190357`.
+  Publication backup (DB, subscriptions, environment, Xray config and manifest):
+  `/var/backups/mohajer-nicol-publish-20261003-190826`.
+  The first failed replacement setup backup remains at
+  `/var/backups/mohajer-nicol-20261003-184601`.
+  Disk cleanup on 2026-10-03 freed about 3 GiB from archived journals, package
+  cache and unused temporary downloads; old syslog/btmp archives were compressed.
+  All Mohajer, Xray and tunnel units remained active; free space was about 3.1 GiB.
 - `/a/config` and custom `/a/user-config` contain generic **relay ingresses**:
   label, address (IP or DNS), external port, prepared REALITY backend, on/off,
   and uncapped count. Multiple relays may share one backend. Public state is
