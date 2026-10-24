@@ -4,7 +4,7 @@
 # staff. This module reuses bot.py's core (db, tg, create_user, enforcer state ...)
 # through `core`, which bot.py binds once at import time (see bind()).
 # Roadmap and feature list: docs/SHOP.md.
-import os, re, json, math, time, html, sqlite3, secrets, tempfile, threading, urllib.request, urllib.parse, urllib.error
+import os, re, json, math, time, html, base64, binascii, sqlite3, secrets, tempfile, threading, urllib.request, urllib.parse, urllib.error
 
 core = None   # the bot module (bot.py); set by bind()
 
@@ -289,7 +289,12 @@ def start_referrer(text):
 # ---------------- customer UI ----------------
 B_BUY, B_TEST, B_SERVICES, B_WALLET = "🛒 خرید سرویس", "🎁 تست رایگان", "📦 سرویس‌های من", "💰 کیف پول"
 B_INVITE, B_REPORT, B_GUIDE, B_ACCOUNT = "👥 دعوت دوستان", "🛠 گزارش اختلال", "📚 آموزش اتصال", "👤 حساب من"
-CUSTOMER_MENU = [[B_BUY, B_TEST], [B_SERVICES, B_WALLET], [B_INVITE, B_REPORT], [B_GUIDE, B_ACCOUNT]]
+B_RULES = "📜 قوانین"
+CUSTOMER_MENU = [[B_BUY, B_TEST], [B_SERVICES, B_WALLET], [B_INVITE, B_REPORT], [B_GUIDE, B_ACCOUNT], [B_RULES]]
+RULES_TEXT = ("📜 <b>قوانین استفاده از سرویس</b>\n\n"
+              "• اختلال، قطعی یا محدودیت‌های اینترنت و اپراتورها خارج از کنترل ماست و مسئولیت آن‌ها را نمی‌پذیریم.\n\n"
+              "• مشکلات نرم‌افزارهای اتصال یا تنظیمات دستگاه کاربر خارج از مسئولیت ماست.\n\n"
+              "• برای راهنمایی یا بررسی مشکل سرویس، از بخش «گزارش اختلال» استفاده کنید.")
 
 MAINTENANCE_TEXT = "🛠 در حال به‌روزرسانی ربات هستیم.\nچند دقیقهٔ دیگر دوباره سر بزن 🙏"
 BLOCKED_TEXT = "⛔️ دسترسی شما به این ربات محدود شده است."
@@ -308,8 +313,34 @@ def customer_menu(chat, text="از منوی پایین یکی رو انتخاب 
 def link_kb(token, extra=None):
     """Open-in-browser page = QR + copy + one-tap import into Happ/v2rayNG (subserver.py)."""
     rows = [[{"text": "📲 باز کردن صفحهٔ اتصال", "url": core.sub_url(token)}],
+            [{"text": "📥 دریافت کانفیگ", "callback_data": "c:configs:%s:0" % token}],
             [{"text": "📚 آموزش اتصال", "callback_data": "c:guide"}]]
     return rows + (extra or [])
+
+def send_configs(chat, uid, token, index=0):
+    """Read the existing subscription locally; never require the customer's browser to open it."""
+    if not owned_service(uid, token):
+        core.send(chat, "این سرویس پیدا نشد."); return
+    try:
+        with open(core.sub_path(token), "rb") as f:
+            raw = f.read()
+        links = [line.strip() for line in base64.b64decode(raw, validate=True).decode("utf-8").splitlines()
+                 if line.strip()]
+    except (OSError, ValueError, binascii.Error):
+        core.send(chat, "دریافت کانفیگ فعلاً ممکن نیست؛ دوباره امتحان کنید یا به پشتیبانی پیام بدهید."); return
+    if not 0 <= index < len(links):
+        core.send(chat, "کانفیگی برای نمایش پیدا نشد."); return
+    head = "📥 کانفیگ %s از %s\nمتن زیر را کپی و در برنامهٔ اتصال وارد کنید." % (fa(index + 1), fa(len(links)))
+    text = head + "\n\n<code>%s</code>" % html.escape(links[index])
+    nav = []
+    if index: nav.append({"text": "قبلی", "callback_data": "c:configs:%s:%d" % (token, index - 1)})
+    if index + 1 < len(links): nav.append({"text": "بعدی", "callback_data": "c:configs:%s:%d" % (token, index + 1)})
+    kb = ([nav] if nav else []) + [[{"text": "بازگشت به سرویس", "callback_data": "c:svc:%s" % token}]]
+    if len(text) > 3800:
+        result = upload("sendDocument", chat, "document", "config.txt", links[index].encode("utf-8"), head)
+        core.send(chat, "کانفیگ در فایل بالا قرار دارد." if result.get("ok") else "ارسال فایل ناموفق بود؛ دوباره امتحان کنید.", kb)
+    else:
+        core.send(chat, text, kb)
 
 # --- free test ---
 TEST_DEFAULT_MB, TEST_DEFAULT_HOURS = 500, 24
@@ -554,6 +585,7 @@ def invoice_view(plan, token=None, bal=0):
         text += "\n\nبا شارژ %s می‌تونی از کیف پول پرداخت کنی." % toman(short)
         kb.append([{"text": "➕ شارژ %s" % toman(short), "callback_data": "c:topup_amt:%d" % short}])
     kb += [[{"text": "💳 پرداخت کارت‌به‌کارت", "callback_data": "c:pay:%d%s" % (plan["id"], suffix)}],
+           [{"text": B_RULES, "callback_data": "c:rules"}],
            [{"text": "بازگشت", "callback_data": "c:plans%s" % suffix}]]
     return text, kb
 
@@ -565,8 +597,7 @@ def get_order(oid):
     c = core.db(); r = c.execute("SELECT * FROM shop_orders WHERE id=?", (oid,)).fetchone(); c.close(); return r
 
 def create_order(uid, kind, price, plan=None, token=None, now=None):
-    """New card-to-card invoice (kind buy | renew | topup) with a unique amount (price + a few
-    random tomans) so the reviewer can match the bank SMS. Older unpaid invoices are cancelled."""
+    """Invoice at the exact quoted price, with no surcharge. Cancel older unpaid invoices."""
     now = int(time.time()) if now is None else now
     c = core.db()
     try:
@@ -574,12 +605,7 @@ def create_order(uid, kind, price, plan=None, token=None, now=None):
         cards = c.execute("SELECT id FROM shop_cards WHERE active=1").fetchall()
         if not cards: c.rollback(); return None
         c.execute("UPDATE shop_orders SET status='cancelled' WHERE tg_id=? AND status='awaiting'", (uid,))
-        taken = {r[0] for r in c.execute("SELECT amount FROM shop_orders WHERE status IN ('awaiting','review') OR "
-                                         "(status IN ('expired','rejected') AND created_ts>=?)", (now - LATE_RECEIPT,))}
-        amount = price + 1 + secrets.randbelow(999)
-        for _ in range(50):
-            if amount not in taken: break
-            amount = price + 1 + secrets.randbelow(999)
+        amount = price
         oid = c.execute("INSERT INTO shop_orders(tg_id,kind,token,plan_id,gb,days,price,amount,card_id,status,created_ts,discount) "
                         "VALUES(?,?,?,?,?,?,?,?,?,'awaiting',?,?)",
                         (uid, kind, token, plan["id"] if plan else None, plan["gb"] if plan else 0,
@@ -837,7 +863,7 @@ def deliver(oid, actor=None):
 def _after_deliver(o, token):
     oid = o["id"]
     extra = paid_of(o) - o["price"] if o["kind"] != "topup" and o["pay_method"] == "card" else 0
-    if extra > 0: wallet_change(o["tg_id"], extra, "overpay", ref="order:%d" % oid)   # incl. the unique-amount tomans
+    if extra > 0: wallet_change(o["tg_id"], extra, "overpay", ref="order:%d" % oid)
     if o["kind"] == "topup":
         core.send(o["tg_id"], "💰 <b>کیف پولت %s شارژ شد!</b>\nموجودی: <b>%s</b>" % (toman(paid_of(o)), toman(balance(o["tg_id"]))),
                   [[{"text": "🛒 خرید سرویس", "callback_data": "c:buy"}]])
@@ -1003,7 +1029,8 @@ def invite_stats(uid):
     c = core.db()
     invited = c.execute("SELECT COUNT(*) FROM shop_customers WHERE referrer_id=?", (uid,)).fetchone()[0]
     buyers = c.execute("SELECT COUNT(DISTINCT o.tg_id) FROM shop_orders o JOIN shop_customers c ON c.tg_id=o.tg_id "
-                       "WHERE c.referrer_id=? AND o.status='approved' AND o.kind!='topup'", (uid,)).fetchone()[0]
+                       "WHERE c.referrer_id=? AND o.status='approved' AND o.delivered_ts IS NOT NULL "
+                       "AND o.kind IN ('buy','renew')", (uid,)).fetchone()[0]
     earned = c.execute("SELECT COALESCE(SUM(delta),0) FROM shop_wallet_tx WHERE tg_id=? AND kind='referral'", (uid,)).fetchone()[0]
     c.close(); return invited, buyers, earned
 
@@ -1170,6 +1197,7 @@ def today_usage(token):
 def service_kb(token):
     c = core.db(); r = c.execute("SELECT kind FROM shop_services WHERE token=?", (token,)).fetchone(); c.close()
     rows = [[{"text": "📲 باز کردن صفحهٔ اتصال", "url": core.sub_url(token)}],
+            [{"text": "📥 دریافت کانفیگ", "callback_data": "c:configs:%s:0" % token}],
             [{"text": "🔄 بروزرسانی وضعیت", "callback_data": "c:svc:%s" % token},
              {"text": "➕ تمدید", "callback_data": "c:renew:%s" % token}]]
     if r and r["kind"] == "paid": rows += auto_kb(token)
@@ -1612,7 +1640,8 @@ def customer_ticket_callback(chat, mid, uid, data, cbid):
 def account_text(uid):
     cust = get_customer(uid)
     c = core.db()
-    paid = c.execute("SELECT COUNT(*) FROM shop_orders WHERE tg_id=? AND status='approved'", (uid,)).fetchone()[0]
+    paid = c.execute("SELECT COUNT(*) FROM shop_orders WHERE tg_id=? AND status='approved' "
+                     "AND delivered_ts IS NOT NULL AND kind IN ('buy','renew')", (uid,)).fetchone()[0]
     c.close()
     return ("👤 <b>حساب من</b>\n\n🙂 %s\n🆔 آیدی عددی: <code>%d</code>\n📅 عضویت: %s\n💰 موجودی: %s\n🛍 تعداد خرید: %s\n🎁 تست رایگان: %s"
             % (html.escape(cust["first_name"] or "-"), uid, fa_date(cust["joined_ts"]), toman(cust["wallet"]), fa(paid),
@@ -1677,6 +1706,7 @@ def customer_message(chat, uid, m):
         if text == B_TEST: test_offer(chat, uid); return
         if text == B_ACCOUNT: core.send(chat, account_text(uid), account_kb(uid)); return
         if text == B_GUIDE: core.send(chat, GUIDE_TEXT, guide_kb()); return
+        if text == B_RULES: core.send(chat, RULES_TEXT); return
         say(chat, SOON_TEXT); return
     st = get_state(uid) or {}
     if st.get("stage") == "topup_amount":
@@ -1687,6 +1717,11 @@ def customer_message(chat, uid, m):
     customer_menu(chat)
 
 def customer_callback(chat, mid, uid, data, cbid, user=None):
+    if data == "c:rules":
+        core.answer(cbid); core.send(chat, RULES_TEXT); return
+    config_parts = data.split(":")
+    if config_parts[:2] == ["c", "configs"] and len(config_parts) == 4 and _int(config_parts[3]) is not None:
+        core.answer(cbid); send_configs(chat, uid, config_parts[2], int(config_parts[3])); return
     if data == "c:test":
         core.answer(cbid); claim_test(chat, mid, uid, (user or {}).get("first_name")); return
     if data == "c:guide":
@@ -1828,9 +1863,10 @@ def _count(sql, args=()):
     c = core.db(); n = c.execute(sql, args).fetchone()[0]; c.close(); return n
 
 def shop_admin_text():
-    return ("🛍 <b>مدیریت فروشگاه</b>\n\n👥 مشتری‌ها: <b>%d</b>\n🎧 پشتیبان‌ها: <b>%d</b>\n"
+    return ("🛍 <b>مدیریت فروشگاه</b>\n\n🛍 خریداران: <b>%d</b>\n🎧 پشتیبان‌ها: <b>%d</b>\n"
             "🛠 حالت تعمیرات: <b>%s</b>\n💾 بکاپ روزانه: <b>%s</b>"
-            % (_count("SELECT COUNT(*) FROM shop_customers"), _count("SELECT COUNT(*) FROM shop_staff"),
+            % (_count("SELECT COUNT(DISTINCT tg_id) FROM shop_orders WHERE status='approved' "
+                      "AND delivered_ts IS NOT NULL AND kind IN ('buy','renew')"), _count("SELECT COUNT(*) FROM shop_staff"),
                "روشن" if flag("maintenance") else "خاموش", "روشن" if flag("backup_auto") else "خاموش"))
 
 def shop_admin_kb():
@@ -1923,7 +1959,7 @@ def user_card(tid):
     c = core.db()
     services = c.execute("SELECT COUNT(*) FROM shop_services s JOIN users u ON u.token=s.token WHERE s.tg_id=?", (tid,)).fetchone()[0]
     bought = c.execute("SELECT COUNT(*), COALESCE(SUM(price),0) FROM shop_orders WHERE tg_id=? AND status='approved' "
-                       "AND kind!='topup'", (tid,)).fetchone()
+                       "AND delivered_ts IS NOT NULL AND kind IN ('buy','renew')", (tid,)).fetchone()
     invited = c.execute("SELECT COUNT(*) FROM shop_customers WHERE referrer_id=?", (tid,)).fetchone()[0]
     c.close()
     text = ("👤 <b>%s</b>%s\n🆔 <code>%d</code>\n📅 عضویت: %s · آخرین بازدید: %s\n💰 موجودی: <b>%s</b>\n"
@@ -1992,7 +2028,8 @@ def ref_admin():
     c = core.db()
     invited = c.execute("SELECT COUNT(*) FROM shop_customers WHERE referrer_id IS NOT NULL").fetchone()[0]
     buyers = c.execute("SELECT COUNT(DISTINCT o.tg_id) FROM shop_orders o JOIN shop_customers c ON c.tg_id=o.tg_id "
-                       "WHERE c.referrer_id IS NOT NULL AND o.status='approved' AND o.kind!='topup'").fetchone()[0]
+                       "WHERE c.referrer_id IS NOT NULL AND o.status='approved' AND o.delivered_ts IS NOT NULL "
+                       "AND o.kind IN ('buy','renew')").fetchone()[0]
     paid = c.execute("SELECT COALESCE(SUM(delta),0) FROM shop_wallet_tx WHERE kind='referral'").fetchone()[0]
     discounts = c.execute("SELECT COALESCE(SUM(discount),0) FROM shop_orders WHERE status='approved'").fetchone()[0]
     top = c.execute("SELECT c.referrer_id id, r.first_name, COUNT(*) n FROM shop_customers c LEFT JOIN shop_customers r "

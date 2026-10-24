@@ -336,12 +336,12 @@ class ShopSalesTests(SalesCase):
         self.assertEqual(shop.parse_amount("۱۵۰.۰۰۰ تومان"), 150000)
         self.assertEqual(shop.toman(150000), "۱۵۰٬۰۰۰ تومان")
 
-    def test_buy_flow_creates_unique_amount_invoice(self):
+    def test_buy_flow_creates_exact_price_invoice(self):
         bot.handle_update(msg(ALICE, shop.B_BUY))
         self.assertEqual(self.last()["reply_markup"]["inline_keyboard"][0][0]["callback_data"], "c:plan:%d" % self.plan["id"])
         o = self.buy()
         self.assertEqual(o["status"], "awaiting")
-        self.assertTrue(150001 <= o["amount"] <= 150999)
+        self.assertEqual(o["amount"], 150000)
         self.assertIn("6037991234567890", self.last("editMessageText")["text"])
         o2 = self.buy()      # a new invoice cancels the unpaid one
         self.assertEqual(self.row("SELECT status FROM shop_orders WHERE id=?", (o["id"],))["status"], "cancelled")
@@ -560,8 +560,9 @@ class ShopWalletTests(SalesCase):
 
     def test_card_overpayment_goes_to_wallet(self):
         o = self.buy(); bot.handle_update(photo(ALICE))
+        bot.handle_update(cb(ADMIN, "r:amt:%d" % o["id"])); bot.handle_update(msg(ADMIN, "160000"))
         bot.handle_update(cb(ADMIN, "r:ok:%d" % o["id"]))
-        self.assertEqual(shop.balance(ALICE), o["amount"] - 150000)  # the unique-amount tomans come back
+        self.assertEqual(shop.balance(ALICE), 10000)
         self.assertEqual(self.ledger()[0][0], "overpay")
         bot.handle_update(cb(ADMIN, "r:ok:%d" % o["id"]))            # second click credits nothing
         self.assertEqual(len(self.ledger()), 1)
@@ -786,7 +787,7 @@ class ShopReferralTests(SalesCase):
         self.assertIn("<s>۱۵۰٬۰۰۰</s>", self.last("editMessageText")["text"])
         o = self.buy(BOB)
         self.assertEqual((o["price"], o["discount"]), (135000, 15000))
-        self.assertTrue(135001 <= o["amount"] <= 135999)
+        self.assertEqual(o["amount"], 135000)
         bot.handle_update(photo(BOB)); bot.handle_update(cb(ADMIN, "r:ok:%d" % o["id"]))
         o2 = self.buy(BOB)
         self.assertEqual((o2["price"], o2["discount"]), (150000, 0))
@@ -1293,3 +1294,98 @@ class ShopSecondReviewTests(SalesCase):
             self.assertTrue(any("هنوز تمام نشده" in t for t in self.texts(ADMIN))); self.assertTrue(shop.setting("outage"))
         finally:
             shop.run_bg = real_bg; shop._bc_lock.release()
+
+class ShopCorrectionsTests(SalesCase):
+    def setUp(self):
+        super().setUp()
+        self.subs = tempfile.TemporaryDirectory()
+        self.old_subdir = bot.SUB_DIR
+        bot.SUB_DIR = self.subs.name
+
+    def tearDown(self):
+        bot.SUB_DIR = self.old_subdir
+        self.subs.cleanup()
+        super().tearDown()
+
+    def delivered_service(self):
+        order = self.buy()
+        bot.handle_update(photo(ALICE))
+        bot.handle_update(cb(ADMIN, 'r:ok:%d' % order['id']))
+        return self.row('SELECT token FROM shop_services WHERE tg_id=?', (ALICE,))['token']
+
+    def test_rules_available_in_menu_and_before_purchase(self):
+        bot.handle_update(msg(ALICE, '/start'))
+        buttons = [b['text'] for row in self.last()['reply_markup']['keyboard'] for b in row]
+        self.assertIn(shop.B_RULES, buttons)
+        bot.handle_update(msg(ALICE, shop.B_RULES))
+        self.assertIn('خارج از کنترل', self.last()['text'])
+        self.assertIn('نرم‌افزار', self.last()['text'])
+        bot.handle_update(cb(ALICE, 'c:plan:%d' % self.plan['id']))
+        self.assertIn('c:rules', [b['callback_data'] for row in self.last('editMessageText')['reply_markup']['inline_keyboard'] for b in row])
+        bot.handle_update(cb(ALICE, 'c:rules'))
+        self.assertEqual(self.last()['text'], shop.RULES_TEXT)
+
+    def test_buyers_excludes_visitors_topups_and_undelivered_orders(self):
+        bot.handle_update(msg(BOB, '/start'))
+        self.assertIn('خریداران: <b>0</b>', shop.shop_admin_text())
+        topup = shop.create_order(BOB, 'topup', 150000)
+        c = bot.db()
+        c.execute("UPDATE shop_orders SET status='approved',delivered_ts=1 WHERE id=?", (topup['id'],))
+        c.commit(); c.close()
+        self.assertIn('خریداران: <b>0</b>', shop.shop_admin_text())
+        pending = self.buy()
+        c = bot.db(); c.execute("UPDATE shop_orders SET status='approved' WHERE id=?", (pending['id'],)); c.commit(); c.close()
+        self.assertIn('خریداران: <b>0</b>', shop.shop_admin_text())
+        c = bot.db(); c.execute('UPDATE shop_orders SET delivered_ts=1 WHERE id=?', (pending['id'],)); c.commit(); c.close()
+        self.assertIn('خریداران: <b>1</b>', shop.shop_admin_text())
+        second = self.buy()
+        c = bot.db(); c.execute("UPDATE shop_orders SET status='approved',delivered_ts=1 WHERE id=?", (second['id'],)); c.commit(); c.close()
+        self.assertIn('خریداران: <b>1</b>', shop.shop_admin_text())
+        self.assertIn('تعداد خرید: ۰', shop.account_text(BOB))
+
+    def test_same_price_invoices_and_topup_have_no_surcharge(self):
+        bot.handle_update(msg(BOB, '/start'))
+        a, b = self.buy(), self.buy(BOB)
+        self.assertEqual((a['amount'], b['amount']), (150000, 150000))
+        topup = shop.create_order(ALICE, 'topup', 123456)
+        self.assertEqual(topup['amount'], 123456)
+
+    def test_configs_are_local_copyable_and_owner_only(self):
+        token = self.delivered_service()
+        import base64
+        links = ['vless://secret@example.invalid:443?type=ws&security=tls#one', 'vmess://eyJhZGQiOiJleGFtcGxlLmludmFsaWQifQ==']
+        with open(bot.sub_path(token), 'wb') as f:
+            f.write(base64.b64encode('\n'.join(links).encode()))
+        for kb in (shop.link_kb(token), shop.service_kb(token)):
+            self.assertIn('c:configs:%s:0' % token, [b.get('callback_data') for row in kb for b in row])
+        bot.handle_update(cb(ALICE, 'c:configs:%s:0' % token))
+        self.assertIn('vless://secret', self.last()['text'])
+        self.assertIn('&amp;security=tls', self.last()['text'])
+        bot.handle_update(cb(ALICE, 'c:configs:%s:1' % token))
+        self.assertIn(links[1], self.last()['text'])
+        bot.handle_update(msg(BOB, '/start'))
+        bot.handle_update(cb(BOB, 'c:configs:%s:0' % token))
+        self.assertNotIn('secret', self.last()['text'])
+        self.assertIn('پیدا نشد', self.last()['text'])
+
+    def test_missing_invalid_and_out_of_range_configs_are_handled(self):
+        token = self.delivered_service()
+        bot.handle_update(cb(ALICE, 'c:configs:%s:0' % token))
+        self.assertIn('فعلاً ممکن نیست', self.last()['text'])
+        with open(bot.sub_path(token), 'wb') as f: f.write(b'bad!')
+        bot.handle_update(cb(ALICE, 'c:configs:%s:0' % token))
+        self.assertIn('فعلاً ممکن نیست', self.last()['text'])
+        import base64
+        with open(bot.sub_path(token), 'wb') as f: f.write(base64.b64encode(b'vless://one'))
+        bot.handle_update(cb(ALICE, 'c:configs:%s:99' % token))
+        self.assertIn('پیدا نشد', self.last()['text'])
+
+    def test_large_config_is_sent_as_file(self):
+        token = self.delivered_service()
+        import base64
+        from unittest.mock import patch
+        raw = 'vless://' + 'x' * 5000
+        with open(bot.sub_path(token), 'wb') as f: f.write(base64.b64encode(raw.encode()))
+        with patch.object(shop, 'upload', return_value={'ok': True}) as upload:
+            bot.handle_update(cb(ALICE, 'c:configs:%s:0' % token))
+            self.assertEqual(upload.call_args.args[4], raw.encode())
