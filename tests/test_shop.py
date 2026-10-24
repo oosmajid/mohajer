@@ -1284,13 +1284,14 @@ class ShopSecondReviewTests(SalesCase):
     def test_daily_backup_is_built_once_and_sent_to_every_owner(self):
         bot.ADMIN_IDS.update({ADMIN, 2}); shop.set_setting("backup_auto", "1")
         builds, sent = [], []
-        real_make, real_upload = shop.make_backup, shop.upload
+        real_make, real_upload, real_hour = shop.make_backup, shop.upload, shop.BACKUP_HOUR
+        shop.BACKUP_HOUR = 0  # This test checks delivery, independently of the current clock.
         shop.make_backup = lambda: builds.append(1) or b"db"
         shop.upload = lambda method, chat, *a, **k: sent.append(chat) or {"ok": chat != ADMIN}   # first owner fails
         try:
             shop._tick_backup(); shop._tick_backup()
         finally:
-            shop.make_backup, shop.upload = real_make, real_upload
+            shop.make_backup, shop.upload, shop.BACKUP_HOUR = real_make, real_upload, real_hour
         self.assertEqual(len(builds), 1); self.assertEqual(sent, [ADMIN, 2])
         self.assertEqual(shop.setting("backup_day"), bot.day_key())
 
@@ -1490,3 +1491,43 @@ class ShopRequestedChangesTests(SalesCase):
             self.assertIsNotNone(new)
             self.assertTrue(shop.owned_service(ALICE,new)['frozen'])
             add.assert_not_called()
+
+class ShopTransactionHistoryTests(SalesCase):
+    def test_card_purchase_is_visible_without_wallet_movements(self):
+        order=self.buy();bot.handle_update(photo(ALICE));bot.handle_update(cb(ADMIN,'r:ok:%d'%order['id']))
+        self.assertEqual(self.row('SELECT COUNT(*) n FROM shop_wallet_tx')['n'],0)
+        lines=shop.tx_lines(ALICE,30)
+        self.assertEqual(len(lines),1)
+        self.assertIn('۱۵۰٬۰۰۰ تومان',lines[0])
+        self.assertIn('کارت‌به‌کارت',lines[0])
+        self.assertIn('خرید',lines[0])
+        text,kb=shop.wallet_view(ALICE)
+        self.assertTrue(any(b.get('callback_data')=='c:tx' for row in kb for b in row))
+        bot.handle_update(cb(ALICE,'c:tx'))
+        self.assertIn('۱۵۰٬۰۰۰ تومان',self.last('editMessageText')['text'])
+        self.assertEqual(shop.tx_lines(BOB,30),[])
+
+    def test_only_approved_card_orders_are_financial_transactions(self):
+        c=bot.db()
+        for status in ('awaiting','review','rejected','expired','cancelled','failed','approved'):
+            c.execute("INSERT INTO shop_orders(tg_id,kind,gb,days,price,amount,paid_amount,status,created_ts,decided_ts) VALUES(?,'renew',1,1,50000,50000,52000,?,1,2)",(ALICE,status))
+        c.commit();c.close()
+        lines=shop.tx_lines(ALICE,30)
+        self.assertEqual(len(lines),1)
+        self.assertIn('۵۲٬۰۰۰ تومان',lines[0])
+        self.assertIn('تمدید',lines[0])
+        self.assertIn('در انتظار تحویل',lines[0])
+
+    def test_mixed_history_is_limited_sorted_and_wallet_purchase_not_duplicated(self):
+        c=bot.db()
+        for n in range(35):
+            c.execute("INSERT INTO shop_orders(tg_id,kind,gb,days,price,amount,status,pay_method,created_ts,decided_ts,delivered_ts) VALUES(?,'buy',1,1,50000,50000,'approved','card',?,?,?)",(ALICE,n,n,n))
+        # Wallet purchases already have their own financial ledger record.
+        c.execute("INSERT INTO shop_orders(tg_id,kind,gb,days,price,amount,status,pay_method,created_ts,delivered_ts) VALUES(?,'buy',1,1,10000,10000,'approved','wallet',100,100)",(ALICE,))
+        c.execute("INSERT INTO shop_wallet_tx(tg_id,delta,balance,kind,ref,ts) VALUES(?,-10000,0,'purchase','order:999',100)",(ALICE,))
+        c.commit();c.close()
+        lines=shop.tx_lines(ALICE,30)
+        self.assertEqual(len(lines),30)
+        self.assertIn('۱۰٬۰۰۰ تومان',lines[0])
+        self.assertEqual(sum('۱۰٬۰۰۰ تومان' in line for line in lines),1)
+        self.assertEqual(sum('۵۰٬۰۰۰ تومان' in line for line in lines),29)

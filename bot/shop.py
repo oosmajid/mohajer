@@ -591,13 +591,35 @@ TX_LABELS = {"topup": "شارژ کیف پول", "purchase": "خرید", "auto": 
              "overpay": "مبلغ اضافهٔ واریزی", "admin": "تغییر توسط پشتیبانی", "referral": "پاداش دعوت"}
 
 def tx_lines(uid, limit):
+    """Financial history: wallet movements plus approved direct card purchases.
+
+    Wallet purchases and top-ups already have ledger rows; only direct card
+    buy/renew orders need a separate event. Historical orders need no backfill.
+    """
     c = core.db()
-    rows = c.execute("SELECT * FROM shop_wallet_tx WHERE tg_id=? ORDER BY id DESC LIMIT ?", (uid, limit)).fetchall()
-    c.close()
-    return ["%s %s · %s%s · %s" % ("🟢" if r["delta"] > 0 else "🔴", fa_date(r["ts"]), "+" if r["delta"] > 0 else "−",
-                                   toman(abs(r["delta"])), TX_LABELS.get(r["kind"], r["kind"]) +
-                                   (" (%s)" % html.escape(r["note"]) if r["note"] and r["kind"] == "admin" else ""))
-            for r in rows]
+    try:
+        rows = c.execute("""SELECT ts,id,'wallet' source,delta,kind,note,ref,0 pending
+            FROM shop_wallet_tx WHERE tg_id=?
+            UNION ALL
+            SELECT COALESCE(decided_ts,created_ts),id,'card',-COALESCE(paid_amount,amount),kind,
+                   NULL,'order:' || id,delivered_ts IS NULL
+            FROM shop_orders WHERE tg_id=? AND pay_method='card' AND status='approved'
+                AND kind IN ('buy','renew')
+            ORDER BY ts DESC,id DESC,source DESC LIMIT ?""", (uid, uid, limit)).fetchall()
+    finally: c.close()
+    lines = []
+    for r in rows:
+        if r["source"] == "card":
+            label = ("تمدید" if r["kind"] == "renew" else "خرید") + " کارت‌به‌کارت"
+            label += " · سفارش #" + fa(r["id"])
+            if r["pending"]: label += " (در انتظار تحویل)"
+        else:
+            label = TX_LABELS.get(r["kind"], r["kind"]) + " (کیف پول)"
+            if r["note"] and r["kind"] == "admin": label += " (%s)" % html.escape(r["note"])
+        lines.append("%s %s · %s%s · %s" % (
+            "🟢" if r["delta"] > 0 else "🔴", fa_date(r["ts"]), "+" if r["delta"] > 0 else "−",
+            toman(abs(r["delta"])), label))
+    return lines
 
 def wallet_view(uid):
     lines = tx_lines(uid, 5)
