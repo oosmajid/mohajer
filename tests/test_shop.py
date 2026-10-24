@@ -1531,3 +1531,82 @@ class ShopTransactionHistoryTests(SalesCase):
         self.assertIn('۱۰٬۰۰۰ تومان',lines[0])
         self.assertEqual(sum('۱۰٬۰۰۰ تومان' in line for line in lines),1)
         self.assertEqual(sum('۵۰٬۰۰۰ تومان' in line for line in lines),29)
+
+class ShopWebLifecycleTests(SalesCase):
+    def web(self,path,token,**fields):
+        import urllib.parse
+        sid,csrf=bot.new_session()
+        return bot.route_admin('POST',path,{},'mj_sess='+sid,
+                               urllib.parse.urlencode(dict(token=token,csrf=csrf,**fields)).encode())
+
+    def paid_service(self):
+        o=self.buy();bot.handle_update(photo(ALICE));bot.handle_update(cb(ADMIN,'r:ok:%d'%o['id']))
+        return self.row('SELECT token FROM shop_orders WHERE id=?',(o['id'],))['token']
+
+    def test_web_delete_immediately_detaches_customer_service_and_count(self):
+        from unittest.mock import patch
+        tok=self.paid_service()
+        shop.set_state(ALICE,{'stage':'tk_text','token':tok})
+        c=bot.db();c.execute("INSERT INTO shop_rotations VALUES(?,'replacement',?,0,'retire',1)",(tok,ALICE));c.commit();c.close()
+        c=bot.db();c.execute("INSERT INTO shop_tickets(tg_id,token,category,status,created_ts,updated_ts) VALUES(?,?,'other','open',1,1)",(ALICE,tok));c.commit();c.close()
+        self.assertIn('مشتری‌ها: <b>1</b>',shop.shop_admin_text())
+        with patch.object(bot,'xr_remove_user',return_value=True),patch.object(bot,'tags_to_cut_for_user',return_value=set()),patch.object(bot,'force_disconnect',return_value=True),patch.object(bot,'del_sub'):
+            status,_,_=self.web('/a/delete',tok,confirm='yes')
+        self.assertEqual(status,302)
+        self.assertIsNone(self.row('SELECT * FROM shop_services WHERE token=?',(tok,)))
+        self.assertIsNone(shop.get_state(ALICE))
+        self.assertIsNone(self.row('SELECT token FROM shop_tickets')['token'])
+        self.assertEqual(self.row('SELECT phase FROM shop_rotations')['phase'],'done')
+        self.assertEqual(shop.my_services(ALICE),[])
+        self.assertNotIn(tok,str(shop.services_view(ALICE)))
+        self.assertNotIn(tok,str(shop.plans_view(ALICE,tok)))
+        self.assertIn('مشتری‌ها: <b>0</b>',shop.shop_admin_text())
+        # The customer's money and purchase record survive service deletion.
+        self.assertIsNotNone(shop.get_customer(ALICE))
+        self.assertEqual(len(shop.tx_lines(ALICE,30)),1)
+
+    def test_customer_with_another_paid_link_remains_counted(self):
+        from unittest.mock import patch
+        one=self.paid_service()
+        o=self.buy();bot.handle_update(photo(ALICE,'r2'));bot.handle_update(cb(ADMIN,'r:ok:%d'%o['id']))
+        self.assertEqual(len(shop.my_services(ALICE)),2)
+        with patch.object(bot,'xr_remove_user',return_value=True),patch.object(bot,'tags_to_cut_for_user',return_value=set()),patch.object(bot,'force_disconnect',return_value=True),patch.object(bot,'del_sub'):
+            self.web('/a/delete',one,confirm='yes')
+        self.assertEqual(len(shop.my_services(ALICE)),1)
+        self.assertIn('مشتری‌ها: <b>1</b>',shop.shop_admin_text())
+
+    def test_web_edits_are_read_by_bot_including_manual_freeze(self):
+        from unittest.mock import patch
+        tok=self.paid_service()
+        self.web('/a/rename',tok,name='نام جدید')
+        self.web('/a/addvol',tok,gb='5')
+        before=shop.owned_service(ALICE,tok)['expiry_ts']
+        self.web('/a/addtime',tok,days='2')
+        u=shop.owned_service(ALICE,tok)
+        self.assertEqual(u['label'],'نام جدید')
+        self.assertEqual(u['limit_bytes'],35*bot.GB)
+        self.assertEqual(u['expiry_ts'],before+2*86400)
+        text,kb=shop.service_view(ALICE,tok)
+        self.assertIn('نام جدید',text);self.assertIn('۳۵',text)
+        self.assertIn('نام جدید',str(shop.services_view(ALICE)))
+        with patch.object(bot,'xr_remove_user',return_value=True),patch.object(bot,'tags_to_cut_for_user',return_value=set()),patch.object(bot,'force_disconnect',return_value=True):
+            self.web('/a/freeze',tok,on='1')
+        self.assertIn('متوقف',shop.service_view(ALICE,tok)[0])
+        self.assertIn('⏸',str(shop.services_view(ALICE)))
+        self.web('/a/unlimit',tok,field='limit_bytes')
+        self.assertIn('حجم نامحدود',shop.service_view(ALICE,tok)[0])
+        c=bot.db();c.execute('UPDATE users SET used_bytes=?,usage_reset_bytes=? WHERE token=?',(5*bot.GB,bot.GB,tok));c.commit();c.close()
+        with patch.object(bot,'refresh_all_usage'):
+            self.web('/a/reset',tok,confirm='yes')
+        self.assertEqual(bot.current_usage(shop.owned_service(ALICE,tok)),0)
+        with patch.object(bot,'xr_add_user',return_value=True),patch.object(bot,'write_sub'):
+            self.web('/a/freeze',tok)
+        self.assertFalse(shop.owned_service(ALICE,tok)['frozen'])
+        self.assertNotIn('متوقف',shop.service_view(ALICE,tok)[0])
+
+    def test_restart_cleans_preexisting_orphan_shop_services(self):
+        tok=self.paid_service()
+        c=bot.db();c.execute('DELETE FROM users WHERE token=?',(tok,));c.commit();c.close()
+        bot.init_db()
+        self.assertIsNone(self.row('SELECT * FROM shop_services WHERE token=?',(tok,)))
+        self.assertIn('مشتری‌ها: <b>0</b>',shop.shop_admin_text())

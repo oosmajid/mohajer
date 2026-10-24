@@ -91,7 +91,30 @@ def init_db():
     c.execute("""CREATE TABLE IF NOT EXISTS shop_rotations(
         old_token TEXT PRIMARY KEY, new_token TEXT NOT NULL UNIQUE, tg_id INTEGER NOT NULL,
         frozen_before INTEGER NOT NULL, phase TEXT NOT NULL, created_ts INTEGER NOT NULL)""")
+    # Older panel deletions left shop ownership rows behind until daily housekeeping.
+    for row in c.execute("SELECT s.token FROM shop_services s LEFT JOIN users u ON u.token=s.token WHERE u.token IS NULL").fetchall():
+        forget_service(c, row["token"])
     c.commit(); c.close()
+
+def forget_service(c, token):
+    """Detach a removed link in the same transaction as core deletion.
+
+    Customer identity, wallet and financial history survive; none of them is a
+    live service. Old Telegram messages are intentionally left untouched.
+    """
+    owners = [r[0] for r in c.execute("SELECT tg_id FROM shop_services WHERE token=?", (token,))]
+    for uid in owners:
+        row = c.execute("SELECT state FROM shop_customers WHERE tg_id=?", (uid,)).fetchone()
+        if row and row[0]:
+            try: state = json.loads(row[0])
+            except (ValueError, TypeError): state = {}
+            if isinstance(state, dict) and state.get("token") == token:
+                c.execute("UPDATE shop_customers SET state=NULL WHERE tg_id=?", (uid,))
+    c.execute("DELETE FROM shop_services WHERE token=?", (token,))
+    c.execute("UPDATE shop_tickets SET token=NULL WHERE token=?", (token,))
+    # Do not let a half-finished credential replacement retry a deleted service.
+    c.execute("UPDATE shop_rotations SET phase='done' WHERE old_token=? OR new_token=?", (token, token))
+    c.execute("DELETE FROM meta WHERE k=?", ("sub_base_" + token,))
 
 # ---------------- settings (meta, prefixed) ----------------
 def setting(key, default=None):
@@ -698,6 +721,7 @@ def price_text(p):
             if p.get("discount") else toman(p["price"]))
 
 def plans_view(uid, token=None):
+    if token and not owned_service(uid, token): return services_view(uid)
     plans = [priced(uid, p) for p in list_plans()]
     if not plans:
         return "🛒 فعلاً پلنی برای فروش نداریم؛ به‌زودی برمی‌گردیم 🙏", None
@@ -1335,7 +1359,7 @@ def services_view(uid):
     if not rows:
         return ("📦 هنوز سرویسی نداری.\nمی‌تونی اول تست رایگان بگیری یا مستقیم یه سرویس بخری 👇",
                 [[{"text": "🛒 خرید سرویس", "callback_data": "c:buy"}]])
-    kb = [[{"text": "%s %s · %s/%s · %s" % ("⏸" if u["disabled_ts"] else "🟢", u["label"], fa_bytes(core.current_usage(u)),
+    kb = [[{"text": "%s %s · %s/%s · %s" % ("⏸" if u["disabled_ts"] or u["frozen"] else "🟢", u["label"], fa_bytes(core.current_usage(u)),
                                             fa_bytes(u["limit_bytes"]) if u["limit_bytes"] else "∞", fa_left(u["expiry_ts"])),
             "callback_data": "c:svc:%s" % u["token"]}] for u in rows]
     return "📦 <b>سرویس‌های من</b>\nروی هر سرویس بزن تا جزئیات و لینک اتصالش رو ببینی:", kb
@@ -1360,7 +1384,9 @@ def service_view(uid, token, now=None):
     u = owned_service(uid, token)
     if not u: return "این سرویس دیگه وجود نداره.", [[{"text": "بازگشت", "callback_data": "c:svcs"}]]
     used, limit = core.current_usage(u), u["limit_bytes"]
-    lines = ["%s <b>%s</b>" % ("⏸" if u["disabled_ts"] else "🟢", html.escape(u["label"])), ""]
+    lines = ["%s <b>%s</b>" % ("⏸" if u["disabled_ts"] or u["frozen"] else "🟢", html.escape(u["label"])), ""]
+    if u["frozen"]:
+        lines += ["⏸ این سرویس از پنل مدیریت متوقف شده است.", ""]
     if u["disabled_ts"]:
         left_h = max(0, (u["disabled_ts"] + core.GRACE_SECONDS - now) // 3600)
         lines += ["⚠️ <b>غیرفعال شده</b>؛ تا %s ساعت دیگه با تمدید، همین لینک دوباره فعال می‌شه." % fa(left_h), ""]
@@ -1514,7 +1540,7 @@ def service_summary(token):
     c = core.db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone(); c.close()
     if not u: return "سرویس حذف شده (<code>%s</code>)" % token
     return "%s %s · %s/%s · %s · <code>%s</code>" % (
-        "⏸" if u["disabled_ts"] else "🟢", html.escape(u["label"]), fa_bytes(core.current_usage(u)),
+        "⏸" if u["disabled_ts"] or u["frozen"] else "🟢", html.escape(u["label"]), fa_bytes(core.current_usage(u)),
         fa_bytes(u["limit_bytes"]) if u["limit_bytes"] else "∞", fa_left(u["expiry_ts"]), token)
 
 def get_ticket(tid):
@@ -2044,7 +2070,7 @@ def _count(sql, args=()):
 def shop_admin_text():
     return ("🛍 <b>مدیریت فروشگاه</b>\n\n👥 مشتری‌ها: <b>%d</b>\n🎧 پشتیبان‌ها: <b>%d</b>\n"
             "🛠 حالت تعمیرات: <b>%s</b>\n💾 بکاپ روزانه: <b>%s</b>"
-            % (_count("SELECT COUNT(DISTINCT tg_id) FROM shop_orders WHERE status='approved' AND delivered_ts IS NOT NULL AND kind IN ('buy','renew') AND price>0"), _count("SELECT COUNT(*) FROM shop_staff"),
+            % (_count("SELECT COUNT(DISTINCT s.tg_id) FROM shop_services s JOIN users u ON u.token=s.token WHERE s.kind='paid' AND u.pending_delete=0 AND EXISTS (SELECT 1 FROM shop_orders o WHERE o.tg_id=s.tg_id AND o.token=s.token AND o.status='approved' AND o.delivered_ts IS NOT NULL AND o.kind IN ('buy','renew') AND o.price>0)"), _count("SELECT COUNT(*) FROM shop_staff"),
                "روشن" if flag("maintenance") else "خاموش", "روشن" if flag("backup_auto") else "خاموش"))
 
 def shop_admin_kb():

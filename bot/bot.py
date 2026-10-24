@@ -1542,6 +1542,7 @@ def delete_user(token):
     if routed:
         c.execute("INSERT INTO meta(k,v) VALUES('outbound_sync_pending','1') "
                   "ON CONFLICT(k) DO UPDATE SET v='1'")
+    shop.forget_service(c, token)
     c.execute("DELETE FROM users WHERE token=?", (token,)); c.commit(); c.close()
     del_sub(token)
     force_disconnect(tags)
