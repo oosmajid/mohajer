@@ -283,14 +283,14 @@ On all four panel hosts, the active `xray.service` reads
   is a `:root[data-theme=dark]{…}` override of the same tokens. The admin panel uses
   blue action and chart tokens; the subscriber page uses the same blue palette. Charts
   use `currentColor` so bars follow the theme. Use palette tokens on themeable surfaces.
-- **Edit bot logic:** `bot.py` + `shop.py`, stdlib only. After editing, copy BOTH to the
+- **Edit bot logic:** `bot.py` + `shop.py` + vendored `qrcodegen.py`, no pip dependencies. After editing, copy all three to the
   server path (see table; on the flat live layout that is `/opt/dpbot/shop.py` next to
   `/opt/dpbot/bot.py`), run `cd /opt/dpbot && python3 -c "import shop"` to be sure the
   import resolves, then `systemctl restart dpbot` (live) / `mohajer-bot` (fresh). A box
   that gets only `bot.py` crash-loops on `import shop`.
 - **Admin bot UX:** `/start` shows one reply keyboard — 🔗 لینک‌ها (the legacy inline menu:
-  new link / list / CDN IPs), 🛍 فروشگاه (shop admin), 🧾 رسیدها, 🎫 تیکت‌ها, 🌐 پنل وب
-  (same as `/admin`: one-time web-panel login link). Any `/command` first drops every shop
+  new link / list / CDN IPs), 🛍 فروشگاه (shop admin), 🌐 پنل وب
+  (same as `/admin`: one-time web-panel login link). Receipts and tickets remain inline in the shop menu. Any `/command` first drops every shop
   prompt (`shop.clear_admin_state`), so a stale "type the reply" prompt can never swallow it.
 - **Shop state:** customer input steps live in `shop_customers.state` (sqlite), never in
   the in-memory `pending` dict, which stays admin-only. Shop settings are `meta.shop_*`.
@@ -374,3 +374,12 @@ shop_ticket_msgs(id, ticket_id, sender, role customer|staff, text, file, ts)
 
 See `docs/ARCHITECTURE.md` for the full flow diagrams and `docs/OPERATIONS.md` for
 the day-2 runbook.
+
+## Storefront purchase and connection controls (2026-10-24)
+
+- Card invoices use exactly the displayed price after any existing referral discount; no random suffix. Existing invoices keep their recorded amount.
+- Purchase/renewal requires acceptance of the current editable `meta.shop_terms` text. Admin: shop menu → قوانین خرید. Acceptance binds to the plan and service, expires in one hour and is consumed at checkout. Editing terms invalidates earlier acceptance.
+- Free tests have an atomic rolling 30-day cooldown from `shop_customers.test_used_ts`; failed minting restores the prior timestamp.
+- The customer count is distinct customers with positive-price approved buy/renew orders and non-null `delivered_ts`. Visits, trials, wallet top-ups and pending/failed delivery do not count.
+- Service cards export a locally generated subscription QR PNG and a complete current UTF-8 `configs.txt`. Keep the MIT-licensed vendored `bot/qrcodegen.py` beside the bot and shop modules.
+- Service replacement requires a ten-minute customer confirmation. `shop_rotations` persists retire/activate/done phases, freezes the service during replacement, revokes old Xray identities and sessions, removes the old public subscription, and generates a new token and all credentials. Quota, expiry, usage baseline/daily history, ownership, orders, tickets, auto-renew settings, custom settings and imported subscription domain survive. The ticker retries unfinished replacements; do not delete its rows, which also prevent stale background work from republishing old subscriptions or identities. Membership operations share an RLock with replacement.

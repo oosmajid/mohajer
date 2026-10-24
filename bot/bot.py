@@ -5,9 +5,27 @@
 # All config comes from bot.env (see config/bot.env.example). Single-file, runs under systemd.
 import os, re, sys, json, time, html, base64, socket, sqlite3, secrets, threading, subprocess, math, tempfile, ipaddress
 import uuid as uuidlib
+import functools
 import urllib.request, urllib.parse, urllib.error, ssl
 import http.cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# Serialize credential replacement with background resync and panel membership edits.
+_membership_lock = threading.RLock()
+
+def serialized_membership(fn):
+    @functools.wraps(fn)
+    def locked(*args, **kwargs):
+        with _membership_lock:
+            return fn(*args, **kwargs)
+    return locked
+
+def retired_shop_token(token):
+    c = db()
+    try:
+        if not c.execute("SELECT 1 FROM sqlite_master WHERE name='shop_rotations'").fetchone(): return False
+        return c.execute("SELECT 1 FROM shop_rotations WHERE old_token=?", (token,)).fetchone() is not None
+    finally: c.close()
 
 def load_env(path):
     env = {}
@@ -252,7 +270,9 @@ def _adu_inbounds(inbounds):
 def _adu(ep, secret, email):
     return _adu_inbounds([_user_inbound(ep, secret, email)])
 
+@serialized_membership
 def xr_add_user(token, secret):
+    if retired_shop_token(token): return False
     ok = True
     slots = active_slot_keys(token)
     converted = slot_mode_tags(token)
@@ -268,10 +288,12 @@ def xr_add_user(token, secret):
             ok = False
     return ok
 
+@serialized_membership
 def xr_add_users(users):
     """Restore a fleet after restart using one CLI process/API connection."""
     inbounds = {}
     for u in users:
+        if retired_shop_token(u["token"]): continue
         token = u["token"]
         slots = active_slot_keys(token)
         converted = slot_mode_tags(token)
@@ -306,6 +328,7 @@ def _rmu_email(tag, email):
 def _rmu(token, tag):
     return _rmu_email(tag, legacy_email(token, tag))
 
+@serialized_membership
 def xr_remove_user(token):
     # Keep credentials in SQLite for renewal; delete_user forgets them separately.
     c = db()
@@ -407,6 +430,7 @@ def ports_to_kick(online_tags):
     return sorted({ep["port"] for ep in ENDPOINTS if ep["tag"] in online_tags})
 
 def force_disconnect(online_tags):
+    ok = True
     for p in ports_to_kick(online_tags):
         try:
             # Cloudflare transports arrive on loopback; direct REALITY connections
@@ -414,10 +438,13 @@ def force_disconnect(online_tags):
             direct = any(ep["port"] == p and "reality" in ep for ep in ENDPOINTS)
             selector = (["sport", "=", ":%d" % p] if direct else
                         ["dst", "127.0.0.1", "dport", "=", ":%d" % p])
-            subprocess.run(["ss", "-K"] + selector,
-                           capture_output=True, text=True, timeout=10)
+            result = subprocess.run(["ss", "-K"] + selector,
+                                    capture_output=True, text=True, timeout=10)
+            if result.returncode != 0: ok = False
         except Exception as e:
             print("kick err", e, flush=True)
+            ok = False
+    return ok
 
 def xr_usage(token):
     # returns bytes, or None if the stats read FAILED. Never return 0 on failure:
@@ -870,9 +897,11 @@ def _set_auth_state(token, mode, slots):
     c = db(); c.execute("UPDATE users SET credential_mode=?,active_slots=? WHERE token=?",
                         (mode, _encode_slots(slots), token)); c.commit(); c.close()
 
+@serialized_membership
 def _reconcile_user_membership(u, before_recipe=None, before_settings=None):
     """Reconcile each endpoint without rotating credentials on other endpoints."""
     token, secret = u["token"], u["uuid"]
+    if retired_shop_token(token): return True, set(), {}
     desired = active_slot_keys(token)
     previous = (_decode_slots(u["active_slots"]) if u["active_slots"] is not None else
                 active_slot_keys(token, before_recipe, before_settings))
@@ -1360,7 +1389,9 @@ def test_outbound(tag):
             marks.append("%s ❌" % hostname)
     return "IP خروجی: %s · %s" % (ip, " · ".join(marks))
 
+@serialized_membership
 def write_sub(token, secret, label):
+    if retired_shop_token(token): return
     ips = effective_ips(token) or DEFAULT_IPS
     ipv4 = [address for address in ips if _is_ipv4(address)]
     names = list(dict.fromkeys(address for address in ips if not _is_ipv4(address)))
@@ -1486,6 +1517,7 @@ def create_user(vol_gb, dur_days, label=None):
     c.commit(); c.close()
     return token
 
+@serialized_membership
 def delete_user(token):
     c = db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone()
     if not u: c.close(); return False
@@ -1524,6 +1556,7 @@ def exhaust_reason(u, now=None):
     if (u["expiry_ts"] or 0) > 0 and now >= u["expiry_ts"]: return "زمان تمام شد"
     return None
 
+@serialized_membership
 def disable_user(token):
     # exhausted: stop service (remove from xray) but KEEP the row + sub file so it can be renewed within the grace window
     tags = tags_to_cut_for_user(token)  # capture BEFORE rmu
@@ -1537,6 +1570,7 @@ def disable_user(token):
     force_disconnect(tags)           # cut the live session so quota/expiry actually takes effect now
     return removed
 
+@serialized_membership
 def reenable_user(token):
     c = db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone(); c.close()
     if not u or u["pending_delete"]: return False
@@ -1555,6 +1589,7 @@ def maybe_reenable(token, refresh=False):
         if u and not exhaust_reason(u): return reenable_user(token)
     return False
 
+@serialized_membership
 def freeze_user(token):
     # manual admin freeze: cut the link NOW and keep it out of xray until unfrozen. Fully
     # independent of the quota/expiry disable — no 48h grace, and the enforcer never touches it.
@@ -1568,6 +1603,7 @@ def freeze_user(token):
     force_disconnect(tags)           # drop the live session immediately
     return removed
 
+@serialized_membership
 def unfreeze_user(token):
     c = db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone(); c.close()
     if not u or u["pending_delete"]: return False
@@ -1788,6 +1824,7 @@ def panel_usage_summary():
     last30 = c.execute("SELECT COALESCE(SUM(max(end_used-start_used,0)),0) v FROM usage_daily WHERE day>=?", (cutoff30,)).fetchone()["v"]
     c.close(); return int(total), int(today), int(last30)
 
+@serialized_membership
 def resync_all(allow_missing_stats_restart=True):
     # A restart clears Xray's dynamic users. Reconcile stored identities first,
     # then register every eligible identity again, including unchanged slots.

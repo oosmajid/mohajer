@@ -313,10 +313,20 @@ class SalesCase(ShopCase):
         for k, v in self._fns.items(): setattr(bot, k, v)
         super().tearDown()
 
+    def checkout(self, update):
+        cq = update["callback_query"]; uid = cq["from"]["id"]
+        parts = cq["data"].split(":")
+        pid = int(parts[2]); token = parts[3] if len(parts) == 4 else None
+        if not shop.terms_accepted(uid, pid, token):
+            suffix = (":" + token) if token else ""
+            shop.customer_callback(uid, 5, uid, "c:plan:%d%s" % (pid, suffix), "cb")
+            shop.customer_callback(uid, 5, uid, "c:agree:%d%s" % (pid, suffix), "cb")
+        bot.handle_update(update)
+
     def buy(self, uid=ALICE, token=None):
         suffix = (":" + token) if token else ""
-        bot.handle_update(cb(uid, "c:plan:%d%s" % (self.plan["id"], suffix)))
-        bot.handle_update(cb(uid, "c:pay:%d%s" % (self.plan["id"], suffix)))
+        self.checkout(cb(uid, "c:plan:%d%s" % (self.plan["id"], suffix)))
+        self.checkout(cb(uid, "c:pay:%d%s" % (self.plan["id"], suffix)))
         return self.row("SELECT * FROM shop_orders WHERE tg_id=? ORDER BY id DESC", (uid,))
 
     def review_copies(self):
@@ -336,12 +346,12 @@ class ShopSalesTests(SalesCase):
         self.assertEqual(shop.parse_amount("۱۵۰.۰۰۰ تومان"), 150000)
         self.assertEqual(shop.toman(150000), "۱۵۰٬۰۰۰ تومان")
 
-    def test_buy_flow_creates_unique_amount_invoice(self):
+    def test_buy_flow_uses_exact_plan_amount(self):
         bot.handle_update(msg(ALICE, shop.B_BUY))
         self.assertEqual(self.last()["reply_markup"]["inline_keyboard"][0][0]["callback_data"], "c:plan:%d" % self.plan["id"])
         o = self.buy()
         self.assertEqual(o["status"], "awaiting")
-        self.assertTrue(150001 <= o["amount"] <= 150999)
+        self.assertEqual(o["amount"], 150000)
         self.assertIn("6037991234567890", self.last("editMessageText")["text"])
         o2 = self.buy()      # a new invoice cancels the unpaid one
         self.assertEqual(self.row("SELECT status FROM shop_orders WHERE id=?", (o["id"],))["status"], "cancelled")
@@ -351,7 +361,7 @@ class ShopSalesTests(SalesCase):
         bot.handle_update(cb(ADMIN, "sa:plan_act:%d" % self.plan["id"]))
         bot.handle_update(msg(ALICE, shop.B_BUY))
         self.assertIn("پلنی", self.last()["text"])
-        bot.handle_update(cb(ALICE, "c:pay:%d" % self.plan["id"]))
+        self.checkout(cb(ALICE, "c:pay:%d" % self.plan["id"]))
         self.assertIsNone(self.row("SELECT * FROM shop_orders"))
 
     def test_no_active_card_tells_customer_and_owner(self):
@@ -527,41 +537,42 @@ class ShopWalletTests(SalesCase):
 
     def test_wallet_purchase_is_instant_and_atomic(self):
         self.topup(200000)
-        bot.handle_update(cb(ALICE, "c:plan:%d" % self.plan["id"]))
+        self.checkout(cb(ALICE, "c:plan:%d" % self.plan["id"]))
         kb = self.last("editMessageText")["reply_markup"]["inline_keyboard"]
         self.assertEqual(kb[0][0]["callback_data"], "c:wpay:%d" % self.plan["id"])
         before = shop.balance(ALICE)
-        bot.handle_update(cb(ALICE, "c:wpay:%d" % self.plan["id"]))
+        self.checkout(cb(ALICE, "c:wpay:%d" % self.plan["id"]))
         self.assertEqual(shop.balance(ALICE), before - 150000)
         o = self.row("SELECT * FROM shop_orders ORDER BY id DESC")
         self.assertEqual((o["pay_method"], o["status"], o["token"]), ("wallet", "approved", "tok0"))
         self.assertTrue(any(bot.sub_url("tok0") in t for t in self.texts(ALICE)))
-        bot.handle_update(cb(ALICE, "c:wpay:%d" % self.plan["id"]))  # right away: a double tap, not a new order
+        self.checkout(cb(ALICE, "c:wpay:%d" % self.plan["id"]))  # right away: a double tap, not a new order
         self.assertIn("چند لحظه پیش", self.last("editMessageText")["text"])
         shop.DUP_WINDOW, dw = 0, shop.DUP_WINDOW
-        try: bot.handle_update(cb(ALICE, "c:wpay:%d" % self.plan["id"]))  # later: a real attempt, not enough left
+        try: self.checkout(cb(ALICE, "c:wpay:%d" % self.plan["id"]))  # later: a real attempt, not enough left
         finally: shop.DUP_WINDOW = dw
         self.assertIn("کافی نیست", self.last("editMessageText")["text"])
         self.assertEqual(len(self.minted), 1)
 
     def test_short_balance_offers_exact_topup(self):
         bot.handle_update(cb(ADMIN, "sa:uwal:%d:add" % ALICE)); bot.handle_update(msg(ADMIN, "100000 هدیه"))
-        bot.handle_update(cb(ALICE, "c:plan:%d" % self.plan["id"]))
+        self.checkout(cb(ALICE, "c:plan:%d" % self.plan["id"]))
         kb = self.last("editMessageText")["reply_markup"]["inline_keyboard"]
         self.assertEqual(kb[0][0]["callback_data"], "c:topup_amt:50000")
 
     def test_failed_wallet_delivery_is_refunded(self):
         self.topup(200000); start = shop.balance(ALICE)
         bot.create_user = lambda *a, **k: None
-        bot.handle_update(cb(ALICE, "c:wpay:%d" % self.plan["id"]))
+        self.checkout(cb(ALICE, "c:wpay:%d" % self.plan["id"]))
         self.assertEqual(shop.balance(ALICE), start)
         self.assertEqual([k for k, _, _ in self.ledger()][-2:], ["purchase", "refund"])
         self.assertEqual(self.row("SELECT status FROM shop_orders ORDER BY id DESC")["status"], "failed")
 
     def test_card_overpayment_goes_to_wallet(self):
         o = self.buy(); bot.handle_update(photo(ALICE))
+        bot.handle_update(cb(ADMIN, "r:amt:%d" % o["id"])); bot.handle_update(msg(ADMIN, "151000"))
         bot.handle_update(cb(ADMIN, "r:ok:%d" % o["id"]))
-        self.assertEqual(shop.balance(ALICE), o["amount"] - 150000)  # the unique-amount tomans come back
+        self.assertEqual(shop.balance(ALICE), 1000)
         self.assertEqual(self.ledger()[0][0], "overpay")
         bot.handle_update(cb(ADMIN, "r:ok:%d" % o["id"]))            # second click credits nothing
         self.assertEqual(len(self.ledger()), 1)
@@ -574,7 +585,7 @@ class ShopWalletTests(SalesCase):
 
     def test_auto_renew_from_wallet(self):
         self.topup(400000)
-        bot.handle_update(cb(ALICE, "c:wpay:%d" % self.plan["id"]))
+        self.checkout(cb(ALICE, "c:wpay:%d" % self.plan["id"]))
         bot.handle_update(cb(ALICE, "c:auto:tok0"))
         self.assertEqual(self.row("SELECT auto_renew FROM shop_services WHERE token='tok0'")["auto_renew"], 1)
         u = self.row("SELECT * FROM users WHERE token='tok0'")
@@ -589,7 +600,7 @@ class ShopWalletTests(SalesCase):
 
     def test_auto_renew_low_balance_reminds_once_a_day(self):
         self.topup(200000)
-        bot.handle_update(cb(ALICE, "c:wpay:%d" % self.plan["id"]))
+        self.checkout(cb(ALICE, "c:wpay:%d" % self.plan["id"]))
         bot.handle_update(cb(ALICE, "c:auto:tok0"))
         now = int(time.time())
         c = bot.db(); c.execute("UPDATE users SET expiry_ts=? WHERE token='tok0'", (now + 600,)); c.commit(); c.close()
@@ -601,7 +612,7 @@ class ShopWalletTests(SalesCase):
         self.assertEqual(len(self.texts(ALICE)), 2)
 
     def test_others_cannot_toggle_auto_renew(self):
-        self.topup(200000); bot.handle_update(cb(ALICE, "c:wpay:%d" % self.plan["id"]))
+        self.topup(200000); self.checkout(cb(ALICE, "c:wpay:%d" % self.plan["id"]))
         bot.handle_update(msg(BOB, "/start")); bot.handle_update(cb(BOB, "c:auto:tok0"))
         self.assertEqual(self.row("SELECT auto_renew FROM shop_services WHERE token='tok0'")["auto_renew"], 0)
 
@@ -639,7 +650,7 @@ class ShopServicesTests(SalesCase):
     def own(self, uid=ALICE):
         """Give uid a paid link (via wallet) and return its token."""
         bot.handle_update(cb(ADMIN, "sa:uwal:%d:add" % uid)); bot.handle_update(msg(ADMIN, "150000 هدیه"))
-        bot.handle_update(cb(uid, "c:wpay:%d" % self.plan["id"]))
+        self.checkout(cb(uid, "c:wpay:%d" % self.plan["id"]))
         return self.row("SELECT token FROM shop_services WHERE tg_id=? ORDER BY created_ts DESC", (uid,))["token"]
 
     def set_link(self, token, **cols):
@@ -723,7 +734,7 @@ class ShopServicesTests(SalesCase):
         self.set_link(tok, expiry_ts=now + 3600); shop.send_service_warnings(now)
         self.assertNotEqual(self.row("SELECT warn_flags f FROM shop_services")["f"], 0)
         bot.handle_update(cb(ADMIN, "sa:uwal:%d:add" % ALICE)); bot.handle_update(msg(ADMIN, "150000 هدیه"))
-        bot.handle_update(cb(ALICE, "c:wpay:%d:%s" % (self.plan["id"], tok)))
+        self.checkout(cb(ALICE, "c:wpay:%d:%s" % (self.plan["id"], tok)))
         self.assertEqual(self.row("SELECT warn_flags f FROM shop_services")["f"], 0)   # 31 days left now
 
     def test_outage_broadcast_and_resolved_go_to_same_people(self):
@@ -758,7 +769,7 @@ class ShopReferralTests(SalesCase):
 
     def alice_buys(self):
         """Rewards only ever go to a paying customer, so most tests make Alice one first."""
-        self.gift(ALICE, 150000); bot.handle_update(cb(ALICE, "c:wpay:%d" % self.plan["id"])); self.calls.clear()
+        self.gift(ALICE, 150000); self.checkout(cb(ALICE, "c:wpay:%d" % self.plan["id"])); self.calls.clear()
 
     def ledger(self, uid):
         return [tuple(r) for r in self.q("SELECT kind, delta FROM shop_wallet_tx WHERE tg_id=? AND kind='referral' ORDER BY id", (uid,))]
@@ -782,11 +793,11 @@ class ShopReferralTests(SalesCase):
         bot.handle_update(msg(BOB, shop.B_BUY))
         self.assertIn("۱۰٪ تخفیف", self.last()["text"])
         self.assertIn("۱۳۵٬۰۰۰ تومان", self.last()["reply_markup"]["inline_keyboard"][0][0]["text"])
-        bot.handle_update(cb(BOB, "c:plan:%d" % self.plan["id"]))
+        self.checkout(cb(BOB, "c:plan:%d" % self.plan["id"]))
         self.assertIn("<s>۱۵۰٬۰۰۰</s>", self.last("editMessageText")["text"])
         o = self.buy(BOB)
         self.assertEqual((o["price"], o["discount"]), (135000, 15000))
-        self.assertTrue(135001 <= o["amount"] <= 135999)
+        self.assertEqual(o["amount"], 135000)
         bot.handle_update(photo(BOB)); bot.handle_update(cb(ADMIN, "r:ok:%d" % o["id"]))
         o2 = self.buy(BOB)
         self.assertEqual((o2["price"], o2["discount"]), (150000, 0))
@@ -805,24 +816,24 @@ class ShopReferralTests(SalesCase):
         o = self.buy(BOB); bot.handle_update(photo(BOB)); bot.handle_update(cb(ADMIN, "r:ok:%d" % o["id"]))
         self.assertEqual(self.ledger(ALICE), [("referral", 13500)])    # 10% of what Bob paid (135,000)
         self.assertIn("پاداش", self.texts(ALICE)[-1])
-        self.gift(BOB, 150000); bot.handle_update(cb(BOB, "c:wpay:%d" % self.plan["id"]))
+        self.gift(BOB, 150000); self.checkout(cb(BOB, "c:wpay:%d" % self.plan["id"]))
         self.assertEqual(self.ledger(ALICE), [("referral", 13500)])
         bot.handle_update(msg(ALICE, shop.B_INVITE))
         self.assertIn("خریدارها: ۱", self.last()["text"]); self.assertIn("۱۳٬۵۰۰ تومان", self.last()["text"])
 
     def test_wallet_first_purchase_also_rewards_and_discounts(self):
         self.alice_buys(); self.gift(BOB, 135000)
-        bot.handle_update(cb(BOB, "c:plan:%d" % self.plan["id"]))
+        self.checkout(cb(BOB, "c:plan:%d" % self.plan["id"]))
         self.assertEqual(self.last("editMessageText")["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
                          "c:wpay:%d" % self.plan["id"])
-        bot.handle_update(cb(BOB, "c:wpay:%d" % self.plan["id"]))
+        self.checkout(cb(BOB, "c:wpay:%d" % self.plan["id"]))
         self.assertEqual(shop.balance(BOB), 0)
         self.assertEqual(self.ledger(ALICE), [("referral", 13500)])
 
     def test_failed_wallet_purchase_neither_counts_nor_rewards(self):
         self.gift(BOB, 135000)
         bot.create_user = lambda *a, **k: None
-        bot.handle_update(cb(BOB, "c:wpay:%d" % self.plan["id"]))
+        self.checkout(cb(BOB, "c:wpay:%d" % self.plan["id"]))
         self.assertEqual(self.ledger(ALICE), [])
         self.assertEqual(shop.first_buy_discount(BOB), 10)
 
@@ -844,7 +855,7 @@ class ShopTicketTests(SalesCase):
     def setUp(self):
         super().setUp()
         bot.handle_update(cb(ADMIN, "sa:uwal:%d:add" % ALICE)); bot.handle_update(msg(ADMIN, "150000 هدیه"))
-        bot.handle_update(cb(ALICE, "c:wpay:%d" % self.plan["id"]))
+        self.checkout(cb(ALICE, "c:wpay:%d" % self.plan["id"]))
         self.tok = self.row("SELECT token FROM shop_services WHERE tg_id=?", (ALICE,))["token"]
         self.calls.clear()
 
@@ -980,7 +991,7 @@ class ShopHardeningTests(SalesCase):
 
     def own(self, uid=ALICE):
         bot.handle_update(cb(ADMIN, "sa:uwal:%d:add" % uid)); bot.handle_update(msg(ADMIN, "150000 هدیه"))
-        bot.handle_update(cb(uid, "c:wpay:%d" % self.plan["id"]))
+        self.checkout(cb(uid, "c:wpay:%d" % self.plan["id"]))
         return self.row("SELECT token FROM shop_services WHERE tg_id=? ORDER BY created_ts DESC", (uid,))["token"]
 
     def test_parse_amount_rejects_decimals_and_junk(self):
@@ -1014,8 +1025,8 @@ class ShopHardeningTests(SalesCase):
 
     def test_double_tap_wallet_purchase_buys_once(self):
         bot.handle_update(cb(ADMIN, "sa:uwal:%d:add" % ALICE)); bot.handle_update(msg(ADMIN, "400000 هدیه"))
-        bot.handle_update(cb(ALICE, "c:wpay:%d" % self.plan["id"]))
-        bot.handle_update(cb(ALICE, "c:wpay:%d" % self.plan["id"]))
+        self.checkout(cb(ALICE, "c:wpay:%d" % self.plan["id"]))
+        self.checkout(cb(ALICE, "c:wpay:%d" % self.plan["id"]))
         self.assertEqual(len(self.minted), 1); self.assertEqual(shop.balance(ALICE), 250000)
         self.assertIn("چند لحظه پیش", self.last("editMessageText")["text"])
 
@@ -1060,12 +1071,12 @@ class ShopHardeningTests(SalesCase):
         tok = self.own()
         self.set_link(tok, limit_bytes=0)                             # admin made it unlimited
         bot.handle_update(cb(ADMIN, "sa:uwal:%d:add" % ALICE)); bot.handle_update(msg(ADMIN, "300000 هدیه"))
-        bot.handle_update(cb(ALICE, "c:wpay:%d:%s" % (self.plan["id"], tok)))
+        self.checkout(cb(ALICE, "c:wpay:%d:%s" % (self.plan["id"], tok)))
         self.assertEqual(self.row("SELECT limit_bytes FROM users WHERE token=?", (tok,))["limit_bytes"], 0)
         self.set_link(tok, limit_bytes=10 * bot.GB, used_bytes=12 * bot.GB)   # overshot by 2GB
         bot.handle_update(cb(ALICE, "c:renew:%s" % tok)); time.sleep(0)
         shop.DUP_WINDOW, dw = 0, shop.DUP_WINDOW
-        try: bot.handle_update(cb(ALICE, "c:wpay:%d:%s" % (self.plan["id"], tok)))
+        try: self.checkout(cb(ALICE, "c:wpay:%d:%s" % (self.plan["id"], tok)))
         finally: shop.DUP_WINDOW = dw
         self.assertEqual(self.row("SELECT limit_bytes FROM users WHERE token=?", (tok,))["limit_bytes"], 42 * bot.GB)
 
@@ -1120,9 +1131,9 @@ class ShopHardeningTests(SalesCase):
     def test_admin_keyboard_has_web_login_and_queue_buttons(self):
         bot.handle_update(msg(ADMIN, "/start"))
         buttons = [b["text"] for row in [p for m, p in self.calls if m == "sendMessage"][-2]["reply_markup"]["keyboard"] for b in row]
-        self.assertEqual(buttons, [shop.B_LINKS, shop.B_SHOP, shop.B_RECEIPTS, shop.B_TICKETS, shop.B_WEB])
+        self.assertEqual(buttons, [shop.B_LINKS, shop.B_SHOP, shop.B_WEB])
         bot.handle_update(msg(ADMIN, shop.B_WEB)); self.assertIn("/a/login/", self.last()["text"])
-        bot.handle_update(msg(ADMIN, shop.B_RECEIPTS)); self.assertIn("رسیدی در انتظار", self.last()["text"])
+        bot.handle_update(cb(ADMIN, "sa:queue")); self.assertIn("رسیدی در انتظار", self.last("editMessageText")["text"])
         bot.handle_update(cb(ADMIN, "sa:users")); bot.handle_update(msg(ADMIN, "/admin"))
         self.assertIn("/a/login/", self.last()["text"])              # a shop prompt never swallows a command
 
@@ -1219,14 +1230,14 @@ class ShopSecondReviewTests(SalesCase):
 
     def own(self, uid=ALICE):
         bot.handle_update(cb(ADMIN, "sa:uwal:%d:add" % uid)); bot.handle_update(msg(ADMIN, "150000 هدیه"))
-        bot.handle_update(cb(uid, "c:wpay:%d" % self.plan["id"]))
+        self.checkout(cb(uid, "c:wpay:%d" % self.plan["id"]))
         return self.row("SELECT token FROM shop_services WHERE tg_id=? ORDER BY created_ts DESC", (uid,))["token"]
 
     def test_failure_after_the_delivery_commit_never_refunds(self):
         bot.handle_update(cb(ADMIN, "sa:uwal:%d:add" % ALICE)); bot.handle_update(msg(ADMIN, "150000 هدیه"))
         real = shop.deliver_message
         shop.deliver_message = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("telegram down"))
-        try: bot.handle_update(cb(ALICE, "c:wpay:%d" % self.plan["id"]))
+        try: self.checkout(cb(ALICE, "c:wpay:%d" % self.plan["id"]))
         finally: shop.deliver_message = real
         o = self.row("SELECT * FROM shop_orders")
         self.assertEqual((o["status"], o["token"]), ("approved", "tok0")); self.assertIsNotNone(o["delivered_ts"])
@@ -1293,3 +1304,189 @@ class ShopSecondReviewTests(SalesCase):
             self.assertTrue(any("هنوز تمام نشده" in t for t in self.texts(ADMIN))); self.assertTrue(shop.setting("outage"))
         finally:
             shop.run_bg = real_bg; shop._bc_lock.release()
+
+class ShopRequestedChangesTests(SalesCase):
+    def accept(self, token=None):
+        suffix = ':' + token if token else ''
+        bot.handle_update(cb(ALICE, 'c:plan:%d%s' % (self.plan['id'], suffix)))
+        bot.handle_update(cb(ALICE, 'c:agree:%d%s' % (self.plan['id'], suffix)))
+
+    def test_terms_block_forged_payment_and_require_displayed_revision(self):
+        for action in ('pay', 'wpay'):
+            bot.handle_update(cb(ALICE, 'c:%s:%d' % (action, self.plan['id'])))
+            self.assertIsNone(self.row('SELECT * FROM shop_orders'))
+        shop.set_setting('terms', 'قوانین جدید <test>')
+        bot.handle_update(cb(ALICE, 'c:agree:%d' % self.plan['id']))
+        self.assertFalse(shop.terms_accepted(ALICE, self.plan['id']))
+        self.assertIn('&lt;test&gt;', self.last('editMessageText')['text'])
+        bot.handle_update(cb(ALICE, 'c:agree:%d' % self.plan['id']))
+        self.assertTrue(shop.terms_accepted(ALICE, self.plan['id']))
+        self.assertFalse(shop.terms_accepted(ALICE, self.plan['id'], 'another'))
+        bot.handle_update(cb(ALICE, 'c:pay:%d' % self.plan['id']))
+        self.assertEqual(self.row('SELECT amount FROM shop_orders')['amount'], 150000)
+        shop.set_setting('terms', 'یک ویرایش دیگر')
+        self.assertFalse(shop.terms_accepted(ALICE, self.plan['id']))
+
+    def test_admin_can_edit_terms_but_support_cannot(self):
+        bot.handle_update(cb(ADMIN, 'sa:terms'))
+        bot.handle_update(msg(ADMIN, 'متن تازهٔ قوانین'))
+        self.assertEqual(shop.terms_text(), 'متن تازهٔ قوانین')
+        bot.handle_update(cb(SUPPORT, 'sa:terms'))
+        bot.handle_update(msg(SUPPORT, 'متن غیرمجاز'))
+        self.assertEqual(shop.terms_text(), 'متن تازهٔ قوانین')
+
+    def test_real_customer_count_requires_delivered_purchase_and_deduplicates(self):
+        bot.handle_update(msg(BOB, '/start'))
+        self.assertIn('مشتری‌ها: <b>0</b>', shop.shop_admin_text())
+        o = self.buy(); bot.handle_update(photo(ALICE))
+        self.assertIn('مشتری‌ها: <b>0</b>', shop.shop_admin_text())
+        bot.handle_update(cb(ADMIN, 'r:ok:%d' % o['id']))
+        self.assertIn('مشتری‌ها: <b>1</b>', shop.shop_admin_text())
+        self.buy()
+        self.assertIn('مشتری‌ها: <b>1</b>', shop.shop_admin_text())
+        c = bot.db()
+        c.execute("INSERT INTO shop_orders(tg_id,kind,gb,days,price,amount,status,created_ts,delivered_ts) VALUES(200,'topup',0,0,100000,100000,'approved',1,1)")
+        c.commit(); c.close()
+        self.assertIn('مشتری‌ها: <b>1</b>', shop.shop_admin_text())
+
+    def test_test_cooldown_boundary_and_failed_retry_restore_history(self):
+        from unittest.mock import patch
+        now = 2000000000
+        c = bot.db(); c.execute('UPDATE shop_customers SET test_used_ts=? WHERE tg_id=?', (now - shop.TEST_COOLDOWN + 1, ALICE)); c.commit(); c.close()
+        with patch.object(shop.time, 'time', return_value=now):
+            shop.claim_test(ALICE, 5, ALICE, 'Alice')
+            self.assertEqual(len(self.minted), 0)
+        with patch.object(shop.time, 'time', return_value=now+1), patch.object(bot, 'create_user', return_value=None):
+            shop.claim_test(ALICE, 5, ALICE, 'Alice')
+        self.assertEqual(shop.get_customer(ALICE)['test_used_ts'], now-shop.TEST_COOLDOWN+1)
+        with patch.object(shop.time, 'time', return_value=now+1):
+            shop.claim_test(ALICE, 5, ALICE, 'Alice')
+            shop.claim_test(ALICE, 5, ALICE, 'Alice')
+        self.assertEqual(len(self.minted), 1)
+
+    def test_exports_check_ownership_and_send_latest_complete_text(self):
+        from unittest.mock import patch
+        from pathlib import Path
+        import base64
+        tok = self.fake_create(30, 30, 'Alice')
+        c = bot.db(); c.execute("INSERT INTO shop_services(token,tg_id,kind,created_ts) VALUES(?,?,'paid',1)", (tok, ALICE)); c.commit(); c.close()
+        text = 'vless://new-current-config\n' * 300
+        with tempfile.TemporaryDirectory() as folder, patch.object(bot, 'SUB_DIR', folder), patch.object(shop, 'upload', return_value={'ok': True}) as upload:
+            def fresh(*args): Path(bot.sub_path(tok)).write_bytes(base64.b64encode(text.encode()))
+            with patch.object(bot, 'write_sub', side_effect=fresh) as write:
+                shop.send_connection(BOB, BOB, tok, 'configs')
+                upload.assert_not_called(); write.assert_not_called()
+                shop.send_connection(ALICE, ALICE, tok, 'configs')
+                self.assertEqual(upload.call_args.args[4].decode(), text)
+                write.assert_called_once()
+                shop.send_connection(ALICE, ALICE, tok, 'qr')
+                self.assertEqual(upload.call_args.args[0], 'sendPhoto')
+                self.assertTrue(upload.call_args.args[4].startswith(b'\x89PNG\r\n\x1a\n'))
+        keys = [b.get('callback_data') for row in shop.service_kb(tok) for b in row]
+        for action in ('qr', 'configs', 'rotate'):
+            self.assertIn('c:%s:%s' % (action, tok), keys)
+
+    def test_rotation_revokes_old_identity_preserves_state_and_is_retryable(self):
+        from unittest.mock import patch
+        from pathlib import Path
+        import base64, contextlib
+        from tests.test_link_settings import EP
+        old = self.fake_create(30, 30, 'Alice')
+        c = bot.db()
+        c.execute("INSERT INTO shop_services(token,tg_id,kind,created_ts,auto_renew) VALUES(?,?,'paid',1,1)", (old, ALICE))
+        c.execute('UPDATE users SET used_bytes=9000,usage_reset_bytes=1000,usage_anchor=5000 WHERE token=?', (old,))
+        c.execute("INSERT INTO usage_ledger VALUES('u_old.ep',?,4,4000)", (old,))
+        c.execute("INSERT INTO usage_daily VALUES(?, '2026-10-24',1000,9000)", (old,))
+        c.commit(); c.close()
+        before = dict(shop.owned_service(ALICE, old))
+        bot.meta_set('sub_base_'+old, 'https://cdn3.example.com')
+        with tempfile.TemporaryDirectory() as folder, contextlib.ExitStack() as stack:
+            for key, value in [('SUB_DIR',folder), ('ENDPOINTS',[dict(EP)]), ('refresh_usage',lambda *a: None),
+                               ('_enable_usage_ledger',lambda *a: True), ('tags_to_cut_for_user',lambda *a: {'vless-ws'})]:
+                stack.enter_context(patch.object(bot,key,value))
+            removed = stack.enter_context(patch.object(bot,'xr_remove_user',return_value=False))
+            cut = stack.enter_context(patch.object(bot,'force_disconnect',return_value=True))
+            real_add = bot.xr_add_user
+            added = stack.enter_context(patch.object(bot,'xr_add_user',return_value=False))
+            bot.ensure_slot_credential(old, EP, 'tls', 443)
+            old_secret = bot._slot_credential_map(old)[('vless-ws','tls',443)]['secret']
+            Path(bot.sub_path(old)).write_text('old subscription')
+            self.assertIsNone(shop.rotate_service(BOB, old))
+            self.assertIsNone(shop.rotate_service(ALICE, old))
+            added.assert_not_called()
+            self.assertTrue(Path(bot.sub_path(old)).exists())
+            removed.return_value = True
+            self.assertIsNone(shop.rotate_service(ALICE, old)) # add failed after old was revoked
+            self.assertFalse(Path(bot.sub_path(old)).exists())
+            # Stale background snapshots cannot republish or reauthorize the retired token.
+            bot.write_sub(old, before['uuid'], before['label'])
+            self.assertFalse(Path(bot.sub_path(old)).exists())
+            with patch.object(bot, '_adu') as adu:
+                self.assertFalse(real_add(old, before['uuid']))
+                adu.assert_not_called()
+            self.assertIsNone(shop.owned_service(ALICE, old))
+            job = self.row('SELECT * FROM shop_rotations')
+            new = job['new_token']
+            self.assertEqual(job['phase'], 'activate')
+            self.assertTrue(shop.owned_service(ALICE, new)['frozen'])
+            added.return_value = True
+            self.assertEqual(shop.rotate_service(ALICE, old), new)
+            after = dict(shop.owned_service(ALICE, new))
+            for key in ('limit_bytes','expiry_ts','used_bytes','usage_reset_bytes','config_override','created_ts','frozen'):
+                self.assertEqual(after[key],before[key],key)
+            self.assertNotEqual(after['uuid'], before['uuid'])
+            self.assertNotEqual(bot._slot_credential_map(new)[('vless-ws','tls',443)]['secret'],old_secret)
+            self.assertTrue(bot.sub_url(new).startswith('https://cdn3.example.com/'))
+            self.assertEqual(self.row('SELECT token FROM usage_daily')['token'],new)
+            self.assertEqual(self.row('SELECT token FROM usage_ledger')['token'],new)
+            calls = added.call_count
+            self.assertEqual(shop.rotate_service(ALICE,old),new)
+            self.assertEqual(added.call_count,calls)
+            self.assertTrue(cut.called)
+            self.assertNotIn(old_secret,base64.b64decode(Path(bot.sub_path(new)).read_bytes()).decode())
+            c=bot.db(); bot._ledger_apply_snapshot(c,shop.owned_service(ALICE,new),{'u_%s.vless-ws.new'%new:100}); c.commit(); c.close()
+            self.assertEqual(shop.owned_service(ALICE,new)['used_bytes'],9100)
+
+    def test_rotation_button_requires_confirmation_and_owner(self):
+        from unittest.mock import patch
+        tok = self.fake_create(30, 30, 'Alice')
+        c=bot.db(); c.execute("INSERT INTO shop_services(token,tg_id,kind,created_ts) VALUES(?,?,'paid',1)",(tok,ALICE)); c.commit(); c.close()
+        with patch.object(shop,'rotate_service',return_value=None) as rotate:
+            bot.handle_update(cb(ALICE,'c:rotate_yes:'+tok))
+            rotate.assert_not_called()
+            bot.handle_update(cb(BOB,'c:rotate:'+tok))
+            rotate.assert_not_called()
+            bot.handle_update(cb(ALICE,'c:rotate:'+tok))
+            rotate.assert_not_called()
+            bot.handle_update(cb(ALICE,'c:rotate_yes:'+tok))
+            rotate.assert_called_once_with(ALICE,tok)
+
+    def test_acceptance_is_consumed_by_checkout(self):
+        self.accept()
+        self.assertTrue(shop.terms_accepted(ALICE,self.plan['id']))
+        bot.handle_update(cb(ALICE,'c:pay:%d'%self.plan['id']))
+        self.assertFalse(shop.terms_accepted(ALICE,self.plan['id']))
+        before=self.row('SELECT COUNT(*) n FROM shop_orders')['n']
+        bot.handle_update(cb(ALICE,'c:pay:%d'%self.plan['id']))
+        self.assertEqual(self.row('SELECT COUNT(*) n FROM shop_orders')['n'],before)
+
+    def test_rotation_keeps_frozen_status_and_waits_for_disconnect(self):
+        from unittest.mock import patch
+        import contextlib
+        from pathlib import Path
+        tok=self.fake_create(30,30,'Alice')
+        c=bot.db();c.execute("INSERT INTO shop_services(token,tg_id,kind,created_ts) VALUES(?,?,'test',1)",(tok,ALICE));c.execute('UPDATE users SET frozen=1 WHERE token=?',(tok,));c.commit();c.close()
+        with tempfile.TemporaryDirectory() as folder, contextlib.ExitStack() as stack:
+            for key,value in [('SUB_DIR',folder),('_enable_usage_ledger',lambda *a: True),('xr_remove_user',lambda *a: True),('refresh_usage',lambda *a: None),('tags_to_cut_for_user',lambda *a: set())]:
+                stack.enter_context(patch.object(bot,key,value))
+            cut=stack.enter_context(patch.object(bot,'force_disconnect',return_value=False))
+            add=stack.enter_context(patch.object(bot,'xr_add_user',return_value=True))
+            Path(bot.sub_path(tok)).write_text('old')
+            self.assertIsNone(shop.rotate_service(ALICE,tok))
+            add.assert_not_called()
+            self.assertTrue(Path(bot.sub_path(tok)).exists())
+            cut.return_value=True
+            new=shop.rotate_service(ALICE,tok)
+            self.assertIsNotNone(new)
+            self.assertTrue(shop.owned_service(ALICE,new)['frozen'])
+            add.assert_not_called()

@@ -5,6 +5,8 @@
 # through `core`, which bot.py binds once at import time (see bind()).
 # Roadmap and feature list: docs/SHOP.md.
 import os, re, json, math, time, html, sqlite3, secrets, tempfile, threading, urllib.request, urllib.parse, urllib.error
+import base64, hashlib, struct, zlib
+from qrcodegen import QrCode
 
 core = None   # the bot module (bot.py); set by bind()
 
@@ -28,6 +30,7 @@ def init_db():
         referrer_id INTEGER, blocked INTEGER NOT NULL DEFAULT 0,
         state TEXT)""")                       # state = JSON of the customer's current input step
     _add_cols(c, "shop_customers", [("test_used_ts", "INTEGER NOT NULL DEFAULT 0"),
+                                    ("terms_acceptance", "TEXT"),
                                     ("wallet", "INTEGER NOT NULL DEFAULT 0"),    # toman; only wallet_apply() changes it
                                     ("notify", "INTEGER NOT NULL DEFAULT 1")])   # customer wants usage/expiry warnings
     # Wallet ledger: every balance change, with the balance after it. (kind, ref) is unique so
@@ -85,6 +88,9 @@ def init_db():
     c.execute("""CREATE TABLE IF NOT EXISTS shop_admin_log(
         id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, actor INTEGER,
         action TEXT NOT NULL, target TEXT, detail TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS shop_rotations(
+        old_token TEXT PRIMARY KEY, new_token TEXT NOT NULL UNIQUE, tg_id INTEGER NOT NULL,
+        frozen_before INTEGER NOT NULL, phase TEXT NOT NULL, created_ts INTEGER NOT NULL)""")
     c.commit(); c.close()
 
 # ---------------- settings (meta, prefixed) ----------------
@@ -308,11 +314,160 @@ def customer_menu(chat, text="از منوی پایین یکی رو انتخاب 
 def link_kb(token, extra=None):
     """Open-in-browser page = QR + copy + one-tap import into Happ/v2rayNG (subserver.py)."""
     rows = [[{"text": "📲 باز کردن صفحهٔ اتصال", "url": core.sub_url(token)}],
+            connection_buttons(token),
             [{"text": "📚 آموزش اتصال", "callback_data": "c:guide"}]]
     return rows + (extra or [])
 
+# --- purchase terms ---
+DEFAULT_TERMS = "لطفاً پیش از خرید توجه کنید: در صورت اختلال یا قطعی اینترنت، مسئولیتی در قبال مشکلات ناشی از آن نداریم."
+TERMS_TTL = 3600
+
+def terms_text():
+    return setting("terms", DEFAULT_TERMS)
+
+def terms_key(plan_id, token=None):
+    return hashlib.sha256(json.dumps([terms_text(), int(plan_id), token], ensure_ascii=False).encode()).hexdigest()
+
+def terms_accepted(uid, plan_id, token=None):
+    cust = get_customer(uid)
+    try: accepted = json.loads(cust["terms_acceptance"] or "{}") if cust else {}
+    except (ValueError, TypeError): return False
+    return (accepted.get("key") == terms_key(plan_id, token) and
+            0 <= time.time() - accepted.get("ts", 0) < TERMS_TTL)
+
+def consume_terms(uid):
+    c = core.db(); c.execute("UPDATE shop_customers SET terms_acceptance=NULL WHERE tg_id=?", (uid,)); c.commit(); c.close()
+
+def require_terms(chat, mid, uid, plan_id, token=None):
+    if terms_accepted(uid, plan_id, token): return True
+    # Only an acceptance of the text actually displayed may unlock payment.
+    set_state(uid, {"stage": "terms", "key": terms_key(plan_id, token)})
+    suffix = (":" + token) if token else ""
+    core.edit(chat, mid, "<b>قوانین خرید</b>\n\n%s\n\nبرای ادامهٔ خرید، لطفاً قوانین را بخوانید و تأیید کنید." % html.escape(terms_text()),
+              [[{"text": "قوانین را خواندم و می‌پذیرم", "callback_data": "c:agree:%d%s" % (plan_id, suffix)}],
+               [{"text": "بازگشت", "callback_data": "c:plans%s" % suffix}]])
+    return False
+
+# --- connection exports ---
+def connection_buttons(token):
+    return [{"text": "دریافت QR Code", "callback_data": "c:qr:" + token},
+            {"text": "متن کامل کانفیگ‌ها", "callback_data": "c:configs:" + token}]
+
+def qr_png(text):
+    qr = QrCode.encode_text(text, QrCode.Ecc.MEDIUM)
+    scale, border = 8, 4
+    side = (qr.get_size() + border * 2) * scale
+    rows = []
+    for y in range(-border, qr.get_size() + border):
+        row = bytes(0 if qr.get_module(x, y) else 255
+                    for x in range(-border, qr.get_size() + border) for _ in range(scale))
+        rows.extend([b"\x00" + row] * scale)
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", side, side, 8, 0, 0, 0, 0)) +
+            chunk(b"IDAT", zlib.compress(b"".join(rows))) + chunk(b"IEND", b""))
+
+def rotate_service(uid, token):
+    """Durable, fail-closed replacement. The ticker resumes either phase after a crash."""
+    with _deliver_lock, core._membership_lock:
+        c = core.db()
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            job = c.execute("SELECT * FROM shop_rotations WHERE old_token=? AND tg_id=?", (token, uid)).fetchone()
+            if not job:
+                u = c.execute("SELECT u.* FROM users u JOIN shop_services s ON s.token=u.token "
+                              "WHERE u.token=? AND s.tg_id=? AND u.pending_delete=0", (token, uid)).fetchone()
+                if not u: c.rollback(); return None
+                # Do not rotate a second time while this service has an unfinished operation.
+                if c.execute("SELECT 1 FROM shop_rotations WHERE new_token=? AND phase!='done'", (token,)).fetchone():
+                    c.rollback(); return None
+                new = secrets.token_hex(8)
+                c.execute("INSERT INTO shop_rotations VALUES(?,?,?,?, 'retire',?)",
+                          (token, new, uid, u["frozen"], int(time.time())))
+                c.execute("UPDATE users SET frozen=1,auth_pending=1 WHERE token=?", (token,))
+            c.commit()
+            job = c.execute("SELECT * FROM shop_rotations WHERE old_token=? AND tg_id=?", (token, uid)).fetchone()
+        finally: c.close()
+        new = job["new_token"]
+        if job["phase"] == "done": return new
+        if job["phase"] == "retire":
+            # A reliable final usage baseline must precede destruction of old identities.
+            if not core._enable_usage_ledger(token): return None
+            tags = core.tags_to_cut_for_user(token)
+            if not core.xr_remove_user(token): return None
+            if not core.force_disconnect(tags): return None
+            core.refresh_usage(token)
+            # Remove the public old subscription before publishing any new credentials.
+            try: os.unlink(core.sub_path(token))
+            except FileNotFoundError: pass
+            c = core.db()
+            try:
+                c.execute("BEGIN IMMEDIATE")
+                u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone()
+                if not u: c.rollback(); return None
+                total = c.execute("SELECT COALESCE(SUM(total_bytes),0) FROM usage_ledger WHERE token=?", (token,)).fetchone()[0]
+                c.execute("UPDATE users SET token=?,uuid=?,email=?,credential_mode='slots',active_slots='[]',"
+                          "base_bytes=used_bytes,last_raw=0,usage_anchor=?,rebase_floor=NULL,auth_pending=0 WHERE token=?",
+                          (new, str(core.uuidlib.uuid4()), "u_" + new, int(u["used_bytes"] or 0) - total, token))
+                for table in ("shop_services", "shop_orders", "shop_tickets", "usage_daily", "usage_ledger"):
+                    c.execute("UPDATE " + table + " SET token=? WHERE token=?", (new, token))
+                for table in ("slot_credentials", "slot_mode_tags", "legacy_emails"):
+                    c.execute("DELETE FROM " + table + " WHERE token=?", (token,))
+                c.execute("UPDATE meta SET k=? WHERE k=?", ("sub_base_" + new, "sub_base_" + token))
+                c.execute("UPDATE shop_rotations SET phase='activate' WHERE old_token=?", (token,))
+                c.commit()
+            finally: c.close()
+        # Keep the replacement frozen until routes, subscription and Xray all succeed.
+        c = core.db(); u = c.execute("SELECT * FROM users WHERE token=?", (new,)).fetchone(); c.close()
+        if not u: return None
+        if u["config_override"] is not None and core.effective_outbounds(new) != core.get_outbounds():
+            ok, _ = core.apply_xray_outbounds()
+            if not ok: return None
+        core.write_sub(new, u["uuid"], u["label"])
+        if not job["frozen_before"] and not u["disabled_ts"] and not core.exhaust_reason(u):
+            if not core.xr_add_user(new, u["uuid"]): return None
+        c = core.db()
+        c.execute("UPDATE users SET frozen=?,active_slots=? WHERE token=?",
+                  (job["frozen_before"], core._encode_slots(core.active_slot_keys(new)), new))
+        c.execute("UPDATE shop_rotations SET phase='done' WHERE old_token=?", (token,))
+        c.commit(); c.close()
+        log(uid, "service_rotate", token, new)
+        return new
+
+def retry_rotations():
+    c = core.db(); jobs = c.execute("SELECT * FROM shop_rotations WHERE phase!='done'").fetchall(); c.close()
+    for job in jobs:
+        new = rotate_service(job["tg_id"], job["old_token"])
+        if new:
+            core.send(job["tg_id"], "لینک و کانفیگ‌های قبلی باطل شدند. اطلاعات جدید اتصال شما:", link_kb(new))
+
+def send_connection(chat, uid, token, kind):
+    u = owned_service(uid, token)
+    if not u:
+        core.send(chat, "این سرویس پیدا نشد."); return
+    try:
+        if kind == "qr":
+            result = upload("sendPhoto", chat, "photo", "connection.png", qr_png(core.sub_url(token)),
+                            "QR Code اشتراک «%s»" % html.escape(u["label"] or ""))
+        else:
+            # write_sub uses the current public/custom settings and the existing identities.
+            core.write_sub(token, u["uuid"], u["label"])
+            with open(core.sub_path(token), "rb") as f:
+                text = base64.b64decode(f.read(), validate=True).decode("utf-8")
+            if not text.strip():
+                core.send(chat, "فعلاً کانفیگی برای این سرویس فعال نیست."); return
+            # A UTF-8 attachment preserves every config even beyond Telegram's message limit.
+            result = upload("sendDocument", chat, "document", "configs.txt", text.encode("utf-8"),
+                            "متن کامل و به‌روز کانفیگ‌های «%s»" % html.escape(u["label"] or ""))
+        if not result.get("ok"):
+            core.send(chat, "ارسال انجام نشد؛ کمی بعد دوباره امتحان کنید.")
+    except Exception as e:
+        print("shop connection export err", type(e).__name__, flush=True)
+        core.send(chat, "دریافت اطلاعات اتصال الان ممکن نشد؛ کمی بعد دوباره امتحان کنید.")
+
 # --- free test ---
 TEST_DEFAULT_MB, TEST_DEFAULT_HOURS = 500, 24
+TEST_COOLDOWN = 30 * 86400
 
 def test_mb():    return int(setting("test_mb", TEST_DEFAULT_MB))
 def test_hours(): return int(setting("test_hours", TEST_DEFAULT_HOURS))
@@ -320,25 +475,28 @@ def test_enabled(): return flag("test_enabled", "1")
 
 def test_offer(chat, uid):
     cust = get_customer(uid)
-    if cust["test_used_ts"]:
-        core.send(chat, "🎁 تست رایگانت رو قبلاً گرفتی (%s).\nبرای ادامه می‌تونی یه سرویس بخری 👇" % fa_date(cust["test_used_ts"]),
+    if cust["test_used_ts"] and time.time() - cust["test_used_ts"] < TEST_COOLDOWN:
+        core.send(chat, "🎁 تست رایگانت رو قبلاً گرفتی؛ از %s می‌تونی دوباره تست بگیری.\nبرای ادامه می‌تونی یه سرویس بخری 👇" % fa_date(cust["test_used_ts"] + TEST_COOLDOWN),
                   [[{"text": "🛒 خرید سرویس", "callback_data": "c:buy"}]]); return
     if not test_enabled():
         say(chat, "🎁 فعلاً تست رایگان نداریم؛ به‌زودی دوباره فعال می‌شه."); return
-    core.send(chat, "🎁 <b>تست رایگان</b>\n\n📦 %s · ⏳ %s\nهر حساب فقط یک بار می‌تونه تست بگیره."
+    core.send(chat, "🎁 <b>تست رایگان</b>\n\n📦 %s · ⏳ %s\nهر حساب هر ۳۰ روز یک بار می‌تونه تست بگیره."
               % (fa_size(test_mb()), fa_hours(test_hours())),
               [[{"text": "✅ دریافت تست", "callback_data": "c:test"}]])
 
 def claim_test(chat, mid, uid, first_name):
-    """One test per Telegram account: the claim is an atomic UPDATE, undone if minting fails."""
+    """Claim once every 30 days atomically; restore the prior claim if minting fails."""
     if not test_enabled():
         core.edit(chat, mid, "🎁 فعلاً تست رایگان نداریم."); return
     now = int(time.time())
     c = core.db()
-    claimed = c.execute("UPDATE shop_customers SET test_used_ts=? WHERE tg_id=? AND test_used_ts=0", (now, uid)).rowcount
+    c.execute("BEGIN IMMEDIATE")
+    previous = c.execute("SELECT test_used_ts FROM shop_customers WHERE tg_id=?", (uid,)).fetchone()
+    claimed = c.execute("UPDATE shop_customers SET test_used_ts=? WHERE tg_id=? AND (test_used_ts=0 OR test_used_ts<=?)",
+                        (now, uid, now - TEST_COOLDOWN)).rowcount
     c.commit(); c.close()
     if not claimed:
-        core.edit(chat, mid, "🎁 تست رایگانت رو قبلاً گرفتی."); return
+        core.edit(chat, mid, "🎁 از دریافت تست قبلی هنوز ۳۰ روز نگذشته."); return
     token = None
     try: token = core.create_user(test_mb() / 1024, test_hours() / 24, label=("تست %s" % (first_name or uid))[:40])
     except Exception as e: print("shop test err", e, flush=True)
@@ -346,7 +504,7 @@ def claim_test(chat, mid, uid, first_name):
     if token:
         c.execute("INSERT INTO shop_services(token,tg_id,kind,created_ts) VALUES(?,?,'test',?)", (token, uid, now))
     else:
-        c.execute("UPDATE shop_customers SET test_used_ts=0 WHERE tg_id=?", (uid,))
+        c.execute("UPDATE shop_customers SET test_used_ts=? WHERE tg_id=? AND test_used_ts=?", (previous[0], uid, now))
     c.commit(); c.close()
     if not token:
         core.edit(chat, mid, "❌ ساخت تست الان ممکن نشد؛ چند دقیقهٔ دیگه دوباره امتحان کن."); return
@@ -565,8 +723,7 @@ def get_order(oid):
     c = core.db(); r = c.execute("SELECT * FROM shop_orders WHERE id=?", (oid,)).fetchone(); c.close(); return r
 
 def create_order(uid, kind, price, plan=None, token=None, now=None):
-    """New card-to-card invoice (kind buy | renew | topup) with a unique amount (price + a few
-    random tomans) so the reviewer can match the bank SMS. Older unpaid invoices are cancelled."""
+    """Create an invoice for the displayed price; cancel older unpaid invoices."""
     now = int(time.time()) if now is None else now
     c = core.db()
     try:
@@ -574,12 +731,7 @@ def create_order(uid, kind, price, plan=None, token=None, now=None):
         cards = c.execute("SELECT id FROM shop_cards WHERE active=1").fetchall()
         if not cards: c.rollback(); return None
         c.execute("UPDATE shop_orders SET status='cancelled' WHERE tg_id=? AND status='awaiting'", (uid,))
-        taken = {r[0] for r in c.execute("SELECT amount FROM shop_orders WHERE status IN ('awaiting','review') OR "
-                                         "(status IN ('expired','rejected') AND created_ts>=?)", (now - LATE_RECEIPT,))}
-        amount = price + 1 + secrets.randbelow(999)
-        for _ in range(50):
-            if amount not in taken: break
-            amount = price + 1 + secrets.randbelow(999)
+        amount = price
         oid = c.execute("INSERT INTO shop_orders(tg_id,kind,token,plan_id,gb,days,price,amount,card_id,status,created_ts,discount) "
                         "VALUES(?,?,?,?,?,?,?,?,?,'awaiting',?,?)",
                         (uid, kind, token, plan["id"] if plan else None, plan["gb"] if plan else 0,
@@ -609,6 +761,7 @@ def payment_text(o):
                html.escape(card["holder"] if card else "-"), fa_clock(o["created_ts"] + ORDER_TTL)))
 
 def start_payment(chat, mid, uid, plan_id, token=None):
+    if not require_terms(chat, mid, uid, plan_id, token): return
     plan = get_plan(plan_id)
     if not plan or not plan["active"]:
         core.edit(chat, mid, "این پلن دیگه موجود نیست.", [[{"text": "🛒 پلن‌ها", "callback_data": "c:plans"}]]); return
@@ -619,6 +772,7 @@ def start_payment(chat, mid, uid, plan_id, token=None):
         core.edit(chat, mid, "😔 پرداخت کارت‌به‌کارت موقتاً در دسترس نیست؛ کمی بعد دوباره امتحان کن.")
         for a in owner_ids(): core.send(a, "⚠️ مشتری می‌خواست بخرد ولی هیچ کارت فعالی تعریف نشده است.")
         return
+    consume_terms(uid)
     core.edit(chat, mid, payment_text(o), [[{"text": "❌ لغو سفارش", "callback_data": "c:cancel:%d" % o["id"]}]])
 
 def cancel_order(chat, mid, uid, oid):
@@ -837,7 +991,7 @@ def deliver(oid, actor=None):
 def _after_deliver(o, token):
     oid = o["id"]
     extra = paid_of(o) - o["price"] if o["kind"] != "topup" and o["pay_method"] == "card" else 0
-    if extra > 0: wallet_change(o["tg_id"], extra, "overpay", ref="order:%d" % oid)   # incl. the unique-amount tomans
+    if extra > 0: wallet_change(o["tg_id"], extra, "overpay", ref="order:%d" % oid)
     if o["kind"] == "topup":
         core.send(o["tg_id"], "💰 <b>کیف پولت %s شارژ شد!</b>\nموجودی: <b>%s</b>" % (toman(paid_of(o)), toman(balance(o["tg_id"]))),
                   [[{"text": "🛒 خرید سرویس", "callback_data": "c:buy"}]])
@@ -955,6 +1109,7 @@ def refund_undelivered(oid, uid, amount):
         c.close()
 
 def wallet_pay(chat, mid, uid, plan_id, token=None):
+    if not require_terms(chat, mid, uid, plan_id, token): return
     plan = get_plan(plan_id)
     if not plan or not plan["active"]:
         core.edit(chat, mid, "این پلن دیگه موجود نیست.", [[{"text": "🛒 پلن‌ها", "callback_data": "c:plans"}]]); return
@@ -969,6 +1124,7 @@ def wallet_pay(chat, mid, uid, plan_id, token=None):
         core.edit(chat, mid, "این سرویس دیگه وجود نداره؛ می‌تونی یه سرویس جدید بخری.", [[{"text": "🛒 خرید سرویس", "callback_data": "c:buy"}]]); return
     if status == "failed":
         core.edit(chat, mid, "❌ ساخت سرویس الان ممکن نشد؛ مبلغ به کیف پولت برگشت. چند دقیقهٔ دیگه دوباره امتحان کن."); return
+    consume_terms(uid)
     core.edit(chat, mid, "✅ از کیف پولت %s کم شد. موجودی: %s" % (toman(o["price"]), toman(balance(uid))))
 
 def reward_inviter(o):
@@ -1170,9 +1326,11 @@ def today_usage(token):
 def service_kb(token):
     c = core.db(); r = c.execute("SELECT kind FROM shop_services WHERE token=?", (token,)).fetchone(); c.close()
     rows = [[{"text": "📲 باز کردن صفحهٔ اتصال", "url": core.sub_url(token)}],
+            connection_buttons(token),
             [{"text": "🔄 بروزرسانی وضعیت", "callback_data": "c:svc:%s" % token},
              {"text": "➕ تمدید", "callback_data": "c:renew:%s" % token}]]
     if r and r["kind"] == "paid": rows += auto_kb(token)
+    rows.append([{"text": "ابطال لینک و کانفیگ‌ها و دریافت لینک جدید", "callback_data": "c:rotate:" + token}])
     return rows + [[{"text": "📚 آموزش اتصال", "callback_data": "c:guide"}, {"text": "بازگشت", "callback_data": "c:svcs"}]]
 
 def service_view(uid, token, now=None):
@@ -1717,12 +1875,22 @@ def customer_callback(chat, mid, uid, data, cbid, user=None):
         return
     if parts[:2] == ["c", "plans"]:
         core.answer(cbid); send_plans(chat, uid, parts[2] if len(parts) == 3 else None, mid); return
-    if parts[:2] in (["c", "plan"], ["c", "pay"], ["c", "wpay"]) and len(parts) in (3, 4) and _int(parts[2]) is not None:
+    if parts[:2] in (["c", "plan"], ["c", "pay"], ["c", "wpay"], ["c", "agree"]) and len(parts) in (3, 4) and _int(parts[2]) is not None:
         core.answer(cbid)
         if parts[1] == "pay": start_payment(chat, mid, uid, int(parts[2]), token); return
         if parts[1] == "wpay": wallet_pay(chat, mid, uid, int(parts[2]), token); return
         plan = get_plan(int(parts[2]))
         if not plan or not plan["active"]: send_plans(chat, uid, token, mid); return
+        if token and not owned_service(uid, token):
+            core.edit(chat, mid, "این سرویس پیدا نشد."); return
+        if parts[1] == "agree":
+            st = get_state(uid) or {}
+            if st.get("stage") == "terms" and st.get("key") == terms_key(plan["id"], token):
+                c = core.db()
+                c.execute("UPDATE shop_customers SET terms_acceptance=? WHERE tg_id=?",
+                          (json.dumps({"key": st["key"], "ts": time.time()}), uid))
+                c.commit(); c.close(); set_state(uid, None)
+        if not require_terms(chat, mid, uid, plan["id"], token): return
         text, kb = invoice_view(priced(uid, plan), token, balance(uid)); core.edit(chat, mid, text, kb); return
     if parts[:2] == ["c", "cancel"] and len(parts) == 3 and _int(parts[2]) is not None:
         core.answer(cbid); cancel_order(chat, mid, uid, int(parts[2])); return
@@ -1744,6 +1912,30 @@ def customer_callback(chat, mid, uid, data, cbid, user=None):
         core.answer(cbid); core.send(chat, "%s\n%s" % (share_text(), invite_link(uid))); return
     if data == "c:svcs":
         core.answer(cbid); core.edit(chat, mid, *services_view(uid)); return
+    if len(parts) == 3 and parts[:2] in (["c", "rotate"], ["c", "rotate_yes"]):
+        core.answer(cbid)
+        if not owned_service(uid, parts[2]):
+            core.send(chat, "این سرویس پیدا نشد."); return
+        if parts[1] == "rotate":
+            set_state(uid, {"stage": "rotate", "token": parts[2], "ts": time.time()})
+            core.edit(chat, mid, "با ادامه، لینک اشتراک و تمام کانفیگ‌های قبلی باطل می‌شوند و اتصال‌های فعلی قطع می‌شوند. "
+                      "باید اطلاعات جدید را دوباره در برنامهٔ اتصال وارد کنید. حجم و زمان باقی‌مانده حفظ می‌شود.\n\nادامه می‌دهید؟",
+                      [[{"text": "بله، اطلاعات قبلی را باطل کن", "callback_data": "c:rotate_yes:" + parts[2]}],
+                       [{"text": "انصراف", "callback_data": "c:svc:" + parts[2]}]]); return
+        st = get_state(uid) or {}
+        if st.get("stage") != "rotate" or st.get("token") != parts[2] or time.time() - st.get("ts", 0) > 600:
+            core.send(chat, "ابتدا از صفحهٔ سرویس، درخواست ابطال را تأیید کنید."); return
+        set_state(uid, None)
+        try: new = rotate_service(uid, parts[2])
+        except Exception as e:
+            print("shop rotate err", type(e).__name__, flush=True); new = None
+        if new:
+            core.edit(chat, mid, "لینک و کانفیگ‌های قبلی باطل شدند.\n\nلینک جدید:\n<code>%s</code>" % html.escape(core.sub_url(new)), link_kb(new))
+        else:
+            core.edit(chat, mid, "جایگزینی اطلاعات اتصال هنوز کامل نشده؛ ربات دوباره تلاش می‌کند. اطلاعات جدید در بخش سرویس‌های من نمایش داده می‌شود.")
+        return
+    if len(parts) == 3 and parts[:2] in (["c", "qr"], ["c", "configs"]):
+        core.answer(cbid); send_connection(chat, uid, parts[2], parts[1]); return
     if parts[:2] == ["c", "svc"] and len(parts) == 3:
         core.answer(cbid, "بروز شد")   # counters come from the enforcer's own refresh (every POLL seconds); no xray call here
         core.edit(chat, mid, *service_view(uid, parts[2])); return
@@ -1812,7 +2004,7 @@ def on_update(up):
 
 # ---------------- admin side ----------------
 B_LINKS, B_SHOP, B_WEB = "🔗 لینک‌ها", "🛍 فروشگاه", "🌐 پنل وب"
-ADMIN_MENU = [[B_LINKS, B_SHOP], [B_RECEIPTS, B_TICKETS], [B_WEB]]
+ADMIN_MENU = [[B_LINKS, B_SHOP], [B_WEB]]
 ADMIN_BUTTONS = {b for row in ADMIN_MENU for b in row}
 
 def admin_start(chat):
@@ -1830,7 +2022,7 @@ def _count(sql, args=()):
 def shop_admin_text():
     return ("🛍 <b>مدیریت فروشگاه</b>\n\n👥 مشتری‌ها: <b>%d</b>\n🎧 پشتیبان‌ها: <b>%d</b>\n"
             "🛠 حالت تعمیرات: <b>%s</b>\n💾 بکاپ روزانه: <b>%s</b>"
-            % (_count("SELECT COUNT(*) FROM shop_customers"), _count("SELECT COUNT(*) FROM shop_staff"),
+            % (_count("SELECT COUNT(DISTINCT tg_id) FROM shop_orders WHERE status='approved' AND delivered_ts IS NOT NULL AND kind IN ('buy','renew') AND price>0"), _count("SELECT COUNT(*) FROM shop_staff"),
                "روشن" if flag("maintenance") else "خاموش", "روشن" if flag("backup_auto") else "خاموش"))
 
 def shop_admin_kb():
@@ -1841,7 +2033,8 @@ def shop_admin_kb():
               "callback_data": "sa:tickets"}],
             [{"text": "📦 پلن‌ها", "callback_data": "sa:plans"}, {"text": "💳 کارت‌ها", "callback_data": "sa:cards"}],
             [{"text": "👤 کاربران", "callback_data": "sa:users"}, {"text": "🎁 تست رایگان", "callback_data": "sa:test"}],
-            [{"text": "👥 دعوت دوستان", "callback_data": "sa:ref"}],
+            [{"text": "👥 دعوت دوستان", "callback_data": "sa:ref"},
+             {"text": "قوانین خرید", "callback_data": "sa:terms"}],
             [{"text": "✅ اعلام رفع اختلال" if setting("outage") else "📢 اعلان اختلال", "callback_data": "sa:outage"}],
             [{"text": "🎧 پشتیبان‌ها", "callback_data": "sa:staff"}, {"text": "📜 لاگ کارها", "callback_data": "sa:log"}],
             [{"text": "💾 بکاپ الان", "callback_data": "sa:backup"},
@@ -1869,7 +2062,7 @@ def test_admin_text():
     disliked = c.execute("SELECT COUNT(*) FROM shop_services WHERE kind='test' AND feedback='bad'").fetchone()[0]
     c.close()
     return ("🎁 <b>تست رایگان</b>\n\nوضعیت: <b>%s</b>\nحجم: <b>%s</b> · زمان: <b>%s</b>\n\n"
-            "تست‌های داده‌شده: %s · 👍 %s · 👎 %s\n\nهر حساب تلگرام فقط یک بار تست می‌گیرد."
+            "تست‌های داده‌شده: %s · 👍 %s · 👎 %s\n\nهر حساب تلگرام هر ۳۰ روز یک بار تست می‌گیرد."
             % ("روشن" if test_enabled() else "خاموش", fa_size(test_mb()), fa_hours(test_hours()),
                fa(given), fa(liked), fa(disliked)))
 
@@ -2031,6 +2224,11 @@ def admin_callback(chat, mid, uid, data, cbid):
     if data.startswith("t:"):
         ticket_callback(chat, mid, uid, data, cbid); return
     review_pending.pop(uid, None); ticket_pending.pop(uid, None)
+    if data == "sa:terms":
+        core.answer(cbid)
+        core.pending[chat] = {"ts": time.time(), "stage": "sa_terms"}
+        core.edit(chat, mid, "<b>قوانین خرید</b>\n\n%s\n\nمتن جدید قوانین را بفرستید (حداکثر ۳۰۰۰ حرف)." % html.escape(terms_text()),
+                  [[{"text": "انصراف", "callback_data": "sa:menu"}]]); return
     if data == "sa:tickets":
         core.answer(cbid); t, kb = tickets_view()
         core.edit(chat, mid, t, (kb or []) + [[{"text": "بازگشت", "callback_data": "sa:menu"}]]); return
@@ -2183,6 +2381,12 @@ def admin_message(chat, uid, m):
     st = core.pending.get(chat)
     if st and str(st.get("stage", "")).startswith("sa_") and time.time() - st.get("ts", 0) > PENDING_TTL:
         core.pending.pop(chat, None); st = None   # an hours-old prompt must not read a random later message
+    if st and st.get("stage") == "sa_terms":
+        if not text or len(text) > 3000:
+            core.send(chat, "متن قوانین باید بین ۱ تا ۳۰۰۰ حرف باشد."); return True
+        set_setting("terms", text); log(uid, "terms_edit")
+        core.pending.pop(chat, None)
+        core.send(chat, "قوانین خرید ذخیره شد.\n\n" + html.escape(text), shop_admin_kb()); return True
     if st and st.get("stage") == "sa_outage":
         if not text: core.send(chat, "متن اعلان را بنویس:"); return True
         core.pending.pop(chat, None); set_setting("outage_draft", text[:1000])
@@ -2329,7 +2533,7 @@ def housekeeping(now=None):
 
 def tick():
     """Every step on its own, so one failing job never starves the others."""
-    for job in (_tick_backup, send_test_followups, expire_orders, retry_deliveries, run_auto_renewals,
+    for job in (_tick_backup, retry_rotations, send_test_followups, expire_orders, retry_deliveries, run_auto_renewals,
                 send_service_warnings, housekeeping):
         try: job()
         except Exception as e: print("shop tick err", job.__name__, e, flush=True)
