@@ -1112,6 +1112,7 @@ def _after_deliver(o, token):
     if not o or o["status"] != "approved": return
     oid = o["id"]
     extra = paid_of(o) - o["price"] if o["kind"] != "topup" and o["pay_method"] == "card" else 0
+    if auto_review_pending(o): extra = 0  # Unreviewed receipts cannot create spendable overpayment credit.
     if extra > 0: wallet_change(o["tg_id"], extra, "overpay", ref="order:%d" % oid)
     if o["kind"] == "topup":
         core.send(o["tg_id"], "💰 <b>کیف پولت %s شارژ شد!</b>\nموجودی: <b>%s</b>" % (toman(paid_of(o)), toman(balance(o["tg_id"]))),
@@ -1316,9 +1317,16 @@ def confirm_auto_receipt(oid, actor):
     if actor not in owner_ids(): return False
     with _deliver_lock:
         c = core.db()
-        n = c.execute("UPDATE shop_orders SET auto_reviewed=1,decided_by=? WHERE id=? AND status='approved' AND auto_approved=1 AND auto_reviewed=0", (actor, oid,)).rowcount
-        c.commit(); c.close()
-        if not n: return False
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            o = c.execute("SELECT * FROM shop_orders WHERE id=?", (oid,)).fetchone()
+            if not o or not auto_review_pending(o): c.rollback(); return False
+            extra = paid_of(o) - o["price"]
+            if o["delivered_ts"] and extra > 0 and not c.execute("SELECT 1 FROM shop_wallet_tx WHERE kind='overpay' AND ref=?", ("order:%d" % oid,)).fetchone():
+                wallet_apply(c, o["tg_id"], extra, "overpay", ref="order:%d" % oid)
+            c.execute("UPDATE shop_orders SET auto_reviewed=1,decided_by=? WHERE id=?", (actor, oid))
+            c.commit()
+        finally: c.close()
         log(actor, "order_auto_confirm", oid)
         reward_inviter(get_order(oid))
     refresh_review(oid)

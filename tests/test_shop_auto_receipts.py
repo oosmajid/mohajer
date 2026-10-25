@@ -256,3 +256,22 @@ class AutoReceiptTests(SalesCase):
         shop.retry_auto_reviews();shop.retry_deliveries(int(time.time())+3600)
         self.assertEqual(shop.get_order(order['id'])['status'],'review')
         self.assertEqual(self.minted,[])
+
+    def test_legacy_invoice_extra_is_not_spendable_before_manual_review(self):
+        shop.set_setting('receipt_auto_approve','1')
+        order=self.buy()
+        c=bot.db();c.execute('UPDATE shop_orders SET amount=150742 WHERE id=?',(order['id'],));c.commit();c.close()
+        bot.handle_update(photo(ALICE,'legacy-extra'))
+        self.assertEqual(shop.balance(ALICE),0)
+        bot.handle_update(cb(ADMIN,'r:ok:%d'%order['id']))
+        self.assertEqual(shop.balance(ALICE),742)
+        bot.handle_update(cb(ADMIN,'r:ok:%d'%order['id']))
+        self.assertEqual(shop.balance(ALICE),742)
+
+    def test_rejected_legacy_invoice_extra_never_creates_wallet_credit(self):
+        shop.set_setting('receipt_auto_approve','1')
+        order=self.buy()
+        c=bot.db();c.execute('UPDATE shop_orders SET amount=150742 WHERE id=?',(order['id'],));c.commit();c.close()
+        bot.handle_update(photo(ALICE,'legacy-extra-reject'))
+        self.assertTrue(self.reject(order['id']))
+        self.assertEqual(shop.balance(ALICE),0)
