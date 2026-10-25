@@ -31,6 +31,7 @@ def init_db():
         state TEXT)""")                       # state = JSON of the customer's current input step
     _add_cols(c, "shop_customers", [("test_used_ts", "INTEGER NOT NULL DEFAULT 0"),
                                     ("terms_acceptance", "TEXT"),
+                                    ("purchase_blocked_until", "INTEGER NOT NULL DEFAULT 0"),
                                     ("wallet", "INTEGER NOT NULL DEFAULT 0"),    # toman; only wallet_apply() changes it
                                     ("notify", "INTEGER NOT NULL DEFAULT 1")])   # customer wants usage/expiry warnings
     # Wallet ledger: every balance change, with the balance after it. (kind, ref) is unique so
@@ -62,7 +63,10 @@ def init_db():
         decided_ts INTEGER, decided_by INTEGER, note TEXT, review_msgs TEXT)""")
     _add_cols(c, "shop_orders", [("pay_method", "TEXT NOT NULL DEFAULT 'card'"),    # card | wallet
                                  ("discount", "INTEGER NOT NULL DEFAULT 0"),         # toman off the list price
-                                 ("delivered_ts", "INTEGER")])                       # set exactly once by fulfill()
+                                 ("delivered_ts", "INTEGER"),
+                                 ("auto_approved", "INTEGER NOT NULL DEFAULT 0"),
+                                 ("auto_reviewed", "INTEGER NOT NULL DEFAULT 0"),
+                                 ("auto_grant", "TEXT")])                       # set exactly once by fulfill()
     _add_cols(c, "shop_services", [("plan_id", "INTEGER"),                          # plan used for auto-renew
                                    ("auto_renew", "INTEGER NOT NULL DEFAULT 0"),
                                    ("auto_note_ts", "INTEGER NOT NULL DEFAULT 0"),  # last "not enough balance" note
@@ -91,6 +95,10 @@ def init_db():
     c.execute("""CREATE TABLE IF NOT EXISTS shop_rotations(
         old_token TEXT PRIMARY KEY, new_token TEXT NOT NULL UNIQUE, tg_id INTEGER NOT NULL,
         frozen_before INTEGER NOT NULL, phase TEXT NOT NULL, created_ts INTEGER NOT NULL)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS shop_receipt_reversals(
+        order_id INTEGER PRIMARY KEY, action TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0,
+        created_ts INTEGER NOT NULL, cut_tags TEXT)""")
+    _add_cols(c, "shop_receipt_reversals", [("cut_tags", "TEXT")])
     # Older panel deletions left shop ownership rows behind until daily housekeeping.
     for row in c.execute("SELECT s.token FROM shop_services s LEFT JOIN users u ON u.token=s.token WHERE u.token IS NULL").fetchall():
         forget_service(c, row["token"])
@@ -125,6 +133,33 @@ def set_setting(key, value):
 
 def flag(key, default="0"):
     return setting(key, default) == "1"
+
+PURCHASE_PENALTY = 48 * 3600
+
+class PurchaseBlocked(Exception):
+    pass
+
+def purchase_blocked(uid, now=None, connection=None):
+    now = time.time() if now is None else now
+    c = connection or core.db()
+    try:
+        row = c.execute("SELECT purchase_blocked_until FROM shop_customers WHERE tg_id=?", (uid,)).fetchone()
+        return bool(row and row[0] > now)
+    finally:
+        if connection is None: c.close()
+
+def purchase_penalty_text(uid):
+    until = get_customer(uid)["purchase_blocked_until"]
+    return ("به دلیل رد شدن رسید، خرید و تمدید این حساب تا %s ساعت %s محدود شده است. "
+            "برای پیگیری می‌توانی از بخش گزارش مشکل پیام بدهی." % (fa_date(until), fa_clock(until)))
+
+def purchase_allowed(chat, uid, mid=None):
+    if not purchase_blocked(uid): return True
+    text = purchase_penalty_text(uid)
+    kb = [[{"text": "گزارش مشکل", "callback_data": "c:rep"}]]
+    if mid: core.edit(chat, mid, text, kb)
+    else: core.send(chat, text, kb)
+    return False
 
 # ---------------- formatting ----------------
 _FA_DIGITS = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
@@ -721,6 +756,7 @@ def price_text(p):
             if p.get("discount") else toman(p["price"]))
 
 def plans_view(uid, token=None):
+    if purchase_blocked(uid): return purchase_penalty_text(uid), [[{"text": "گزارش مشکل", "callback_data": "c:rep"}]]
     if token and not owned_service(uid, token): return services_view(uid)
     plans = [priced(uid, p) for p in list_plans()]
     if not plans:
@@ -728,8 +764,6 @@ def plans_view(uid, token=None):
     suffix = (":" + token) if token else ""
     kb = [[{"text": "%s%s · %s" % ("🔥 " if p["popular"] else "", plan_title(p["gb"], p["days"]), toman(p["price"])),
             "callback_data": "c:plan:%d%s" % (p["id"], suffix)}] for p in plans]
-    per_gb = ["• %s ← هر گیگ %s" % (plan_title(p["gb"], p["days"]), toman(p["price"] / p["gb"]))
-              for p in plans if p["gb"]]
     if token:
         u = owned_service(uid, token)
         head = "🔄 <b>تمدید «%s»</b>\nحجم و زمان پلن به همین سرویس اضافه می‌شه و لینکت عوض نمی‌شه:" % html.escape(u["label"] if u else "")
@@ -737,7 +771,7 @@ def plans_view(uid, token=None):
         head = "🛒 <b>خرید سرویس</b>\nیکی از پلن‌ها رو انتخاب کن:"
     if plans[0]["discount"]:
         head += "\n\n🎁 چون با دعوت دوستت اومدی، <b>%s٪ تخفیف</b> روی اولین خریدت داری (قیمت‌ها با تخفیفه)." % fa(first_buy_discount(uid))
-    return head + ("\n\n" + "\n".join(per_gb) if per_gb else ""), kb
+    return head, kb
 
 def send_plans(chat, uid, token=None, mid=None):
     text, kb = plans_view(uid, token)
@@ -774,6 +808,8 @@ def create_order(uid, kind, price, plan=None, token=None, now=None):
     c = core.db()
     try:
         c.execute("BEGIN IMMEDIATE")
+        if kind != "topup" and purchase_blocked(uid, now, c):
+            c.rollback(); raise PurchaseBlocked()
         cards = c.execute("SELECT id FROM shop_cards WHERE active=1").fetchall()
         if not cards: c.rollback(); return None
         c.execute("UPDATE shop_orders SET status='cancelled' WHERE tg_id=? AND status='awaiting'", (uid,))
@@ -807,13 +843,16 @@ def payment_text(o):
                html.escape(card["holder"] if card else "-"), fa_clock(o["created_ts"] + ORDER_TTL)))
 
 def start_payment(chat, mid, uid, plan_id, token=None):
+    if not purchase_allowed(chat, uid, mid): return
     if not require_terms(chat, mid, uid, plan_id, token): return
     plan = get_plan(plan_id)
     if not plan or not plan["active"]:
         core.edit(chat, mid, "این پلن دیگه موجود نیست.", [[{"text": "🛒 پلن‌ها", "callback_data": "c:plans"}]]); return
     if token and not owned_service(uid, token):
         core.edit(chat, mid, "این سرویس پیدا نشد."); return
-    o = plan_order(uid, plan, token)
+    try: o = plan_order(uid, plan, token)
+    except PurchaseBlocked:
+        purchase_allowed(chat, uid, mid); return
     if not o:
         core.edit(chat, mid, "😔 پرداخت کارت‌به‌کارت موقتاً در دسترس نیست؛ کمی بعد دوباره امتحان کن.")
         for a in owner_ids(): core.send(a, "⚠️ مشتری می‌خواست بخرد ولی هیچ کارت فعالی تعریف نشده است.")
@@ -834,7 +873,7 @@ def receipt_candidates(c, uid, now):
     """The invoice(s) a receipt can pay for: the open one plus every expired, rejected or
     auto-cancelled one of the last 24h (people pay late, or pay invoice A and then start B);
     with several the customer is asked which one."""
-    return c.execute("SELECT * FROM shop_orders WHERE tg_id=? AND pay_method='card' AND (status='awaiting' OR "
+    return c.execute("SELECT * FROM shop_orders WHERE tg_id=? AND pay_method='card' AND NOT (auto_approved=1 AND status='rejected') AND (status='awaiting' OR "
                      "(status IN ('expired','rejected','cancelled') AND created_ts>=?)) ORDER BY id DESC LIMIT 5",
                      (uid, now - LATE_RECEIPT)).fetchall()
 
@@ -864,14 +903,26 @@ def receive_receipt(chat, uid, file_ref, file_uid, now=None, oid=None):
                                                      "" if r["status"] == "awaiting" else " (قبلی)"),
                          "callback_data": "c:rcpt:%d" % r["id"]}] for r in rows]); return
         o = rows[0]
-        c.execute("UPDATE shop_orders SET status='review',receipt_file=?,receipt_uid=?,receipt_ts=?,note=NULL,"
-                  "decided_ts=NULL,decided_by=NULL WHERE id=?", (file_ref, file_uid, now, o["id"]))
+        if o["kind"] != "topup" and purchase_blocked(uid, now, c):
+            c.rollback(); purchase_allowed(chat, uid); return
+        automatic = flag("receipt_auto_approve") and o["kind"] in ("buy", "renew")
+        c.execute("UPDATE shop_orders SET status=?,receipt_file=?,receipt_uid=?,receipt_ts=?,note=NULL,"
+                  "decided_ts=?,decided_by=?,auto_approved=?,auto_reviewed=0 WHERE id=?",
+                  ("approved" if automatic else "review", file_ref, file_uid, now,
+                   now if automatic else None, 0 if automatic else None, int(automatic), o["id"]))
         c.commit()
     finally:
         c.close()
     set_state(uid, None)
-    say(chat, "✅ رسیدت رسید! بعد از بررسی خبرت می‌کنیم 🙏\nشمارهٔ سفارش: #%s" % fa(o["id"]))
+    if automatic:
+        log(0, "order_auto_approve", o["id"])
+        token = deliver(o["id"], 0)
+        if not token:
+            say(chat, "رسید به‌صورت خودکار تأیید شد. ساخت سرویس هنوز کامل نشده و ربات دوباره تلاش می‌کند.\nشمارهٔ سفارش: #%s" % fa(o["id"]))
+    else:
+        say(chat, "✅ رسیدت رسید! بعد از بررسی خبرت می‌کنیم 🙏\nشمارهٔ سفارش: #%s" % fa(o["id"]))
     send_review(o["id"])
+
 
 def reviewers():
     c = core.db(); staff = [r[0] for r in c.execute("SELECT tg_id FROM shop_staff")]; c.close()
@@ -890,11 +941,23 @@ def review_caption(o):
     if o["paid_amount"] is not None:
         lines.append("✏️ مبلغ واریزی: <b>%s</b>" % toman(o["paid_amount"]))
     lines.append("💳 کارت: %s (%s)" % (("…" + card["number"][-4:]) if card else "-", html.escape(card["holder"]) if card else "-"))
-    if o["status"] == "approved": lines += ["", "✅ <b>تأیید شد</b> · <code>%s</code>" % o["decided_by"]]
+    if auto_review_pending(o): lines += ["", "تأیید خودکار؛ منتظر بررسی ادمین"]
+    elif o["status"] == "approved": lines += ["", "✅ <b>تأیید شد</b> · <code>%s</code>" % o["decided_by"]]
     if o["status"] == "rejected": lines += ["", "❌ <b>رد شد</b>: %s · <code>%s</code>" % (html.escape(o["note"] or ""), o["decided_by"])]
+    if o["status"] == "approved" and o["kind"] != "topup" and not o["delivered_ts"]:
+        lines += ["ساخت سرویس هنوز کامل نشده؛ ربات دوباره تلاش می‌کند."]
+    if o["auto_approved"] and o["status"] == "rejected":
+        c = core.db(); pending = c.execute("SELECT 1 FROM shop_receipt_reversals WHERE order_id=? AND done=0", (o["id"],)).fetchone(); c.close()
+        if pending: lines += ["همگام‌سازی قطع دسترسی هنوز کامل نشده؛ ربات دوباره تلاش می‌کند."]
     return "\n".join(lines)
 
+def auto_review_pending(o):
+    return bool(o["auto_approved"] and not o["auto_reviewed"] and o["status"] == "approved")
+
 def review_kb(o):
+    if auto_review_pending(o):
+        return [[{"text": "✅ تأیید", "callback_data": "r:ok:%d" % o["id"]},
+                 {"text": "❌ رد", "callback_data": "r:no:%d" % o["id"]}]]
     if o["status"] != "review": return []
     return [[{"text": "✅ تأیید", "callback_data": "r:ok:%d" % o["id"]}, {"text": "❌ رد", "callback_data": "r:no:%d" % o["id"]}],
             [{"text": "✏️ اصلاح مبلغ واریزی (فقط مالک)", "callback_data": "r:amt:%d" % o["id"]}]]
@@ -969,7 +1032,15 @@ def fulfill(o):
             c.execute("UPDATE shop_orders SET delivered_ts=?,token='wallet' WHERE id=?", (now, o["id"]))
             c.commit(); return "wallet"
         token = o["token"]
+        before = c.execute("SELECT limit_bytes,expiry_ts FROM users WHERE token=?", (token,)).fetchone() if token else None
+        service_before = c.execute("SELECT kind,plan_id FROM shop_services WHERE token=?", (token,)).fetchone() if token else None
         if o["kind"] == "renew" and token and _extend_link(c, token, o["gb"], o["days"], now):
+            if o["auto_approved"]:
+                after = c.execute("SELECT limit_bytes,expiry_ts FROM users WHERE token=?", (token,)).fetchone()
+                grant = {"created": False, "limit_delta": after[0] - before[0], "expiry_delta": after[1] - before[1],
+                         "service_kind": service_before["kind"] if service_before else "paid",
+                         "plan_id": service_before["plan_id"] if service_before else None}
+                c.execute("UPDATE shop_orders SET auto_grant=? WHERE id=?", (json.dumps(grant), o["id"]))
             c.execute("UPDATE shop_services SET kind='paid',plan_id=COALESCE(?,plan_id),auto_note_ts=0,warn_flags=0 WHERE token=?",
                       (o["plan_id"], token))
             c.execute("UPDATE shop_orders SET delivered_ts=? WHERE id=?", (now, o["id"]))
@@ -993,6 +1064,8 @@ def fulfill(o):
         c.execute("BEGIN IMMEDIATE")
         c.execute("INSERT OR IGNORE INTO shop_services(token,tg_id,kind,created_ts,plan_id) VALUES(?,?,'paid',?,?)",
                   (token, o["tg_id"], now, o["plan_id"]))
+        if o["auto_approved"]:
+            c.execute("UPDATE shop_orders SET auto_grant=? WHERE id=?", (json.dumps({"created": True}), o["id"]))
         c.execute("UPDATE shop_orders SET token=?,delivered_ts=? WHERE id=? AND delivered_ts IS NULL", (token, now, o["id"]))
         c.commit()
     finally:
@@ -1010,7 +1083,7 @@ def reset_warnings(token):
         c.commit()
     c.close()
 
-_deliver_lock = threading.Lock()   # the update loop and the ticker both deliver; never the same order twice at once
+_deliver_lock = threading.RLock()   # the update loop and the ticker both deliver; never the same order twice at once
 
 DELIVER_HEADS = {"card": "🎉 <b>پرداختت تأیید شد!</b>", "wallet": "🎉 <b>خریدت انجام شد!</b>", "auto": "🔁 <b>تمدید خودکار انجام شد</b>"}
 
@@ -1035,6 +1108,8 @@ def deliver(oid, actor=None):
     return o["token"] or token
 
 def _after_deliver(o, token):
+    o = get_order(o["id"])
+    if not o or o["status"] != "approved": return
     oid = o["id"]
     extra = paid_of(o) - o["price"] if o["kind"] != "topup" and o["pay_method"] == "card" else 0
     if extra > 0: wallet_change(o["tg_id"], extra, "overpay", ref="order:%d" % oid)
@@ -1042,7 +1117,7 @@ def _after_deliver(o, token):
         core.send(o["tg_id"], "💰 <b>کیف پولت %s شارژ شد!</b>\nموجودی: <b>%s</b>" % (toman(paid_of(o)), toman(balance(o["tg_id"]))),
                   [[{"text": "🛒 خرید سرویس", "callback_data": "c:buy"}]])
     else:
-        head = DELIVER_HEADS.get(o["pay_method"], DELIVER_HEADS["card"])
+        head = "رسیدت به‌صورت خودکار تأیید شد." if o["auto_approved"] else DELIVER_HEADS.get(o["pay_method"], DELIVER_HEADS["card"])
         if o["pay_method"] == "auto": head += " (%s از کیف پولت)" % toman(o["price"])
         deliver_message(o, token, head, extra)
         reward_inviter(o)
@@ -1118,6 +1193,7 @@ def wallet_buy(uid, plan, token=None, kind="purchase"):
     c = core.db()
     try:
         c.execute("BEGIN IMMEDIATE")
+        if purchase_blocked(uid, now, c): c.rollback(); return "penalty", None, None
         dup = c.execute("SELECT id FROM shop_orders WHERE tg_id=? AND pay_method IN ('wallet','auto') AND plan_id=? AND kind=? "
                         "AND (kind='buy' OR token=?) AND status='approved' AND created_ts>?",
                         (uid, plan["id"], "renew" if token else "buy", token, now - DUP_WINDOW)).fetchone()
@@ -1155,6 +1231,7 @@ def refund_undelivered(oid, uid, amount):
         c.close()
 
 def wallet_pay(chat, mid, uid, plan_id, token=None):
+    if not purchase_allowed(chat, uid, mid): return
     if not require_terms(chat, mid, uid, plan_id, token): return
     plan = get_plan(plan_id)
     if not plan or not plan["active"]:
@@ -1162,6 +1239,8 @@ def wallet_pay(chat, mid, uid, plan_id, token=None):
     if token and not owned_service(uid, token):
         core.edit(chat, mid, "این سرویس پیدا نشد."); return
     status, o, tok = wallet_buy(uid, plan, token)
+    if status == "penalty":
+        purchase_allowed(chat, uid, mid); return
     if status == "funds":
         text, kb = invoice_view(priced(uid, plan), token, balance(uid)); core.edit(chat, mid, "⚠️ موجودی کافی نیست.\n\n" + text, kb); return
     if status == "dup":
@@ -1176,13 +1255,15 @@ def wallet_pay(chat, mid, uid, plan_id, token=None):
 def reward_inviter(o):
     """The inviter earns a share of the invitee's FIRST real purchase. ref='ref:<invitee>' is
     unique in the ledger, so it can only ever be paid once per invited customer."""
+    o = get_order(o["id"])
+    if not o or o["status"] != "approved" or not o["delivered_ts"] or (o["auto_approved"] and not o["auto_reviewed"]): return
     cust = get_customer(o["tg_id"])
     if not cust or not cust["referrer_id"] or o["kind"] == "topup": return
     c = core.db()
     n = c.execute("SELECT COUNT(*) FROM shop_orders WHERE tg_id=? AND status='approved' AND delivered_ts IS NOT NULL "
-                  "AND kind!='topup'", (o["tg_id"],)).fetchone()[0]
+                  "AND kind!='topup' AND (auto_approved=0 OR auto_reviewed=1)", (o["tg_id"],)).fetchone()[0]
     inviter_bought = c.execute("SELECT 1 FROM shop_orders WHERE tg_id=? AND status='approved' AND delivered_ts IS NOT NULL "
-                               "AND kind!='topup'", (cust["referrer_id"],)).fetchone()
+                               "AND kind!='topup' AND (auto_approved=0 OR auto_reviewed=1)", (cust["referrer_id"],)).fetchone()
     c.close()
     amount = o["price"] * ref_reward_pct() // 100
     if n != 1 or amount <= 0 or not inviter_bought: return   # a reward only ever goes to a paying customer
@@ -1231,7 +1312,102 @@ def invite_view(uid):
 
 REJECT_REASONS = ["مبلغ واریزی با فاکتور یکی نیست", "رسید ناخوانا یا نامعتبر است", "واریزی به حساب ما نرسیده", "رسید تکراری است"]
 
+def confirm_auto_receipt(oid, actor):
+    if actor not in owner_ids(): return False
+    with _deliver_lock:
+        c = core.db()
+        n = c.execute("UPDATE shop_orders SET auto_reviewed=1,decided_by=? WHERE id=? AND status='approved' AND auto_approved=1 AND auto_reviewed=0", (actor, oid,)).rowcount
+        c.commit(); c.close()
+        if not n: return False
+        log(actor, "order_auto_confirm", oid)
+        reward_inviter(get_order(oid))
+    refresh_review(oid)
+    return True
+
+def process_receipt_reversal(oid):
+    """Durably retry both credential revocation and Linux session teardown."""
+    with _deliver_lock, core._membership_lock:
+        c = core.db(); job = c.execute("SELECT * FROM shop_receipt_reversals WHERE order_id=? AND done=0", (oid,)).fetchone(); c.close()
+        if not job: return True
+        o = get_order(oid)
+        token = o["token"] if o else None
+        if token and job["action"] == "restore": core.refresh_usage(token)
+        c = core.db(); u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone() if token else None; c.close()
+        must_cut = job["action"] == "delete" or bool(u and job["action"] == "restore" and core.exhaust_reason(u))
+        if must_cut:
+            # Keep the inbound set even if the row disappears before socket teardown succeeds.
+            if job["cut_tags"] is None:
+                tags = core.tags_to_cut_for_user(token) if u else None
+                c = core.db(); c.execute("UPDATE shop_receipt_reversals SET cut_tags=? WHERE order_id=?", (json.dumps(sorted(tags) if tags is not None else None), oid)); c.commit(); c.close()
+            else: tags = json.loads(job["cut_tags"])
+            if u and job["action"] == "delete" and not core.delete_user(token): return False
+            if u and job["action"] == "restore" and not core.disable_user(token): return False
+            if not core.force_disconnect(tags): return False
+        if token and job["action"] == "restore": reset_warnings(token)
+        c = core.db(); c.execute("UPDATE shop_receipt_reversals SET done=1 WHERE order_id=?", (oid,)); c.commit(); c.close()
+        return True
+
+def reject_auto_receipt(oid, actor, reason):
+    if actor not in owner_ids(): return False
+    with _deliver_lock, core._membership_lock:
+        now = int(time.time()); c = core.db()
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            o = c.execute("SELECT * FROM shop_orders WHERE id=?", (oid,)).fetchone()
+            if not o or not auto_review_pending(o): c.rollback(); return False
+            c.execute("UPDATE shop_orders SET status='rejected',auto_reviewed=1,note=?,decided_ts=?,decided_by=? WHERE id=?", (reason, now, actor, oid))
+            c.execute("UPDATE shop_customers SET purchase_blocked_until=MAX(purchase_blocked_until,?),state=NULL,terms_acceptance=NULL WHERE tg_id=?", (now + PURCHASE_PENALTY, o["tg_id"]))
+            c.execute("UPDATE shop_orders SET status='cancelled' WHERE tg_id=? AND kind IN ('buy','renew') AND status IN ('awaiting','review')", (o["tg_id"],))
+            grant = json.loads(o["auto_grant"] or "{}")
+            action = "none"
+            u = c.execute("SELECT * FROM users WHERE token=?", (o["token"],)).fetchone() if o["token"] else None
+            if u and o["delivered_ts"]:
+                if grant.get("created"):
+                    action = "delete"
+                    c.execute("UPDATE users SET pending_delete=1,auth_pending=1 WHERE token=?", (o["token"],))
+                else:
+                    action = "restore"
+                    # A finite grant reversal must never turn a finite limit into 0 (unlimited).
+                    limit = max(1, u["limit_bytes"] - grant.get("limit_delta", 0)) if u["limit_bytes"] else 0
+                    expiry = max(1, u["expiry_ts"] - grant.get("expiry_delta", 0)) if u["expiry_ts"] else 0
+                    c.execute("UPDATE users SET limit_bytes=?,expiry_ts=? WHERE token=?", (limit, expiry, o["token"]))
+                    newer = c.execute("SELECT 1 FROM shop_orders WHERE token=? AND status='approved' AND delivered_ts IS NOT NULL AND id>?", (o["token"], oid)).fetchone()
+                    if not newer:
+                        c.execute("UPDATE shop_services SET kind=?,plan_id=? WHERE token=?", (grant.get("service_kind", "paid"), grant.get("plan_id"), o["token"]))
+            c.execute("INSERT INTO shop_receipt_reversals(order_id,action,created_ts) VALUES(?,?,?)", (oid, action, now))
+            c.commit()
+        finally: c.close()
+        enforced = False
+        try: enforced = process_receipt_reversal(oid)
+        except Exception as e: print("shop receipt reversal err", oid, type(e).__name__, flush=True)
+    log(actor, "order_auto_reject", oid, reason)
+    if grant.get("created"):
+        outcome = "سرویس این خرید باطل شد." if enforced else "ابطال سرویس هنوز کامل نشده و ربات دوباره تلاش می‌کند."
+    else:
+        outcome = "افزایش حجم و زمان این تمدید پس گرفته شد." if o["kind"] == "renew" and o["delivered_ts"] else "تحویل این سفارش لغو شد."
+    core.send(o["tg_id"], "رسید سفارش #%s رد شد.\nدلیل: %s\n\n%s\n%s" % (
+        fa(oid), html.escape(reason), outcome, purchase_penalty_text(o["tg_id"])),
+        [[{"text": "گزارش مشکل", "callback_data": "c:rep"}]])
+    refresh_review(oid)
+    return True
+
+def retry_receipt_reversals():
+    c = core.db(); ids = [r[0] for r in c.execute("SELECT order_id FROM shop_receipt_reversals WHERE done=0")]; c.close()
+    for oid in ids:
+        try:
+            if process_receipt_reversal(oid): refresh_review(oid)
+        except Exception as e: print("shop receipt reversal retry err", oid, type(e).__name__, flush=True)
+
+def retry_auto_reviews():
+    c = core.db(); rows = c.execute("SELECT * FROM shop_orders WHERE auto_approved=1 AND auto_reviewed=0 AND status='approved'").fetchall(); c.close()
+    for o in rows:
+        sent = {pair[0] for pair in json.loads(o["review_msgs"] or "[]")}
+        missing = [uid for uid in owner_ids() if uid not in sent]
+        if missing: send_review(o["id"], to=missing)
+
 def reject(oid, uid, reason):
+    o = get_order(oid)
+    if o and o["auto_approved"]: return reject_auto_receipt(oid, uid, reason)
     c = core.db()
     n = c.execute("UPDATE shop_orders SET status='rejected',note=?,decided_ts=?,decided_by=? WHERE id=? AND status='review'",
                   (reason, int(time.time()), uid, oid)).rowcount
@@ -1262,7 +1438,7 @@ def clear_admin_state(chat, uid):
 def queue_view():
     c = core.db()
     rows = c.execute("SELECT o.*, c.first_name FROM shop_orders o LEFT JOIN shop_customers c ON c.tg_id=o.tg_id "
-                     "WHERE o.status='review' ORDER BY o.receipt_ts LIMIT 30").fetchall()
+                     "WHERE o.status='review' OR (o.status='approved' AND o.auto_approved=1 AND o.auto_reviewed=0) ORDER BY o.receipt_ts LIMIT 30").fetchall()
     c.close()
     if not rows: return "🧾 رسیدی در انتظار بررسی نیست ✨", None
     return ("🧾 <b>رسیدهای در انتظار</b> (%s)\nروی هرکدام بزن تا رسیدش بیاد:" % fa(len(rows)),
@@ -1280,7 +1456,15 @@ def review_callback(chat, mid, uid, data, cbid):
     owner = uid in owner_ids()
     if action == "q":
         core.answer(cbid); send_review(oid, to=[chat]); return
-    if o["status"] != "review":
+    pending_auto = auto_review_pending(o)
+    if pending_auto:
+        if not owner:
+            core.answer(cbid, "بررسی رسید خودکار فقط برای مالک ممکن است"); return
+        if action == "ok":
+            confirm_auto_receipt(oid, uid); core.answer(cbid, "تأیید شد؛ سرویس دوباره تحویل نمی‌شود"); return
+        if action == "amt":
+            core.answer(cbid, "مبلغ رسید خودکار قابل تغییر نیست؛ تأیید یا رد کن"); return
+    if o["status"] != "review" and not pending_auto:
         core.answer(cbid, "این سفارش قبلاً بررسی شده"); refresh_review(oid); return
     if action == "ok":
         # Support may only approve an untouched invoice (exact amount); anything that moves money
@@ -1315,7 +1499,7 @@ def review_text(chat, uid, text):
     st = _pending_get(review_pending, uid)
     if not st: return False
     o = get_order(st["oid"])
-    if not o or o["status"] != "review":
+    if not o or (o["status"] != "review" and not (st["kind"] == "reason" and auto_review_pending(o) and uid in owner_ids())):
         review_pending.pop(uid, None); core.send(chat, "این سفارش دیگر در انتظار بررسی نیست."); return True
     if st["kind"] == "reason":
         if not text.strip(): core.send(chat, "دلیل را بنویس:"); return True
@@ -1467,9 +1651,9 @@ def run_auto_renewals(now=None):
     c = core.db()
     rows = c.execute("SELECT s.token AS token, s.tg_id, s.plan_id, s.auto_note_ts, u.label, u.disabled_ts, u.expiry_ts, "
                      "u.limit_bytes, u.used_bytes, u.usage_reset_bytes FROM shop_services s JOIN users u ON u.token=s.token "
-                     "JOIN shop_customers c ON c.tg_id=s.tg_id WHERE s.auto_renew=1 AND s.kind='paid' AND c.blocked=0 "
+                     "JOIN shop_customers c ON c.tg_id=s.tg_id WHERE s.auto_renew=1 AND s.kind='paid' AND c.blocked=0 AND c.purchase_blocked_until<=? "
                      "AND u.pending_delete=0 AND u.frozen=0 AND NOT EXISTS (SELECT 1 FROM shop_orders o WHERE o.token=s.token "
-                     "AND o.kind='renew' AND o.status='approved' AND o.created_ts>?)", (now - AUTO_GAP,)).fetchall()
+                     "AND o.kind='renew' AND o.status='approved' AND o.created_ts>?)", (now, now - AUTO_GAP)).fetchall()
     c.close()
     for r in rows:
         try:
@@ -1905,6 +2089,9 @@ def customer_callback(chat, mid, uid, data, cbid, user=None):
         core.answer(cbid); record_feedback(chat, mid, uid, data); return
     parts = data.split(":")
     token = parts[3] if len(parts) == 4 else None
+    if len(parts) > 1 and parts[1] in ("buy", "renew", "plans", "plan", "agree", "pay", "wpay"):
+        if purchase_blocked(uid):
+            core.answer(cbid); purchase_allowed(chat, uid, mid); return
     if parts[:2] == ["c", "rcpt"] and len(parts) == 3 and _int(parts[2]) is not None:
         st = get_state(uid) or {}
         core.answer(cbid)
@@ -2075,10 +2262,11 @@ def shop_admin_text():
 
 def shop_admin_kb():
     return [[{"text": ("✅ خاموش کردن تعمیرات" if flag("maintenance") else "🛠 روشن کردن تعمیرات"), "callback_data": "sa:maint"}],
-            [{"text": "🧾 رسیدهای در انتظار (%s)" % fa(_count("SELECT COUNT(*) FROM shop_orders WHERE status='review'")),
+            [{"text": "🧾 رسیدهای در انتظار (%s)" % fa(_count("SELECT COUNT(*) FROM shop_orders WHERE status='review' OR (status='approved' AND auto_approved=1 AND auto_reviewed=0)")),
               "callback_data": "sa:queue"},
              {"text": "🎫 تیکت‌ها (%s)" % fa(_count("SELECT COUNT(*) FROM shop_tickets WHERE status='open'")),
               "callback_data": "sa:tickets"}],
+            [{"text": "تأیید پیش‌فرض رسیدها: " + ("روشن" if flag("receipt_auto_approve") else "خاموش"), "callback_data": "sa:receipt_auto"}],
             [{"text": "📦 پلن‌ها", "callback_data": "sa:plans"}, {"text": "💳 کارت‌ها", "callback_data": "sa:cards"}],
             [{"text": "👤 کاربران", "callback_data": "sa:users"}, {"text": "🎁 تست رایگان", "callback_data": "sa:test"}],
             [{"text": "👥 دعوت دوستان", "callback_data": "sa:ref"},
@@ -2357,6 +2545,11 @@ def admin_callback(chat, mid, uid, data, cbid):
             core.answer(cbid); core.edit(chat, mid, *cards_admin()); return
     if data == "sa:menu":
         core.answer(cbid); core.edit(chat, mid, shop_admin_text(), shop_admin_kb()); return
+    if data == "sa:receipt_auto":
+        if uid not in owner_ids(): core.answer(cbid, "فقط مالک می‌تواند این گزینه را تغییر دهد"); return
+        on = not flag("receipt_auto_approve")
+        set_setting("receipt_auto_approve", "1" if on else "0"); log(uid, "receipt_auto_on" if on else "receipt_auto_off")
+        core.answer(cbid); core.edit(chat, mid, shop_admin_text(), shop_admin_kb()); return
     if data == "sa:maint":
         on = not flag("maintenance"); set_setting("maintenance", "1" if on else "0")
         log(uid, "maintenance_on" if on else "maintenance_off")
@@ -2581,7 +2774,7 @@ def housekeeping(now=None):
 
 def tick():
     """Every step on its own, so one failing job never starves the others."""
-    for job in (_tick_backup, retry_rotations, send_test_followups, expire_orders, retry_deliveries, run_auto_renewals,
+    for job in (_tick_backup, retry_receipt_reversals, retry_auto_reviews, retry_rotations, send_test_followups, expire_orders, retry_deliveries, run_auto_renewals,
                 send_service_warnings, housekeeping):
         try: job()
         except Exception as e: print("shop tick err", job.__name__, e, flush=True)
