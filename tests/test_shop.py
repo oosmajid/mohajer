@@ -554,11 +554,11 @@ class ShopWalletTests(SalesCase):
         self.assertIn("کافی نیست", self.last("editMessageText")["text"])
         self.assertEqual(len(self.minted), 1)
 
-    def test_short_balance_offers_exact_topup(self):
+    def test_short_balance_offers_card_payment_only(self):
         bot.handle_update(cb(ADMIN, "sa:uwal:%d:add" % ALICE)); bot.handle_update(msg(ADMIN, "100000 هدیه"))
         self.checkout(cb(ALICE, "c:plan:%d" % self.plan["id"]))
         kb = self.last("editMessageText")["reply_markup"]["inline_keyboard"]
-        self.assertEqual(kb[0][0]["callback_data"], "c:topup_amt:50000")
+        self.assertEqual(kb[0][0]["callback_data"], "c:pay:%d" % self.plan["id"])
 
     def test_failed_wallet_delivery_is_refunded(self):
         self.topup(200000); start = shop.balance(ALICE)
@@ -583,33 +583,7 @@ class ShopWalletTests(SalesCase):
         self.assertIsNone(shop.wallet_change(ALICE, 500, "topup", ref="order:1"))
         self.assertEqual(shop.balance(ALICE), 500)
 
-    def test_auto_renew_from_wallet(self):
-        self.topup(400000)
-        self.checkout(cb(ALICE, "c:wpay:%d" % self.plan["id"]))
-        bot.handle_update(cb(ALICE, "c:auto:tok0"))
-        self.assertEqual(self.row("SELECT auto_renew FROM shop_services WHERE token='tok0'")["auto_renew"], 1)
-        u = self.row("SELECT * FROM users WHERE token='tok0'")
-        shop.run_auto_renewals(now=u["expiry_ts"] - 5 * 3600)         # not due yet
-        self.assertEqual(len(self.ledger()), 2)
-        shop.run_auto_renewals(now=u["expiry_ts"] - 600)
-        after = self.row("SELECT * FROM users WHERE token='tok0'")
-        self.assertEqual(after["limit_bytes"] - u["limit_bytes"], 30 * bot.GB)
-        self.assertEqual(self.ledger()[-1][0], "auto")
-        self.assertEqual(len(self.minted), 1)
-        self.assertIn("تمدید خودکار انجام شد", self.texts(ALICE)[-1])
 
-    def test_auto_renew_low_balance_reminds_once_a_day(self):
-        self.topup(200000)
-        self.checkout(cb(ALICE, "c:wpay:%d" % self.plan["id"]))
-        bot.handle_update(cb(ALICE, "c:auto:tok0"))
-        now = int(time.time())
-        c = bot.db(); c.execute("UPDATE users SET expiry_ts=? WHERE token='tok0'", (now + 600,)); c.commit(); c.close()
-        self.calls.clear()
-        shop.run_auto_renewals(now=now); shop.run_auto_renewals(now=now + 3600)
-        self.assertEqual(len(self.texts(ALICE)), 1)
-        self.assertIn("کافی نیست", self.texts(ALICE)[0])
-        shop.run_auto_renewals(now=now + shop.AUTO_NOTE_EVERY + 1)
-        self.assertEqual(len(self.texts(ALICE)), 2)
 
     def test_others_cannot_toggle_auto_renew(self):
         self.topup(200000); self.checkout(cb(ALICE, "c:wpay:%d" % self.plan["id"]))
@@ -679,8 +653,8 @@ class ShopServicesTests(SalesCase):
         self.assertIn("مصرف امروز: ۲ گیگ", view["text"])
         self.assertIn("۱۰ روز", view["text"])
         callbacks = [b.get("callback_data") for row in view["reply_markup"]["inline_keyboard"] for b in row]
-        self.assertIn("c:renew:%s" % tok, callbacks); self.assertIn("c:auto:%s" % tok, callbacks)
-        bot.handle_update(cb(ALICE, "c:auto:%s" % tok))            # toggle keeps the detail keyboard
+        self.assertIn("c:renew:%s" % tok, callbacks); self.assertNotIn("c:auto:%s" % tok, callbacks)
+        bot.handle_update(cb(ALICE, "c:auto:%s" % tok))            # a legacy button cannot restore the retired feature
         kb = self.last("editMessageReplyMarkup")["reply_markup"]["inline_keyboard"]
         self.assertIn("c:svcs", [b.get("callback_data") for row in kb for b in row])
 
@@ -712,7 +686,7 @@ class ShopServicesTests(SalesCase):
         self.assertEqual(len(self.texts(ALICE)), 4); self.assertIn("تموم شد", self.texts(ALICE)[-1])
         self.assertEqual(self.last()["reply_markup"]["inline_keyboard"][0][0]["callback_data"], "c:renew:%s" % tok)
 
-    def test_quiet_customers_and_auto_renew_still_get_ended(self):
+    def test_quiet_customers_still_get_ended(self):
         tok = self.own(); now = int(time.time())
         bot.handle_update(cb(ALICE, "c:notify"))
         self.assertEqual(shop.get_customer(ALICE)["notify"], 0)
@@ -1045,27 +1019,7 @@ class ShopHardeningTests(SalesCase):
         self.assertEqual(self.row("SELECT limit_bytes FROM users WHERE token=?", (tok,))["limit_bytes"], after["limit_bytes"])
         self.assertEqual(len(self.minted), 1)
 
-    def test_auto_renew_never_charges_twice_for_a_link_that_stays_disabled(self):
-        tok = self.own(); bot.handle_update(cb(ALICE, "c:auto:%s" % tok))
-        bot.handle_update(cb(ADMIN, "sa:uwal:%d:add" % ALICE)); bot.handle_update(msg(ADMIN, "450000 هدیه"))
-        now = int(time.time())
-        self.set_link(tok, expiry_ts=now - 10, disabled_ts=now - 5)   # expired and disabled; xray never re-adds it in tests
-        shop.run_auto_renewals(now=now)
-        self.assertEqual(shop.balance(ALICE), 300000)
-        for dt in (60, 120, 3600, 7200):
-            shop.run_auto_renewals(now=now + dt)
-        self.assertEqual(shop.balance(ALICE), 300000)                 # one renewal, however often the ticker runs
-        self.assertEqual(self.row("SELECT COUNT(*) n FROM shop_orders WHERE kind='renew'")["n"], 1)
-        u = self.row("SELECT * FROM users WHERE token=?", (tok,))
-        self.assertGreater(u["expiry_ts"], now + 29 * 86400)
 
-    def test_blocked_customers_are_not_auto_renewed(self):
-        tok = self.own(); bot.handle_update(cb(ALICE, "c:auto:%s" % tok))
-        bot.handle_update(cb(ADMIN, "sa:uwal:%d:add" % ALICE)); bot.handle_update(msg(ADMIN, "150000 هدیه"))
-        bot.handle_update(cb(ADMIN, "sa:ublock:%d" % ALICE))
-        now = int(time.time()); self.set_link(tok, expiry_ts=now + 60)
-        shop.run_auto_renewals(now=now)
-        self.assertEqual(shop.balance(ALICE), 150000)
 
     def test_renewal_keeps_unlimited_and_covers_overshoot(self):
         tok = self.own()
@@ -1202,13 +1156,12 @@ class ShopHardeningTests(SalesCase):
         bot.handle_update(cb(ALICE, "c:svc:%s" % tok))
         self.assertIn(bot.sub_url(tok), self.last("editMessageText")["text"])
 
-    def test_housekeeping_turns_off_auto_renew_of_deleted_links(self):
-        tok = self.own(); bot.handle_update(cb(ALICE, "c:auto:%s" % tok))
-        c = bot.db(); c.execute("DELETE FROM users WHERE token=?", (tok,)); c.commit(); c.close()
-        self.calls.clear(); shop.housekeeping()
-        self.assertEqual(self.row("SELECT auto_renew FROM shop_services WHERE token=?", (tok,))["auto_renew"], 0)
-        self.assertIn("حذف شد", self.texts(ALICE)[-1])
-        shop.housekeeping(); self.assertEqual(len(self.texts(ALICE)), 1)   # once a day
+    def test_housekeeping_removes_old_orphan_service_rows(self):
+        tok = self.own()
+        c = bot.db(); c.execute("DELETE FROM users WHERE token=?", (tok,))
+        c.execute("UPDATE shop_services SET created_ts=0 WHERE token=?", (tok,)); c.commit(); c.close()
+        shop.housekeeping()
+        self.assertIsNone(self.row("SELECT * FROM shop_services WHERE token=?", (tok,)))
 
     def test_broadcast_reports_failures_and_waits_on_flood(self):
         self.own(ALICE); bot.handle_update(msg(BOB, "/start")); self.own(BOB)

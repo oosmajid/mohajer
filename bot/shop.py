@@ -99,6 +99,8 @@ def init_db():
         order_id INTEGER PRIMARY KEY, action TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0,
         created_ts INTEGER NOT NULL, cut_tags TEXT)""")
     _add_cols(c, "shop_receipt_reversals", [("cut_tags", "TEXT")])
+    # Retained columns describe legacy records only; recurring renewals are retired.
+    c.execute("UPDATE shop_services SET auto_renew=0 WHERE auto_renew!=0")
     # Older panel deletions left shop ownership rows behind until daily housekeeping.
     for row in c.execute("SELECT s.token FROM shop_services s LEFT JOIN users u ON u.token=s.token WHERE u.token IS NULL").fetchall():
         forget_service(c, row["token"])
@@ -409,7 +411,7 @@ def require_terms(chat, mid, uid, plan_id, token=None):
 # --- connection exports ---
 def connection_buttons(token):
     return [{"text": "دریافت QR Code", "callback_data": "c:qr:" + token},
-            {"text": "متن کامل کانفیگ‌ها", "callback_data": "c:configs:" + token}]
+            {"text": "دریافت فایل کانفیگ‌ها", "callback_data": "c:configs:" + token}]
 
 def qr_png(text):
     qr = QrCode.encode_text(text, QrCode.Ecc.MEDIUM)
@@ -642,6 +644,18 @@ def wallet_change(uid, delta, kind, ref=None, note=None, actor=None):
     finally:
         c.close()
 
+def wallet_set(uid, amount, note, actor):
+    if amount < 0 or amount > AMOUNT_MAX: return None
+    c = core.db()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        row = c.execute("SELECT wallet FROM shop_customers WHERE tg_id=?", (uid,)).fetchone()
+        if not row: c.rollback(); return None
+        delta = amount - row[0]
+        if delta: wallet_apply(c, uid, delta, "admin", note=note, actor=actor)
+        c.commit(); return amount, delta
+    finally: c.close()
+
 def balance(uid):
     r = get_customer(uid); return r["wallet"] if r else 0
 
@@ -786,11 +800,6 @@ def invoice_view(plan, token=None, bal=0):
     kb = []
     if bal >= plan["price"]:
         kb.append([{"text": "💰 پرداخت از کیف پول (فوری)", "callback_data": "c:wpay:%d%s" % (plan["id"], suffix)}])
-    elif bal > 0:
-        short = -(-(plan["price"] - bal) // 1000) * 1000          # round the shortfall up to 1,000
-        short = max(short, TOPUP_MIN)
-        text += "\n\nبا شارژ %s می‌تونی از کیف پول پرداخت کنی." % toman(short)
-        kb.append([{"text": "➕ شارژ %s" % toman(short), "callback_data": "c:topup_amt:%d" % short}])
     kb += [[{"text": "💳 پرداخت کارت‌به‌کارت", "callback_data": "c:pay:%d%s" % (plan["id"], suffix)}],
            [{"text": "بازگشت", "callback_data": "c:plans%s" % suffix}]]
     return text, kb
@@ -1095,6 +1104,10 @@ def deliver(oid, actor=None):
         o = get_order(oid)
         if not o or o["status"] != "approved": return None
         if o["delivered_ts"]: return o["token"]
+        if o["pay_method"] == "auto":
+            # Refund previously charged but unfulfilled recurring renewals; never apply them.
+            refund_undelivered(oid, o["tg_id"], o["price"])
+            return None
         token = None
         try: token = fulfill(o)
         except Exception as e: print("shop fulfill err", oid, e, flush=True)
@@ -1156,6 +1169,10 @@ def retry_deliveries(now=None):
                      "AND delivered_ts IS NULL AND decided_ts<?", (now - RETRY_AFTER,)).fetchall()
     c.close()
     for r in rows:
+        if r["pay_method"] == "auto":
+            if refund_undelivered(r["id"], r["tg_id"], r["price"]):
+                core.send(r["tg_id"], "تمدید خودکار حذف شده است. مبلغ %s بابت تمدید انجام‌نشده به کیف پولت برگشت." % toman(r["price"]))
+            continue
         if deliver(r["id"]): continue
         if r["pay_method"] in ("wallet", "auto") and now - r["decided_ts"] >= RETRY_GIVE_UP:
             if refund_undelivered(r["id"], r["tg_id"], r["price"]):   # a day without a link: the customer gets the money back
@@ -1179,18 +1196,14 @@ def deliver_message(o, token, head, extra=0):
     if extra > 0: text += "\n\n💰 %s اضافه واریز کرده بودی؛ به کیف پولت برگشت." % toman(extra)
     core.send(o["tg_id"], text, service_kb(token))
 
-def auto_kb(token):
-    c = core.db(); r = c.execute("SELECT auto_renew FROM shop_services WHERE token=?", (token,)).fetchone(); c.close()
-    on = bool(r and r[0])
-    return [[{"text": "🔁 تمدید خودکار: %s" % ("روشن ✅" if on else "خاموش"), "callback_data": "c:auto:%s" % token}]]
-
 DUP_WINDOW = 60   # a second identical wallet purchase within this many seconds is a double tap, not a new order
 
 def wallet_buy(uid, plan, token=None, kind="purchase"):
     """Pay a plan from the wallet: debit + approved order in one transaction, then deliver. If
     nothing could be delivered the debit is refunded. Returns (status, order, token);
     status ok | funds | dup | gone | failed."""
-    now = int(time.time()); plan = priced(uid, plan); method = "auto" if kind == "auto" else "wallet"
+    if kind != "purchase": return "removed", None, None
+    now = int(time.time()); plan = priced(uid, plan); method = "wallet"
     c = core.db()
     try:
         c.execute("BEGIN IMMEDIATE")
@@ -1542,7 +1555,7 @@ def expire_orders(now=None):
 # --- my services ---
 def my_services(uid):
     c = core.db()
-    rows = c.execute("SELECT u.*, s.kind, s.auto_renew FROM shop_services s JOIN users u ON u.token=s.token "
+    rows = c.execute("SELECT u.*, s.kind FROM shop_services s JOIN users u ON u.token=s.token "
                      "WHERE s.tg_id=? AND u.pending_delete=0 ORDER BY u.created_ts DESC", (uid,)).fetchall()
     c.close(); return rows
 
@@ -1562,13 +1575,11 @@ def today_usage(token):
     c.close(); return (r[0] or 0) if r else 0
 
 def service_kb(token):
-    c = core.db(); r = c.execute("SELECT kind FROM shop_services WHERE token=?", (token,)).fetchone(); c.close()
     rows = [[{"text": "📲 باز کردن صفحهٔ اتصال", "url": core.sub_url(token)}],
             connection_buttons(token),
             [{"text": "🔄 بروزرسانی وضعیت", "callback_data": "c:svc:%s" % token},
              {"text": "➕ تمدید", "callback_data": "c:renew:%s" % token}]]
-    if r and r["kind"] == "paid": rows += auto_kb(token)
-    rows.append([{"text": "ابطال لینک و کانفیگ‌ها و دریافت لینک جدید", "callback_data": "c:rotate:" + token}])
+    rows.append([{"text": "تغییر رمز اتصال", "callback_data": "c:rotate:" + token}])
     return rows + [[{"text": "📚 آموزش اتصال", "callback_data": "c:guide"}, {"text": "بازگشت", "callback_data": "c:svcs"}]]
 
 def service_view(uid, token, now=None):
@@ -1610,10 +1621,10 @@ def due_warnings(u, now):
 
 def send_service_warnings(now=None):
     """80% data, 3 days and 1 day left, and 'ended' - each at most once per renewal period.
-    Test links have their own follow-up; auto-renewing links skip the early warnings."""
+    Test links have their own follow-up."""
     now = int(time.time()) if now is None else now
     c = core.db()
-    rows = c.execute("SELECT s.token, s.tg_id, s.warn_flags, s.auto_renew, c.notify, u.label, u.disabled_ts, u.expiry_ts, "
+    rows = c.execute("SELECT s.token, s.tg_id, s.warn_flags, c.notify, u.label, u.disabled_ts, u.expiry_ts, "
                      "u.limit_bytes, u.used_bytes, u.usage_reset_bytes FROM shop_services s JOIN users u ON u.token=s.token "
                      "JOIN shop_customers c ON c.tg_id=s.tg_id WHERE s.kind='paid' AND u.pending_delete=0 AND u.frozen=0 "
                      "AND c.blocked=0").fetchall()
@@ -1626,7 +1637,7 @@ def send_service_warnings(now=None):
         if new & WARN_ENDED:
             text = "⏸ سرویس «%s» تموم شد و غیرفعال شد.\nتا %s ساعت دیگه با تمدید، همین لینک دوباره فعال می‌شه." % (
                 label, fa(core.GRACE_SECONDS // 3600))
-        elif r["auto_renew"] or not r["notify"]:
+        elif not r["notify"]:
             continue
         elif new & WARN_DAYS1:
             text = "⏳ فقط کمتر از ۱ روز از سرویس «%s» مونده." % label
@@ -1636,54 +1647,6 @@ def send_service_warnings(now=None):
             text = "📊 ۸۰٪ حجم سرویس «%s» مصرف شده." % label
         core.send(r["tg_id"], text, [[{"text": "➕ تمدید", "callback_data": "c:renew:%s" % r["token"]},
                                       {"text": "📦 جزئیات", "callback_data": "c:svc:%s" % r["token"]}]])
-
-# --- auto-renew from the wallet ---
-AUTO_BEFORE, AUTO_USED = 3600, 0.98   # renew when <1h is left, 98% of the data is used, or the link was disabled
-AUTO_NOTE_EVERY = 24 * 3600           # remind about a low balance at most once a day
-
-AUTO_GAP = 3600   # never auto-renew the same link twice within an hour, whatever the counters say
-
-def auto_renew_due(u, now):
-    """Due when the link is about to end. 'disabled' on its own is not a reason: a link that was
-    just renewed stays disabled until xray re-adds it, and charging again for that would loop."""
-    if u["expiry_ts"] and u["expiry_ts"] - now <= AUTO_BEFORE: return True
-    return bool(u["limit_bytes"]) and core.current_usage(u) >= AUTO_USED * u["limit_bytes"]
-
-def _auto_note(r, now, text, kb):
-    if now - r["auto_note_ts"] < AUTO_NOTE_EVERY: return
-    c = core.db(); c.execute("UPDATE shop_services SET auto_note_ts=? WHERE token=?", (now, r["token"])); c.commit(); c.close()
-    core.send(r["tg_id"], text, kb)
-
-def run_auto_renewals(now=None):
-    now = int(time.time()) if now is None else now
-    c = core.db()
-    rows = c.execute("SELECT s.token AS token, s.tg_id, s.plan_id, s.auto_note_ts, u.label, u.disabled_ts, u.expiry_ts, "
-                     "u.limit_bytes, u.used_bytes, u.usage_reset_bytes FROM shop_services s JOIN users u ON u.token=s.token "
-                     "JOIN shop_customers c ON c.tg_id=s.tg_id WHERE s.auto_renew=1 AND s.kind='paid' AND c.blocked=0 AND c.purchase_blocked_until<=? "
-                     "AND u.pending_delete=0 AND u.frozen=0 AND NOT EXISTS (SELECT 1 FROM shop_orders o WHERE o.token=s.token "
-                     "AND o.kind='renew' AND o.status='approved' AND o.created_ts>?)", (now, now - AUTO_GAP)).fetchall()
-    c.close()
-    for r in rows:
-        try:
-            if not auto_renew_due(r, now): continue
-            renew_btn = [{"text": "🔄 تمدید دستی", "callback_data": "c:renew:%s" % r["token"]}]
-            plan = get_plan(r["plan_id"]) if r["plan_id"] else None
-            if not plan or not plan["active"]:
-                _auto_note(r, now, "🔁 تمدید خودکار «%s» انجام نشد: پلن قبلی دیگه فروخته نمی‌شه.\nیه پلن جدید انتخاب کن 👇"
-                           % html.escape(r["label"]), [renew_btn]); continue
-            status, o, tok = wallet_buy(r["tg_id"], plan, r["token"], kind="auto")
-            if status == "funds":
-                short = max(TOPUP_MIN, -(-(plan["price"] - balance(r["tg_id"])) // 1000) * 1000)
-                _auto_note(r, now, "🔁 سرویس «%s» داره تموم می‌شه ولی موجودی کیف پولت برای تمدید خودکار کافی نیست.\n"
-                           "مبلغ تمدید: %s · موجودی: %s" % (html.escape(r["label"]), toman(plan["price"]), toman(balance(r["tg_id"]))),
-                           [[{"text": "➕ شارژ %s" % toman(short), "callback_data": "c:topup_amt:%d" % short}], renew_btn])
-            elif status == "failed":
-                _auto_note(r, now, "🔁 تمدید خودکار «%s» الان انجام نشد؛ مبلغ به کیف پولت برگشت و دوباره تلاش می‌کنیم."
-                           % html.escape(r["label"]), [renew_btn])
-            elif status == "gone":
-                c = core.db(); c.execute("UPDATE shop_services SET auto_renew=0 WHERE token=?", (r["token"],)); c.commit(); c.close()
-        except Exception as e:
-            print("shop auto-renew err", r["token"], e, flush=True)
 
 TICKET_CATS = [("down", "🔴 کلاً وصل نمی‌شه"), ("slow", "🐢 سرعتش کمه"), ("carrier", "📶 فقط روی یه اینترنت مشکل داره"),
                ("pay", "💳 مشکل پرداخت"), ("other", "💬 سؤال یا موارد دیگه")]
@@ -2187,13 +2150,13 @@ def customer_callback(chat, mid, uid, data, cbid, user=None):
         core.answer(cbid, "اعلان‌ها روشن شد" if get_customer(uid)["notify"] else "اعلان‌ها خاموش شد")
         core.edit(chat, mid, account_text(uid), account_kb(uid)); return
     if parts[:2] == ["c", "auto"] and len(parts) == 3:
-        if not owned_service(uid, parts[2]): core.answer(cbid, "این سرویس پیدا نشد"); return
-        c = core.db()
-        c.execute("UPDATE shop_services SET auto_renew=1-auto_renew,auto_note_ts=0 WHERE token=? AND tg_id=? AND kind='paid'", (parts[2], uid))
-        c.commit(); on = c.execute("SELECT auto_renew FROM shop_services WHERE token=?", (parts[2],)).fetchone()[0]; c.close()
-        core.answer(cbid, "تمدید خودکار روشن شد؛ موقع تموم شدن، از کیف پولت تمدید می‌شه" if on else "تمدید خودکار خاموش شد")
-        core.tg("editMessageReplyMarkup", chat_id=chat, message_id=mid,
-                reply_markup={"inline_keyboard": service_kb(parts[2])}); return
+        # Old Telegram messages can outlive the removed feature.
+        core.answer(cbid, "تمدید خودکار حذف شده است؛ برای تمدید، پلن را انتخاب کن.")
+        if owned_service(uid, parts[2]):
+            c = core.db(); c.execute("UPDATE shop_services SET auto_renew=0 WHERE token=? AND tg_id=?", (parts[2], uid)); c.commit(); c.close()
+            core.tg("editMessageReplyMarkup", chat_id=chat, message_id=mid,
+                    reply_markup={"inline_keyboard": service_kb(parts[2])})
+        return
     if (data.startswith(("c:rep", "c:rs:", "c:rc", "c:rk:", "c:tk")) and
             customer_ticket_callback(chat, mid, uid, data, cbid)): return
     core.answer(cbid)
@@ -2370,6 +2333,7 @@ def user_card(tid):
                fa(bought[0]), toman(bought[1]), fa(invited), "\n🚫 <b>مسدود</b>" if cust["blocked"] else ""))
     kb = [[{"text": "➕ افزایش موجودی", "callback_data": "sa:uwal:%d:add" % tid},
            {"text": "➖ کسر موجودی", "callback_data": "sa:uwal:%d:sub" % tid}],
+          [{"text": "✏️ تنظیم موجودی نهایی", "callback_data": "sa:uwal:%d:set" % tid}],
           [{"text": "✅ رفع مسدودی" if cust["blocked"] else "🚫 مسدود کن", "callback_data": "sa:ublock:%d" % tid}],
           [{"text": "🔎 کاربر دیگر", "callback_data": "sa:users"}, {"text": "بازگشت", "callback_data": "sa:menu"}]]
     return text, kb
@@ -2513,12 +2477,13 @@ def admin_callback(chat, mid, uid, data, cbid):
         core.pending[chat] = {"ts": time.time(), "stage": "sa_user_find"}; core.answer(cbid)
         core.edit(chat, mid, USERS_PROMPT, [[{"text": "بازگشت", "callback_data": "sa:menu"}]]); return
     parts = data.split(":")
-    if parts[1:2] == ["uwal"] and len(parts) == 4 and _int(parts[2]) is not None and parts[3] in ("add", "sub"):
+    if parts[1:2] == ["uwal"] and len(parts) == 4 and _int(parts[2]) is not None and parts[3] in ("add", "sub", "set"):
+        if uid not in owner_ids(): core.answer(cbid, "ویرایش موجودی فقط برای مالک ممکن است"); return
         tid = int(parts[2])
         if not get_customer(tid): core.answer(cbid, "پیدا نشد"); return
-        core.pending[chat] = {"ts": time.time(), "stage": "sa_wallet", "id": tid, "sign": 1 if parts[3] == "add" else -1}; core.answer(cbid)
+        core.pending[chat] = {"ts": time.time(), "stage": "sa_wallet", "id": tid, "mode": parts[3], "sign": 1 if parts[3] == "add" else -1}; core.answer(cbid)
         core.send(chat, "%s موجودی <code>%d</code>: مبلغ (تومان) و بعد دلیل را بفرست:\n<code>50000 بازگشت وجه سفارش ۱۲</code>"
-                  % ("➕ افزایش" if parts[3] == "add" else "➖ کسر", tid)); return
+                  % ({"add": "➕ افزایش", "sub": "➖ کسر", "set": "✏️ تنظیم موجودی نهایی (صفر هم مجاز است)"}[parts[3]], tid)); return
     if parts[1:2] == ["ublock"] and len(parts) == 3 and _int(parts[2]) is not None:
         tid = int(parts[2]); cust = get_customer(tid)
         if not cust: core.answer(cbid, "پیدا نشد"); return
@@ -2651,16 +2616,21 @@ def admin_message(chat, uid, m):
         core.pending.pop(chat, None); core.send(chat, *user_card(cust["tg_id"])); return True
     if st and st.get("stage") == "sa_wallet":
         words = text.split(maxsplit=1)
-        n = parse_amount(words[0]) if words else None
-        if not n or len(words) < 2:
+        setting_balance = st.get("mode") == "set"
+        n = (0 if setting_balance and _int(words[0]) == 0 else parse_amount(words[0])) if words else None
+        if n is None or (n == 0 and not setting_balance) or len(words) < 2:
             core.send(chat, "مبلغ و دلیل را بفرست، مثلاً <code>50000 بازگشت وجه</code>:"); return True
-        tid, delta, note = st["id"], st["sign"] * n, words[1].strip()[:100]
-        bal = wallet_change(tid, delta, "admin", note=note, actor=uid)
+        tid, note = st["id"], words[1].strip()[:100]
+        if setting_balance:
+            result = wallet_set(tid, n, note, uid)
+            bal, delta = result if result else (None, 0)
+        else:
+            delta = st["sign"] * n
+            bal = wallet_change(tid, delta, "admin", note=note, actor=uid)
         if bal is None:
             core.send(chat, "❌ موجودی مشتری کمتر از این مبلغ است."); return True
         core.pending.pop(chat, None); log(uid, "wallet_adjust", tid, "%+d %s" % (delta, note))
-        core.send(tid, "💰 %s %s کیف پولت توسط پشتیبانی.\nدلیل: %s\nموجودی: <b>%s</b>"
-                  % (toman(abs(delta)), "اضافه شد به" if delta > 0 else "کم شد از", html.escape(note), toman(bal)))
+        core.send(tid, "موجودی کیف پولت توسط پشتیبانی به <b>%s</b> تغییر کرد.\nدلیل: %s" % (toman(bal), html.escape(note)))
         core.send(chat, "✅ انجام شد.\n\n" + user_card(tid)[0], user_card(tid)[1]); return True
     if st and st.get("stage") == "sa_plan_add":
         nums = to_ascii(text).split()
@@ -2757,15 +2727,11 @@ TICK_SECONDS = 60
 KEEP_CLOSED_DAYS, KEEP_LOG_ROWS, KEEP_ORPHAN_DAYS = 90, 20000, 30
 
 def housekeeping(now=None):
-    """Once a day: forget old closed tickets and audit rows, tell owners of deleted links that
-    auto-renew is off, and drop shop_services rows whose link is long gone."""
+    """Once a day: forget old closed tickets, audit rows and orphan service associations."""
     now = int(time.time()) if now is None else now
     if setting("housekeeping_day") == core.day_key(now): return
     set_setting("housekeeping_day", core.day_key(now))
     c = core.db()
-    gone = c.execute("SELECT s.token, s.tg_id, s.kind FROM shop_services s LEFT JOIN users u ON u.token=s.token "
-                     "WHERE u.token IS NULL AND s.auto_renew=1").fetchall()
-    c.execute("UPDATE shop_services SET auto_renew=0 WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.token=shop_services.token)")
     c.execute("DELETE FROM shop_services WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.token=shop_services.token) AND created_ts<?",
               (now - KEEP_ORPHAN_DAYS * 86400,))
     c.execute("DELETE FROM shop_ticket_msgs WHERE ticket_id IN (SELECT id FROM shop_tickets WHERE status='closed' AND updated_ts<?)",
@@ -2775,14 +2741,10 @@ def housekeeping(now=None):
     c.execute("DELETE FROM meta WHERE k LIKE 'shop_stuck_alert_%' AND k NOT IN "
               "(SELECT 'shop_stuck_alert_' || id FROM shop_orders WHERE status='approved' AND delivered_ts IS NULL)")
     c.commit(); c.close()
-    for r in gone:
-        if r["kind"] == "paid":
-            core.send(r["tg_id"], "ℹ️ یکی از سرویس‌هات بعد از پایان مهلت تمدید حذف شد و تمدید خودکارش خاموش شد.\n"
-                      "هر وقت خواستی، یه سرویس جدید بخر 👇", [[{"text": "🛒 خرید سرویس", "callback_data": "c:buy"}]])
 
 def tick():
     """Every step on its own, so one failing job never starves the others."""
-    for job in (_tick_backup, retry_receipt_reversals, retry_auto_reviews, retry_rotations, send_test_followups, expire_orders, retry_deliveries, run_auto_renewals,
+    for job in (_tick_backup, retry_receipt_reversals, retry_auto_reviews, retry_rotations, send_test_followups, expire_orders, retry_deliveries,
                 send_service_warnings, housekeeping):
         try: job()
         except Exception as e: print("shop tick err", job.__name__, e, flush=True)

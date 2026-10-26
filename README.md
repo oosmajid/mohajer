@@ -35,7 +35,7 @@ No database server, no web framework, no pip packages — just **Python 3 stdlib
 ### ✨ Features
 
 - 🤖 **Telegram-native admin panel** — create / list / extend / delete links from inline buttons; admin tools answer **only** your admin id(s).
-- 🛍 **Customer shop in the same bot** — free test, plans, card-to-card receipts reviewed by admin/support, wallet with auto-renew, usage view and warnings, invite rewards, and support tickets (`bot/shop.py`, see [docs/SHOP.md](docs/SHOP.md)).
+- 🛍 **Customer shop in the same bot** — free test, plans, card-to-card receipts reviewed by admin/support, wallet payments, usage view and warnings, invite rewards, and support tickets (`bot/shop.py`, see [docs/SHOP.md](docs/SHOP.md)).
 - 🧩 **Multi-protocol links** — one link bundles VLESS / VMess / Trojan over WS (TLS + no-TLS) + VLESS-XHTTP. Clients fail over automatically.
 - 📊 **Live quota & expiry** — per-user data + time limits enforced live via the xray gRPC API; links auto-disable & delete when exhausted.
 - ☁️ **Cloudflare-fronted** — outbound `cloudflared` tunnel (works behind NAT) hides the throttled origin IP.
@@ -141,7 +141,7 @@ mohajer/
 ### ✨ امکانات
 
 - 🤖 **پنل تلگرامی** — ساخت / لیست / تمدید / حذف لینک با دکمه‌های شیشه‌ای؛ ابزار مدیریت **فقط** برای آی‌دی ادمین است.
-- 🛍 **فروشگاه مشتری در همین ربات** — تست رایگان، خرید پلن، رسید کارت‌به‌کارت با تأیید ادمین/پشتیبان، کیف پول و تمدید خودکار، مشاهدهٔ حجم و زمان و هشدارها، دعوت دوستان و تیکت پشتیبانی (`bot/shop.py`، جزئیات در [docs/SHOP.md](docs/SHOP.md)).
+- 🛍 **فروشگاه مشتری در همین ربات** — تست رایگان، خرید پلن، رسید کارت‌به‌کارت با تأیید ادمین/پشتیبان، کیف پول، مشاهدهٔ حجم و زمان و هشدارها، دعوت دوستان و تیکت پشتیبانی (`bot/shop.py`، جزئیات در [docs/SHOP.md](docs/SHOP.md)).
 - 🧩 **لینک چندپروتکلی** — یک لینک شامل VLESS / VMess / Trojan روی WS (با و بدون TLS) + VLESS-XHTTP؛ کلاینت خودش بینشان سوییچ می‌کند.
 - 📊 **حجم و زمانِ زنده** — محدودیت حجم و زمانِ هر کاربر زنده از طریق xray اعمال می‌شود؛ لینک پس از اتمام خودکار غیرفعال و حذف می‌شود.
 - ☁️ **پشت کلادفلر** — تونل خروجیِ `cloudflared` (پشت NAT هم کار می‌کند) آی‌پی throttle‌شده‌ی سرور را پنهان می‌کند.

@@ -160,7 +160,7 @@ class AutoReceiptTests(SalesCase):
             shop._hits.clear();bot.handle_update(cb(ALICE,action))
             self.assertIn('محدود',self.last('editMessageText')['text'])
         c=bot.db();c.execute('UPDATE users SET expiry_ts=? WHERE token=?',(int(time.time())-1,tok));c.commit();c.close()
-        shop.run_auto_renewals()
+        shop.tick()
         self.assertEqual(shop.balance(ALICE),500000)
         self.assertIsNotNone(shop.owned_service(ALICE,tok))
         self.assertIn(bot.sub_url(tok),shop.service_view(ALICE,tok)[0])

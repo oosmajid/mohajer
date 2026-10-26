@@ -35,7 +35,7 @@
   `shop.on_update` (customers + support staff) in `bot/shop.py`, which must be deployed
   next to `bot.py`.
 - **Shop ticker thread** (`shop.ticker`, every 60s): backup, test follow-ups, invoice expiry,
-  delivery retries, wallet auto-renewals, usage/expiry warnings, daily housekeeping.
+  delivery retries, usage/expiry warnings, daily housekeeping.
 - **Enforcer thread** (`enforcer`, every `POLL_SECONDS`):
   1. If xray's `MainPID` changed (restart/reboot) → `resync_all()` re-adds every user
      to the running xray and rewrites their sub files.
