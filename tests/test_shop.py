@@ -1011,12 +1011,54 @@ class ShopHardeningTests(SalesCase):
         self.assertEqual(self.row("SELECT kind,delta FROM shop_wallet_tx")[:], ("partial", 100000))
         self.assertTrue(any("به کیف پولت اضافه شد" in t for t in self.texts(ALICE)))
         to_alice = [q for m, q in self.calls if m == "sendMessage" and q.get("chat_id") == ALICE][-1]
-        self.assertIn("c:topup_amt:50000", str(to_alice["reply_markup"]))
+        self.assertIn("شارژ ۵۰٬۰۰۰ تومان", str(to_alice["reply_markup"]))
+        self.assertIn("c:topup_short:%d" % o["id"], str(to_alice["reply_markup"]))
         self.assertFalse(shop.purchase_blocked(ALICE))                # no penalty for paying short
         self.assertIsNone(shop.reject_to_wallet(o["id"], ADMIN, 100000))   # idempotent: already decided
         self.assertEqual(shop.balance(ALICE), 100000)
         bot.handle_update(cb(ADMIN, "r:ok:%d" % o["id"]))             # rejected: cannot be approved anymore
         self.assertEqual(self.row("SELECT status FROM shop_orders")["status"], "rejected")
+
+    def short_pay(self, paid, uid=ALICE, receipt="r1"):
+        o = self.buy(uid); bot.handle_update(photo(uid, receipt))
+        bot.handle_update(cb(ADMIN, "r:wal:%d" % o["id"])); bot.handle_update(msg(ADMIN, str(paid)))
+        return o, [q for m, q in self.calls if m == "sendMessage" and q.get("chat_id") == uid][-1]
+
+    def test_shortfall_button_is_exact_and_never_rounded_up_to_the_invoice(self):
+        o, note = self.short_pay(300)                                 # 149,700 used to round up to the full 150,000
+        self.assertIn("شارژ ۱۴۹٬۷۰۰ تومان", str(note["reply_markup"]))
+        bot.handle_update(cb(ALICE, "c:topup_short:%d" % o["id"]))
+        t = self.row("SELECT kind,price,amount FROM shop_orders ORDER BY id DESC")
+        self.assertEqual(t[:], ("topup", 149700, 149700))
+
+    def test_shortfall_below_the_topup_minimum_still_works(self):
+        o, note = self.short_pay(145000)
+        self.assertIn("شارژ ۵٬۰۰۰ تومان", str(note["reply_markup"]))
+        bot.handle_update(cb(ALICE, "c:topup_amt:5000"))              # a free-form amount stays refused
+        self.assertEqual(self.row("SELECT COUNT(*) n FROM shop_orders WHERE kind='topup'")["n"], 0)
+        bot.handle_update(cb(ALICE, "c:topup_short:%d" % o["id"]))
+        self.assertEqual(self.row("SELECT amount FROM shop_orders WHERE kind='topup'")["amount"], 5000)
+
+    def test_shortfall_counts_the_existing_balance(self):
+        bot.handle_update(cb(ADMIN, "sa:uwal:%d:add" % ALICE)); bot.handle_update(msg(ADMIN, "20000 هدیه"))
+        o, note = self.short_pay(100000)
+        self.assertIn("شارژ ۳۰٬۰۰۰ تومان", str(note["reply_markup"]))
+        bot.handle_update(cb(ADMIN, "sa:uwal:%d:add" % ALICE)); bot.handle_update(msg(ADMIN, "30000 هدیه"))
+        bot.handle_update(cb(ALICE, "c:topup_short:%d" % o["id"]))    # enough by now: no invoice
+        self.assertEqual(self.row("SELECT COUNT(*) n FROM shop_orders WHERE kind='topup'")["n"], 0)
+        self.assertIn("کافیه", self.last("editMessageText")["text"])
+
+    def test_no_shortfall_button_when_the_wallet_already_covers_it(self):
+        bot.handle_update(cb(ADMIN, "sa:uwal:%d:add" % ALICE)); bot.handle_update(msg(ADMIN, "60000 هدیه"))
+        o, note = self.short_pay(100000)
+        self.assertNotIn("topup_short", str(note["reply_markup"])); self.assertIn("کافیه", note["text"])
+
+    def test_shortfall_button_only_works_for_its_owner_and_a_moved_order(self):
+        o, _ = self.short_pay(100000)
+        bot.handle_update(msg(BOB, "/start")); bot.handle_update(cb(BOB, "c:topup_short:%d" % o["id"]))
+        o2 = self.buy()                                               # never moved to the wallet
+        bot.handle_update(cb(ALICE, "c:topup_short:%d" % o2["id"]))
+        self.assertEqual(self.row("SELECT COUNT(*) n FROM shop_orders WHERE kind='topup'")["n"], 0)
 
     def test_support_cannot_change_or_approve_a_corrected_amount(self):
         o = self.buy(); bot.handle_update(photo(ALICE))

@@ -711,8 +711,8 @@ def topup_view():
     kb += [[{"text": "✏️ مبلغ دلخواه", "callback_data": "c:topup_custom"}], [{"text": "بازگشت", "callback_data": "c:wallet"}]]
     return "➕ <b>شارژ کیف پول</b>\nچقدر شارژ کنیم؟", kb
 
-def start_topup(chat, uid, amount, mid=None):
-    if not (TOPUP_MIN <= amount <= TOPUP_MAX):
+def start_topup(chat, uid, amount, mid=None, exact=False):
+    if not exact and not (TOPUP_MIN <= amount <= TOPUP_MAX):
         core.send(chat, "مبلغ شارژ باید بین %s و %s باشد." % (toman(TOPUP_MIN), toman(TOPUP_MAX))); return
     o = create_order(uid, "topup", amount)
     if not o:
@@ -1493,14 +1493,28 @@ def reject_to_wallet(oid, uid, paid):
     return bal
 
 def notify_partial(o, paid, outcome=""):
-    short = max(0, o["price"] - paid); topup = max(TOPUP_MIN, -(-short // 1000) * 1000)
+    bal = balance(o["tg_id"]); short = max(0, o["price"] - bal)   # exact: never rounded up, and what the wallet already holds counts
+    next_step = ("می‌تونی %s دیگه شارژ کنی و همون پلن رو از کیف پول بخری، یا یه پلن ارزون‌تر انتخاب کنی 👇" % toman(short)
+                 if short else "موجودیت برای خرید همین پلن از کیف پول کافیه 👇")
+    kb = [[{"text": "➕ شارژ %s" % toman(short), "callback_data": "c:topup_short:%d" % o["id"]}]] if short else []
     core.send(o["tg_id"], "ℹ️ مبلغ واریزی سفارش #%s (%s) کمتر از فاکتور (%s) بود.\n%s"
-              "سفارش بسته شد و <b>%s</b> به کیف پولت اضافه شد؛ موجودی: <b>%s</b>\n\n"
-              "می‌تونی %s دیگه شارژ کنی و همون پلن رو از کیف پول بخری، یا یه پلن ارزون‌تر انتخاب کنی 👇"
-              % (fa(o["id"]), toman(paid), toman(o["price"]), (outcome + "\n") if outcome else "", toman(paid),
-                 toman(balance(o["tg_id"])), toman(short)),
-              [[{"text": "➕ شارژ %s" % toman(topup), "callback_data": "c:topup_amt:%d" % topup}],
-               [{"text": "🛒 خرید سرویس", "callback_data": "c:buy"}]])
+              "سفارش بسته شد و <b>%s</b> به کیف پولت اضافه شد؛ موجودی: <b>%s</b>\n\n%s"
+              % (fa(o["id"]), toman(paid), toman(o["price"]), (outcome + "\n") if outcome else "", toman(paid), toman(bal), next_step),
+              kb + [[{"text": "🛒 خرید سرویس", "callback_data": "c:buy"}]])
+
+def topup_shortfall(chat, mid, uid, oid):
+    """The shortfall button of a short payment: top up exactly what is still missing for that plan, worked
+    out now from the customer's own order, so it may be below TOPUP_MIN (a free-form amount may not)."""
+    c = core.db()
+    moved = c.execute("SELECT 1 FROM shop_wallet_tx WHERE tg_id=? AND kind='partial' AND ref=?", (uid, "order:%d" % oid)).fetchone()
+    c.close()
+    o = get_order(oid)
+    if not moved or not o or o["tg_id"] != uid:
+        core.edit(chat, mid, "این سفارش پیدا نشد."); return
+    short = o["price"] - balance(uid)
+    if short <= 0:
+        core.edit(chat, mid, "موجودی کیف پولت برای خرید این پلن کافیه 👇", [[{"text": "🛒 خرید سرویس", "callback_data": "c:buy"}]]); return
+    start_topup(chat, uid, min(short, TOPUP_MAX), mid, exact=True)
 
 review_pending = {}   # reviewer uid -> {"kind": "amount" | "reason" | "wallet" | "approve", "oid": id, "ts": when}; staff only, tiny
 PENDING_TTL = 600     # a typed-answer prompt for staff expires after this; stale prompts must never eat a later message
@@ -2167,7 +2181,7 @@ def customer_callback(chat, mid, uid, data, cbid, user=None):
         if st.get("stage") != "rcpt_pick": core.edit(chat, mid, "این انتخاب دیگه معتبر نیست؛ عکس رسید رو دوباره بفرست."); return
         core.tg("editMessageReplyMarkup", chat_id=chat, message_id=mid, reply_markup={"inline_keyboard": []})
         receive_receipt(chat, uid, st["file"], st["uid"], oid=int(parts[2])); return
-    if len(parts) > 1 and parts[1] in ("buy", "renew", "plans", "plan", "pay", "wpay", "topup", "topup_custom", "topup_amt"):
+    if len(parts) > 1 and parts[1] in ("buy", "renew", "plans", "plan", "pay", "wpay", "topup", "topup_custom", "topup_amt", "topup_short"):
         st = get_state(uid) or {}
         if str(st.get("stage", "")).startswith(("tk_", "rcpt")): set_state(uid, None)   # leaving the ticket flow
     if data == "c:buy":
@@ -2206,6 +2220,8 @@ def customer_callback(chat, mid, uid, data, cbid, user=None):
         core.answer(cbid); set_state(uid, {"stage": "topup_amount"})
         core.edit(chat, mid, "✏️ مبلغ شارژ رو به تومان بفرست (حداقل %s):" % toman(TOPUP_MIN),
                   [[{"text": "انصراف", "callback_data": "c:wallet"}]]); return
+    if parts[:2] == ["c", "topup_short"] and len(parts) == 3 and _int(parts[2]) is not None:
+        core.answer(cbid); topup_shortfall(chat, mid, uid, int(parts[2])); return
     if parts[:2] == ["c", "topup_amt"] and len(parts) == 3 and _int(parts[2]) is not None:
         core.answer(cbid); start_topup(chat, uid, int(parts[2]), mid); return
     if data == "c:tx":
