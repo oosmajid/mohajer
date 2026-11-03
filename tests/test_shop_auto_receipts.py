@@ -33,10 +33,67 @@ class AutoReceiptTests(SalesCase):
         copies=self.review_copies()
         self.assertTrue(any(p['chat_id']==ADMIN for p in copies))
         buttons=[b['callback_data'] for row in copies[0]['reply_markup']['inline_keyboard'] for b in row]
-        self.assertEqual(buttons,['r:ok:%d'%order['id'],'r:no:%d'%order['id']])
+        self.assertEqual(buttons,['r:%s:%d'%(a,order['id']) for a in ('ok','no','okx','wal')])
         self.assertIn('#%d'%order['id'],shop.queue_view()[0]+str(shop.queue_view()[1]))
         bot.handle_update(photo(ALICE,'again'))
         self.assertEqual(len(self.minted),1)
+
+    def wal(self, oid, amount, actor=ADMIN):
+        bot.handle_update(cb(actor,'r:wal:%d'%oid))
+        with patch.object(bot,'xr_remove_user',return_value=True),patch.object(bot,'tags_to_cut_for_user',return_value=set()),patch.object(bot,'force_disconnect',return_value=True),patch.object(bot,'del_sub'):
+            bot.handle_update(msg(actor,amount))
+
+    def test_overpaid_auto_receipt_credits_the_difference_once(self):
+        order=self.auto_buy();before=dict(shop.owned_service(ALICE,order['token']))
+        self.assertEqual(shop.balance(ALICE),0)
+        bot.handle_update(cb(SUPPORT,'r:okx:%d'%order['id']));bot.handle_update(msg(SUPPORT,'200000'))
+        self.assertEqual(shop.balance(ALICE),0)                       # support may not
+        bot.handle_update(cb(ADMIN,'r:okx:%d'%order['id']));bot.handle_update(msg(ADMIN,'100000'))
+        self.assertEqual(shop.get_order(order['id'])['auto_reviewed'],0)   # short: use the other button
+        bot.handle_update(cb(ADMIN,'r:okx:%d'%order['id']));bot.handle_update(msg(ADMIN,'9999999'))
+        self.assertEqual(shop.get_order(order['id'])['auto_reviewed'],0)   # over the 2x cap
+        bot.handle_update(msg(ADMIN,'۲۰۰٬۰۰۰'))
+        o=shop.get_order(order['id'])
+        self.assertEqual((o['status'],o['auto_reviewed'],o['paid_amount']),('approved',1,200000))
+        self.assertEqual(shop.balance(ALICE),200000-o['price'])
+        self.assertEqual(dict(shop.owned_service(ALICE,order['token'])),before)   # service untouched
+        self.assertEqual(len(self.minted),1)
+        self.assertTrue(any('اضافه واریز' in t for t in self.texts(ALICE)))
+        bot.handle_update(cb(ADMIN,'r:ok:%d'%order['id']))
+        self.assertEqual(shop.balance(ALICE),200000-o['price'])
+
+    def test_underpaid_auto_buy_revokes_service_and_credits_wallet_without_penalty(self):
+        order=self.auto_buy()
+        self.wal(order['id'],'150000')                                # not short: refused, service stays
+        self.assertEqual(shop.get_order(order['id'])['status'],'approved')
+        self.assertIsNotNone(shop.owned_service(ALICE,order['token']))
+        self.wal(order['id'],'۱۰۰٬۰۰۰')
+        o=shop.get_order(order['id'])
+        self.assertEqual((o['status'],o['auto_reviewed'],o['paid_amount']),('rejected',1,100000))
+        self.assertIsNone(shop.owned_service(ALICE,order['token']))
+        self.assertEqual(shop.balance(ALICE),100000)
+        self.assertFalse(shop.purchase_blocked(ALICE))
+        self.assertTrue(any('به کیف پولت اضافه شد' in t and 'باطل' in t for t in self.texts(ALICE)))
+        self.wal(order['id'],'100000')                                # a repeat pays nothing
+        self.assertEqual(shop.balance(ALICE),100000)
+
+    def test_underpaid_auto_renew_takes_back_the_extension(self):
+        first=self.auto_buy();bot.handle_update(cb(ADMIN,'r:ok:%d'%first['id']))
+        before=self.row("SELECT limit_bytes,expiry_ts FROM users WHERE token=?",(first['token'],))[:]
+        renew=self.auto_buy(token=first['token'],receipt='auto-r2')
+        self.assertNotEqual(self.row("SELECT limit_bytes,expiry_ts FROM users WHERE token=?",(first['token'],))[:],before)
+        self.wal(renew['id'],'100000')
+        self.assertEqual(self.row("SELECT limit_bytes,expiry_ts FROM users WHERE token=?",(first['token'],))[:],before)
+        self.assertIsNotNone(shop.owned_service(ALICE,first['token']))
+        self.assertEqual(shop.balance(ALICE),100000)
+
+    def test_invoice_moved_to_wallet_takes_no_more_receipts(self):
+        o=self.buy();bot.handle_update(photo(ALICE))
+        bot.handle_update(cb(ADMIN,'r:wal:%d'%o['id']));bot.handle_update(msg(ADMIN,'100000'))
+        self.assertEqual(shop.get_order(o['id'])['status'],'rejected')
+        bot.handle_update(photo(ALICE,'second'))
+        self.assertEqual(shop.get_order(o['id'])['status'],'rejected')
+        self.assertEqual(shop.balance(ALICE),100000)
 
     def test_confirm_is_idempotent_and_completes_manual_review(self):
         order=self.auto_buy();before=dict(shop.owned_service(ALICE,order['token']))

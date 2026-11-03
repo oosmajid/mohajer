@@ -883,7 +883,8 @@ def receipt_candidates(c, uid, now):
     """The invoice(s) a receipt can pay for: the open one plus every expired, rejected or
     auto-cancelled one of the last 24h (people pay late, or pay invoice A and then start B);
     with several the customer is asked which one."""
-    return c.execute("SELECT * FROM shop_orders WHERE tg_id=? AND pay_method='card' AND NOT (auto_approved=1 AND status='rejected') AND (status='awaiting' OR "
+    return c.execute("SELECT * FROM shop_orders WHERE tg_id=? AND pay_method='card' AND NOT (auto_approved=1 AND status='rejected') "
+                     "AND NOT EXISTS (SELECT 1 FROM shop_wallet_tx w WHERE w.kind='partial' AND w.ref='order:'||shop_orders.id) AND (status='awaiting' OR "
                      "(status IN ('expired','rejected','cancelled') AND created_ts>=?)) ORDER BY id DESC LIMIT 5",
                      (uid, now - LATE_RECEIPT)).fetchall()
 
@@ -967,7 +968,9 @@ def auto_review_pending(o):
 def review_kb(o):
     if auto_review_pending(o):
         return [[{"text": "✅ تأیید", "callback_data": "r:ok:%d" % o["id"]},
-                 {"text": "❌ رد", "callback_data": "r:no:%d" % o["id"]}]]
+                 {"text": "❌ رد", "callback_data": "r:no:%d" % o["id"]}],
+                [{"text": "✅ تأیید با مبلغ بیشتر (اضافه به کیف پول)", "callback_data": "r:okx:%d" % o["id"]}],
+                [{"text": "💰 مبلغ کمتر بود: ابطال سرویس و انتقال به کیف پول", "callback_data": "r:wal:%d" % o["id"]}]]
     if o["status"] != "review": return []
     rows = [[{"text": "✅ تأیید", "callback_data": "r:ok:%d" % o["id"]}, {"text": "❌ رد", "callback_data": "r:no:%d" % o["id"]}],
             [{"text": "✅ تأیید با مبلغ دیگر (فقط مالک)", "callback_data": "r:okx:%d" % o["id"]}],
@@ -1331,7 +1334,7 @@ def invite_view(uid):
 
 REJECT_REASONS = ["مبلغ واریزی با فاکتور یکی نیست", "رسید ناخوانا یا نامعتبر است", "واریزی به حساب ما نرسیده", "رسید تکراری است"]
 
-def confirm_auto_receipt(oid, actor):
+def confirm_auto_receipt(oid, actor, paid=None):
     if actor not in owner_ids(): return False
     with _deliver_lock:
         c = core.db()
@@ -1339,13 +1342,17 @@ def confirm_auto_receipt(oid, actor):
             c.execute("BEGIN IMMEDIATE")
             o = c.execute("SELECT * FROM shop_orders WHERE id=?", (oid,)).fetchone()
             if not o or not auto_review_pending(o): c.rollback(); return False
-            extra = paid_of(o) - o["price"]
+            if paid is not None: c.execute("UPDATE shop_orders SET paid_amount=? WHERE id=?", (paid, oid))
+            extra = (paid if paid is not None else paid_of(o)) - o["price"]
+            credited = False
             if o["delivered_ts"] and extra > 0 and not c.execute("SELECT 1 FROM shop_wallet_tx WHERE kind='overpay' AND ref=?", ("order:%d" % oid,)).fetchone():
-                wallet_apply(c, o["tg_id"], extra, "overpay", ref="order:%d" % oid)
+                wallet_apply(c, o["tg_id"], extra, "overpay", ref="order:%d" % oid); credited = True
             c.execute("UPDATE shop_orders SET auto_reviewed=1,decided_by=? WHERE id=?", (actor, oid))
             c.commit()
         finally: c.close()
-        log(actor, "order_auto_confirm", oid)
+        log(actor, "order_auto_confirm", oid, paid if paid is not None else "")
+        if credited:
+            core.send(o["tg_id"], "💰 %s اضافه واریز کرده بودی و به کیف پولت اضافه شد. موجودی: <b>%s</b>" % (toman(extra), toman(balance(o["tg_id"]))))
         reward_inviter(get_order(oid))
     refresh_review(oid)
     return True
@@ -1373,7 +1380,9 @@ def process_receipt_reversal(oid):
         c = core.db(); c.execute("UPDATE shop_receipt_reversals SET done=1 WHERE order_id=?", (oid,)); c.commit(); c.close()
         return True
 
-def reject_auto_receipt(oid, actor, reason):
+def reject_auto_receipt(oid, actor, reason, wallet_paid=None):
+    """Reverse an auto-delivered order. wallet_paid=None: a bad receipt (48h purchase penalty).
+    wallet_paid=n: a real but short payment, so n goes to the wallet in the same transaction and no penalty applies."""
     if actor not in owner_ids(): return False
     with _deliver_lock, core._membership_lock:
         now = int(time.time()); c = core.db()
@@ -1382,8 +1391,12 @@ def reject_auto_receipt(oid, actor, reason):
             o = c.execute("SELECT * FROM shop_orders WHERE id=?", (oid,)).fetchone()
             if not o or not auto_review_pending(o): c.rollback(); return False
             c.execute("UPDATE shop_orders SET status='rejected',auto_reviewed=1,note=?,decided_ts=?,decided_by=? WHERE id=?", (reason, now, actor, oid))
-            c.execute("UPDATE shop_customers SET purchase_blocked_until=MAX(purchase_blocked_until,?),state=NULL,terms_acceptance=NULL WHERE tg_id=?", (now + PURCHASE_PENALTY, o["tg_id"]))
-            c.execute("UPDATE shop_orders SET status='cancelled' WHERE tg_id=? AND kind IN ('buy','renew') AND status IN ('awaiting','review')", (o["tg_id"],))
+            if wallet_paid is None:
+                c.execute("UPDATE shop_customers SET purchase_blocked_until=MAX(purchase_blocked_until,?),state=NULL,terms_acceptance=NULL WHERE tg_id=?", (now + PURCHASE_PENALTY, o["tg_id"]))
+                c.execute("UPDATE shop_orders SET status='cancelled' WHERE tg_id=? AND kind IN ('buy','renew') AND status IN ('awaiting','review')", (o["tg_id"],))
+            else:
+                c.execute("UPDATE shop_orders SET paid_amount=? WHERE id=?", (wallet_paid, oid))
+                wallet_apply(c, o["tg_id"], wallet_paid, "partial", ref="order:%d" % oid, actor=actor)
             grant = json.loads(o["auto_grant"] or "{}")
             action = "none"
             u = c.execute("SELECT * FROM users WHERE token=?", (o["token"],)).fetchone() if o["token"] else None
@@ -1411,9 +1424,12 @@ def reject_auto_receipt(oid, actor, reason):
         outcome = "سرویس این خرید باطل شد." if enforced else "ابطال سرویس هنوز کامل نشده و ربات دوباره تلاش می‌کند."
     else:
         outcome = "افزایش حجم و زمان این تمدید پس گرفته شد." if o["kind"] == "renew" and o["delivered_ts"] else "تحویل این سفارش لغو شد."
-    core.send(o["tg_id"], "رسید سفارش #%s رد شد.\nدلیل: %s\n\n%s\n%s" % (
-        fa(oid), html.escape(reason), outcome, purchase_penalty_text(o["tg_id"])),
-        [[{"text": "گزارش مشکل", "callback_data": "c:rep"}]])
+    if wallet_paid is None:
+        core.send(o["tg_id"], "رسید سفارش #%s رد شد.\nدلیل: %s\n\n%s\n%s" % (
+            fa(oid), html.escape(reason), outcome, purchase_penalty_text(o["tg_id"])),
+            [[{"text": "گزارش مشکل", "callback_data": "c:rep"}]])
+    else:
+        notify_partial(o, wallet_paid, outcome)
     refresh_review(oid)
     return True
 
@@ -1448,7 +1464,16 @@ def reject(oid, uid, reason):
 def reject_to_wallet(oid, uid, paid):
     """An under-paid invoice: reject it and credit what was really paid to the customer's wallet, in one
     transaction (ledger ref order:<id> under kind 'partial' makes a retry a no-op). Returns the new balance
-    or None when the order is no longer under review. No purchase penalty: paying short is not fraud."""
+    or None when the order is no longer under review. No purchase penalty: paying short is not fraud.
+    An auto-approved order was already delivered, so its service is reversed as well."""
+    cur = get_order(oid)
+    if cur and auto_review_pending(cur):
+        try:
+            if not reject_auto_receipt(oid, uid, "مبلغ واریزی کمتر از فاکتور بود؛ به کیف پول منتقل شد", wallet_paid=paid): return None
+        except (sqlite3.IntegrityError, InsufficientFunds):
+            return None
+        log(uid, "order_reject_to_wallet", oid, paid)
+        return balance(cur["tg_id"])
     now = int(time.time()); c = core.db()
     try:
         c.execute("BEGIN IMMEDIATE")
@@ -1463,16 +1488,19 @@ def reject_to_wallet(oid, uid, paid):
     finally:
         c.close()
     log(uid, "order_reject_to_wallet", oid, paid)
-    short = o["price"] - paid
-    core.send(o["tg_id"], "ℹ️ مبلغ واریزی سفارش #%s (%s) کمتر از فاکتور (%s) بود.\n"
-              "سفارش بسته شد و <b>%s</b> به کیف پولت اضافه شد؛ موجودی: <b>%s</b>\n\n"
-              "می‌تونی %s دیگه شارژ کنی و همون پلن رو از کیف پول بخری، یا یه پلن ارزون‌تر انتخاب کنی 👇"
-              % (fa(oid), toman(paid), toman(o["price"]), toman(paid), toman(bal), toman(short)),
-              [[{"text": "➕ شارژ %s" % toman(max(TOPUP_MIN, -(-short // 1000) * 1000)),
-                 "callback_data": "c:topup_amt:%d" % max(TOPUP_MIN, -(-short // 1000) * 1000)}],
-               [{"text": "🛒 خرید سرویس", "callback_data": "c:buy"}]])
+    notify_partial(o, paid)
     refresh_review(oid)
     return bal
+
+def notify_partial(o, paid, outcome=""):
+    short = max(0, o["price"] - paid); topup = max(TOPUP_MIN, -(-short // 1000) * 1000)
+    core.send(o["tg_id"], "ℹ️ مبلغ واریزی سفارش #%s (%s) کمتر از فاکتور (%s) بود.\n%s"
+              "سفارش بسته شد و <b>%s</b> به کیف پولت اضافه شد؛ موجودی: <b>%s</b>\n\n"
+              "می‌تونی %s دیگه شارژ کنی و همون پلن رو از کیف پول بخری، یا یه پلن ارزون‌تر انتخاب کنی 👇"
+              % (fa(o["id"]), toman(paid), toman(o["price"]), (outcome + "\n") if outcome else "", toman(paid),
+                 toman(balance(o["tg_id"])), toman(short)),
+              [[{"text": "➕ شارژ %s" % toman(topup), "callback_data": "c:topup_amt:%d" % topup}],
+               [{"text": "🛒 خرید سرویس", "callback_data": "c:buy"}]])
 
 review_pending = {}   # reviewer uid -> {"kind": "amount" | "reason" | "wallet" | "approve", "oid": id, "ts": when}; staff only, tiny
 PENDING_TTL = 600     # a typed-answer prompt for staff expires after this; stale prompts must never eat a later message
@@ -1517,8 +1545,8 @@ def review_callback(chat, mid, uid, data, cbid):
             core.answer(cbid, "بررسی رسید خودکار فقط برای مالک ممکن است"); return
         if action == "ok":
             confirm_auto_receipt(oid, uid); core.answer(cbid, "تأیید شد؛ سرویس دوباره تحویل نمی‌شود"); return
-        if action in ("amt", "okx"):
-            core.answer(cbid, "مبلغ رسید خودکار قابل تغییر نیست؛ تأیید یا رد کن"); return
+        if action == "amt":
+            core.answer(cbid, "برای رسید خودکار از دکمه‌های «تأیید با مبلغ بیشتر» یا «مبلغ کمتر بود» استفاده کن"); return
     if o["status"] != "review" and not pending_auto:
         core.answer(cbid, "این سفارش قبلاً بررسی شده"); refresh_review(oid); return
     if action == "ok":
@@ -1541,8 +1569,9 @@ def review_callback(chat, mid, uid, data, cbid):
     if action == "wal" and o["kind"] != "topup":
         review_pending[uid] = {"kind": "wallet", "oid": oid, "ts": time.time()}; core.answer(cbid)
         core.send(chat, "💰 مبلغی که واقعاً برای سفارش #%d واریز شده را به تومان بفرست.\n"
-                  "سفارش رد می‌شود و همین مبلغ به کیف پول مشتری می‌رود تا با شارژ باقی‌مانده یا پلن ارزان‌تر خرید کند. (فاکتور: %s)"
-                  % (oid, toman(o["amount"])), [[{"text": "انصراف", "callback_data": "r:back:%d" % oid}]]); return
+                  "%sسفارش رد می‌شود و همین مبلغ به کیف پول مشتری می‌رود تا با شارژ باقی‌مانده یا پلن ارزان‌تر خرید کند. (فاکتور: %s)"
+                  % (oid, "⚠️ سرویسی که خودکار تحویل شده باطل می‌شود. " if pending_auto else "", toman(o["amount"])),
+                  [[{"text": "انصراف", "callback_data": "r:back:%d" % oid}]]); return
     if action == "no":
         core.answer(cbid)
         kb = [[{"text": r, "callback_data": "r:nor:%d:%d" % (oid, i)}] for i, r in enumerate(REJECT_REASONS)]
@@ -1565,7 +1594,7 @@ def review_text(chat, uid, text):
     st = _pending_get(review_pending, uid)
     if not st: return False
     o = get_order(st["oid"])
-    if not o or (o["status"] != "review" and not (st["kind"] == "reason" and auto_review_pending(o) and uid in owner_ids())):
+    if not o or (o["status"] != "review" and not (st["kind"] in ("reason", "wallet", "approve") and auto_review_pending(o) and uid in owner_ids())):
         review_pending.pop(uid, None); core.send(chat, "این سفارش دیگر در انتظار بررسی نیست."); return True
     if st["kind"] == "reason":
         if not text.strip(): core.send(chat, "دلیل را بنویس:"); return True
@@ -1588,6 +1617,12 @@ def review_text(chat, uid, text):
     if st["kind"] == "approve" and o["kind"] != "topup" and n < o["amount"]:
         core.send(chat, "این مبلغ کمتر از فاکتور (%s) است و سفارش تأیید نشد؛ از «💰 رد و انتقال واریزی به کیف پول» استفاده کن."
                   % toman(o["amount"])); return True
+    if st["kind"] == "approve" and auto_review_pending(o):
+        if confirm_auto_receipt(o["id"], uid, paid=n):
+            core.send(chat, "✅ رسید سفارش #%d با مبلغ %s تأیید شد؛ سرویس دوباره تحویل نمی‌شود." % (o["id"], toman(n)))
+        else:
+            core.send(chat, "این سفارش دیگر در انتظار بررسی نیست.")
+        return True
     c = core.db(); n_rows = c.execute("UPDATE shop_orders SET paid_amount=? WHERE id=? AND status='review'", (n, o["id"])).rowcount
     c.commit(); c.close()
     if not n_rows: core.send(chat, "این سفارش دیگر در انتظار بررسی نیست."); return True
