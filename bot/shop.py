@@ -970,6 +970,7 @@ def review_kb(o):
                  {"text": "❌ رد", "callback_data": "r:no:%d" % o["id"]}]]
     if o["status"] != "review": return []
     rows = [[{"text": "✅ تأیید", "callback_data": "r:ok:%d" % o["id"]}, {"text": "❌ رد", "callback_data": "r:no:%d" % o["id"]}],
+            [{"text": "✅ تأیید با مبلغ دیگر (فقط مالک)", "callback_data": "r:okx:%d" % o["id"]}],
             [{"text": "✏️ اصلاح مبلغ واریزی (فقط مالک)", "callback_data": "r:amt:%d" % o["id"]}]]
     if o["kind"] != "topup":
         rows.append([{"text": "💰 رد و انتقال واریزی به کیف پول (فقط مالک)", "callback_data": "r:wal:%d" % o["id"]}])
@@ -1473,7 +1474,7 @@ def reject_to_wallet(oid, uid, paid):
     refresh_review(oid)
     return bal
 
-review_pending = {}   # reviewer uid -> {"kind": "amount" | "reason" | "wallet", "oid": id, "ts": when}; staff only, tiny
+review_pending = {}   # reviewer uid -> {"kind": "amount" | "reason" | "wallet" | "approve", "oid": id, "ts": when}; staff only, tiny
 PENDING_TTL = 600     # a typed-answer prompt for staff expires after this; stale prompts must never eat a later message
 
 def _pending_get(d, uid, now=None):
@@ -1516,7 +1517,7 @@ def review_callback(chat, mid, uid, data, cbid):
             core.answer(cbid, "بررسی رسید خودکار فقط برای مالک ممکن است"); return
         if action == "ok":
             confirm_auto_receipt(oid, uid); core.answer(cbid, "تأیید شد؛ سرویس دوباره تحویل نمی‌شود"); return
-        if action == "amt":
+        if action in ("amt", "okx"):
             core.answer(cbid, "مبلغ رسید خودکار قابل تغییر نیست؛ تأیید یا رد کن"); return
     if o["status"] != "review" and not pending_auto:
         core.answer(cbid, "این سفارش قبلاً بررسی شده"); refresh_review(oid); return
@@ -1529,8 +1530,14 @@ def review_callback(chat, mid, uid, data, cbid):
         core.answer(cbid, {"ok": "✅ تأیید شد و سرویس ارسال شد", "done": "این سفارش قبلاً بررسی شده",
                            "short": "مبلغ واریزی کمتر از فاکتور است؛ رد کن یا مبلغ را اصلاح کن",
                            "pending": "✅ تأیید شد؛ ساخت سرویس کمی طول می‌کشد و خودکار تکرار می‌شود"}[res]); return
-    if action in ("amt", "wal") and not owner:
+    if action in ("amt", "wal", "okx") and not owner:
         core.answer(cbid, "این کار فقط برای مالک ممکن است؛ در صورت اختلاف، رد کن یا به مالک بگو"); return
+    if action == "okx":
+        review_pending[uid] = {"kind": "approve", "oid": oid, "ts": time.time()}; core.answer(cbid)
+        core.send(chat, "✅ مبلغی که واقعاً برای سفارش #%d واریز شده را به تومان بفرست.\n"
+                  "سفارش همان لحظه تأیید می‌شود%s (فاکتور: %s)"
+                  % (oid, "." if o["kind"] == "topup" else " و مبلغ اضافه به کیف پول مشتری می‌رود.", toman(o["amount"])),
+                  [[{"text": "انصراف", "callback_data": "r:back:%d" % oid}]]); return
     if action == "wal" and o["kind"] != "topup":
         review_pending[uid] = {"kind": "wallet", "oid": oid, "ts": time.time()}; core.answer(cbid)
         core.send(chat, "💰 مبلغی که واقعاً برای سفارش #%d واریز شده را به تومان بفرست.\n"
@@ -1578,9 +1585,20 @@ def review_text(chat, uid, text):
         if bal is None: core.send(chat, "این سفارش دیگر در انتظار بررسی نیست."); return True
         core.send(chat, "💰 سفارش #%d رد شد و %s به کیف پول مشتری رفت (موجودی: %s). به مشتری خبر داده شد."
                   % (o["id"], toman(n), toman(bal))); return True
+    if st["kind"] == "approve" and o["kind"] != "topup" and n < o["amount"]:
+        core.send(chat, "این مبلغ کمتر از فاکتور (%s) است و سفارش تأیید نشد؛ از «💰 رد و انتقال واریزی به کیف پول» استفاده کن."
+                  % toman(o["amount"])); return True
     c = core.db(); n_rows = c.execute("UPDATE shop_orders SET paid_amount=? WHERE id=? AND status='review'", (n, o["id"])).rowcount
     c.commit(); c.close()
     if not n_rows: core.send(chat, "این سفارش دیگر در انتظار بررسی نیست."); return True
+    if st["kind"] == "approve":
+        log(uid, "order_paid_amount", o["id"], n)
+        res = approve(o["id"], uid)
+        core.send(chat, {"ok": "✅ سفارش #%d با مبلغ %s تأیید شد." % (o["id"], toman(n)),
+                         "done": "این سفارش دیگر در انتظار بررسی نیست.",
+                         "short": "مبلغ کمتر از فاکتور است؛ سفارش تأیید نشد.",
+                         "pending": "✅ سفارش #%d تأیید شد؛ ساخت سرویس خودکار تکرار می‌شود." % o["id"]}[res])
+        return True
     log(uid, "order_paid_amount", o["id"], n); refresh_review(o["id"])
     core.send(chat, "✏️ مبلغ واریزی سفارش #%d ثبت شد: %s%s" % (o["id"], toman(n),
               "" if n >= o["amount"] else "\n⚠️ کمتر از فاکتور است؛ تأیید ممکن نیست."))

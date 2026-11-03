@@ -977,6 +977,24 @@ class ShopHardeningTests(SalesCase):
         bot.handle_update(msg(BOB, "/start ref_²"))                  # must not crash the update
         self.assertIsNotNone(shop.get_customer(BOB))
 
+    def test_owner_approves_an_overpaid_invoice_in_one_step(self):
+        o = self.buy(); bot.handle_update(photo(ALICE))
+        bot.handle_update(cb(SUPPORT, "r:okx:%d" % o["id"])); bot.handle_update(msg(SUPPORT, "200000"))
+        self.assertEqual(self.row("SELECT status,paid_amount FROM shop_orders")[:], ("review", None))   # support may not
+        bot.handle_update(cb(ADMIN, "r:okx:%d" % o["id"])); bot.handle_update(msg(ADMIN, "100000"))
+        self.assertEqual(self.row("SELECT status,paid_amount FROM shop_orders")[:], ("review", None))   # short: refused
+        self.assertIn("کمتر از فاکتور", self.last()["text"])
+        bot.handle_update(cb(ADMIN, "r:okx:%d" % o["id"])); bot.handle_update(msg(ADMIN, "9999999"))
+        self.assertEqual(self.row("SELECT status,paid_amount FROM shop_orders")[:], ("review", None))   # over the 2x cap
+        bot.handle_update(msg(ADMIN, "۲۰۰٬۰۰۰"))
+        self.assertEqual(self.row("SELECT status,paid_amount FROM shop_orders")[:], ("approved", 200000))
+        self.assertEqual(len(self.minted), 1)
+        self.assertEqual(shop.balance(ALICE), 50000)                  # 200k paid - 150k price
+        self.assertTrue(any("به کیف پولت برگشت" in t for t in self.texts(ALICE)))
+        self.assertIn("تأیید شد", self.texts(ADMIN)[-1])
+        bot.handle_update(cb(ADMIN, "r:ok:%d" % o["id"]))             # a late click changes nothing
+        self.assertEqual(shop.balance(ALICE), 50000); self.assertEqual(len(self.minted), 1)
+
     def test_owner_can_reject_an_underpaid_invoice_into_the_wallet(self):
         o = self.buy(); bot.handle_update(photo(ALICE))
         kb = self.last("sendPhoto")["reply_markup"]["inline_keyboard"]
