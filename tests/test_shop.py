@@ -977,6 +977,29 @@ class ShopHardeningTests(SalesCase):
         bot.handle_update(msg(BOB, "/start ref_²"))                  # must not crash the update
         self.assertIsNotNone(shop.get_customer(BOB))
 
+    def test_owner_can_reject_an_underpaid_invoice_into_the_wallet(self):
+        o = self.buy(); bot.handle_update(photo(ALICE))
+        kb = self.last("sendPhoto")["reply_markup"]["inline_keyboard"]
+        self.assertEqual(kb[-1][0]["callback_data"], "r:wal:%d" % o["id"])
+        bot.handle_update(cb(SUPPORT, "r:wal:%d" % o["id"])); bot.handle_update(msg(SUPPORT, "100000"))
+        self.assertEqual(self.row("SELECT status FROM shop_orders")["status"], "review")   # support may not
+        bot.handle_update(cb(ADMIN, "r:wal:%d" % o["id"])); bot.handle_update(msg(ADMIN, "150000"))
+        self.assertIn("کمتر از فاکتور نیست", self.last()["text"])
+        self.assertEqual(self.row("SELECT status FROM shop_orders")["status"], "review")   # not short: approve instead
+        bot.handle_update(cb(ADMIN, "r:wal:%d" % o["id"])); bot.handle_update(msg(ADMIN, "۱۰۰٬۰۰۰"))
+        row = self.row("SELECT status,paid_amount,decided_by FROM shop_orders")
+        self.assertEqual(row[:], ("rejected", 100000, ADMIN))
+        self.assertEqual(shop.balance(ALICE), 100000); self.assertEqual(self.minted, [])
+        self.assertEqual(self.row("SELECT kind,delta FROM shop_wallet_tx")[:], ("partial", 100000))
+        self.assertTrue(any("به کیف پولت اضافه شد" in t for t in self.texts(ALICE)))
+        to_alice = [q for m, q in self.calls if m == "sendMessage" and q.get("chat_id") == ALICE][-1]
+        self.assertIn("c:topup_amt:50000", str(to_alice["reply_markup"]))
+        self.assertFalse(shop.purchase_blocked(ALICE))                # no penalty for paying short
+        self.assertIsNone(shop.reject_to_wallet(o["id"], ADMIN, 100000))   # idempotent: already decided
+        self.assertEqual(shop.balance(ALICE), 100000)
+        bot.handle_update(cb(ADMIN, "r:ok:%d" % o["id"]))             # rejected: cannot be approved anymore
+        self.assertEqual(self.row("SELECT status FROM shop_orders")["status"], "rejected")
+
     def test_support_cannot_change_or_approve_a_corrected_amount(self):
         o = self.buy(); bot.handle_update(photo(ALICE))
         bot.handle_update(cb(SUPPORT, "r:amt:%d" % o["id"])); bot.handle_update(msg(SUPPORT, "999999"))

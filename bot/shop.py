@@ -660,7 +660,8 @@ def balance(uid):
     r = get_customer(uid); return r["wallet"] if r else 0
 
 TX_LABELS = {"topup": "شارژ کیف پول", "purchase": "خرید", "auto": "تمدید خودکار", "refund": "بازگشت وجه",
-             "overpay": "مبلغ اضافهٔ واریزی", "admin": "تغییر توسط پشتیبانی", "referral": "پاداش دعوت"}
+             "overpay": "مبلغ اضافهٔ واریزی", "admin": "تغییر توسط پشتیبانی", "referral": "پاداش دعوت",
+             "partial": "انتقال واریزی ناقص به کیف پول"}
 
 def tx_lines(uid, limit):
     """Financial history: wallet movements plus approved direct card purchases.
@@ -968,8 +969,11 @@ def review_kb(o):
         return [[{"text": "✅ تأیید", "callback_data": "r:ok:%d" % o["id"]},
                  {"text": "❌ رد", "callback_data": "r:no:%d" % o["id"]}]]
     if o["status"] != "review": return []
-    return [[{"text": "✅ تأیید", "callback_data": "r:ok:%d" % o["id"]}, {"text": "❌ رد", "callback_data": "r:no:%d" % o["id"]}],
+    rows = [[{"text": "✅ تأیید", "callback_data": "r:ok:%d" % o["id"]}, {"text": "❌ رد", "callback_data": "r:no:%d" % o["id"]}],
             [{"text": "✏️ اصلاح مبلغ واریزی (فقط مالک)", "callback_data": "r:amt:%d" % o["id"]}]]
+    if o["kind"] != "topup":
+        rows.append([{"text": "💰 رد و انتقال واریزی به کیف پول (فقط مالک)", "callback_data": "r:wal:%d" % o["id"]}])
+    return rows
 
 PAID_MAX_FACTOR = 2   # a corrected "paid" amount may be at most twice the invoice; more is a typo, never money
 
@@ -1440,7 +1444,36 @@ def reject(oid, uid, reason):
     refresh_review(oid)
     return True
 
-review_pending = {}   # reviewer uid -> {"kind": "amount" | "reason", "oid": id, "ts": when}; staff only, tiny
+def reject_to_wallet(oid, uid, paid):
+    """An under-paid invoice: reject it and credit what was really paid to the customer's wallet, in one
+    transaction (ledger ref order:<id> under kind 'partial' makes a retry a no-op). Returns the new balance
+    or None when the order is no longer under review. No purchase penalty: paying short is not fraud."""
+    now = int(time.time()); c = core.db()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        o = c.execute("SELECT * FROM shop_orders WHERE id=? AND status='review' AND kind!='topup'", (oid,)).fetchone()
+        if not o: c.rollback(); return None
+        c.execute("UPDATE shop_orders SET status='rejected',paid_amount=?,note=?,decided_ts=?,decided_by=? WHERE id=?",
+                  (paid, "مبلغ واریزی کمتر از فاکتور بود؛ به کیف پول منتقل شد", now, uid, oid))
+        bal = wallet_apply(c, o["tg_id"], paid, "partial", ref="order:%d" % oid, actor=uid)
+        c.commit()
+    except sqlite3.IntegrityError:
+        c.rollback(); return None
+    finally:
+        c.close()
+    log(uid, "order_reject_to_wallet", oid, paid)
+    short = o["price"] - paid
+    core.send(o["tg_id"], "ℹ️ مبلغ واریزی سفارش #%s (%s) کمتر از فاکتور (%s) بود.\n"
+              "سفارش بسته شد و <b>%s</b> به کیف پولت اضافه شد؛ موجودی: <b>%s</b>\n\n"
+              "می‌تونی %s دیگه شارژ کنی و همون پلن رو از کیف پول بخری، یا یه پلن ارزون‌تر انتخاب کنی 👇"
+              % (fa(oid), toman(paid), toman(o["price"]), toman(paid), toman(bal), toman(short)),
+              [[{"text": "➕ شارژ %s" % toman(max(TOPUP_MIN, -(-short // 1000) * 1000)),
+                 "callback_data": "c:topup_amt:%d" % max(TOPUP_MIN, -(-short // 1000) * 1000)}],
+               [{"text": "🛒 خرید سرویس", "callback_data": "c:buy"}]])
+    refresh_review(oid)
+    return bal
+
+review_pending = {}   # reviewer uid -> {"kind": "amount" | "reason" | "wallet", "oid": id, "ts": when}; staff only, tiny
 PENDING_TTL = 600     # a typed-answer prompt for staff expires after this; stale prompts must never eat a later message
 
 def _pending_get(d, uid, now=None):
@@ -1496,8 +1529,13 @@ def review_callback(chat, mid, uid, data, cbid):
         core.answer(cbid, {"ok": "✅ تأیید شد و سرویس ارسال شد", "done": "این سفارش قبلاً بررسی شده",
                            "short": "مبلغ واریزی کمتر از فاکتور است؛ رد کن یا مبلغ را اصلاح کن",
                            "pending": "✅ تأیید شد؛ ساخت سرویس کمی طول می‌کشد و خودکار تکرار می‌شود"}[res]); return
-    if action == "amt" and not owner:
-        core.answer(cbid, "اصلاح مبلغ فقط برای مالک ممکن است؛ در صورت اختلاف، رد کن یا به مالک بگو"); return
+    if action in ("amt", "wal") and not owner:
+        core.answer(cbid, "این کار فقط برای مالک ممکن است؛ در صورت اختلاف، رد کن یا به مالک بگو"); return
+    if action == "wal" and o["kind"] != "topup":
+        review_pending[uid] = {"kind": "wallet", "oid": oid, "ts": time.time()}; core.answer(cbid)
+        core.send(chat, "💰 مبلغی که واقعاً برای سفارش #%d واریز شده را به تومان بفرست.\n"
+                  "سفارش رد می‌شود و همین مبلغ به کیف پول مشتری می‌رود تا با شارژ باقی‌مانده یا پلن ارزان‌تر خرید کند. (فاکتور: %s)"
+                  % (oid, toman(o["amount"])), [[{"text": "انصراف", "callback_data": "r:back:%d" % oid}]]); return
     if action == "no":
         core.answer(cbid)
         kb = [[{"text": r, "callback_data": "r:nor:%d:%d" % (oid, i)}] for i, r in enumerate(REJECT_REASONS)]
@@ -1533,6 +1571,13 @@ def review_text(chat, uid, text):
                   "با «👤 کاربران» کیف پولش را دستی شارژ کن." % (fa(PAID_MAX_FACTOR), toman(o["amount"]))); return True
     if uid not in owner_ids(): review_pending.pop(uid, None); return True
     review_pending.pop(uid, None)
+    if st["kind"] == "wallet":
+        if n >= o["amount"]:
+            core.send(chat, "این مبلغ کمتر از فاکتور نیست؛ به‌جای انتقال، سفارش را ✅ تأیید کن (یا با ✏️ مبلغ را اصلاح کن)."); return True
+        bal = reject_to_wallet(o["id"], uid, n)
+        if bal is None: core.send(chat, "این سفارش دیگر در انتظار بررسی نیست."); return True
+        core.send(chat, "💰 سفارش #%d رد شد و %s به کیف پول مشتری رفت (موجودی: %s). به مشتری خبر داده شد."
+                  % (o["id"], toman(n), toman(bal))); return True
     c = core.db(); n_rows = c.execute("UPDATE shop_orders SET paid_amount=? WHERE id=? AND status='review'", (n, o["id"])).rowcount
     c.commit(); c.close()
     if not n_rows: core.send(chat, "این سفارش دیگر در انتظار بررسی نیست."); return True
