@@ -95,6 +95,19 @@ class BuildSectionsTests(unittest.TestCase):
         self.assertEqual(dom[0]["domain"], ["geosite:google", "claude.ai"])
         self.assertEqual(dom[0]["outboundTag"], "mj-clean")
 
+    def test_youtube_exception_precedes_google_and_is_owned(self):
+        domains = bot.parse_domains("geosite:google\n!geosite:youtube\n!domain:googlevideo.com")
+        outbounds = [{**self.OB[0], "domains": domains}]
+        outs, rules, _ = bot.build_xray_sections(outbounds, {"abc": outbounds})
+        direct = next(o for o in outs if o["tag"] == "mj-direct:exception")
+        self.assertEqual(direct["protocol"], "freedom")
+        for scoped in (True, False):
+            matching = [r for r in rules if r.get("domain") and bool(r.get("user")) == scoped]
+            self.assertEqual([r["domain"] for r in matching],
+                             [["geosite:youtube", "domain:googlevideo.com"], ["geosite:google"]])
+            self.assertEqual(matching[0]["outboundTag"], direct["tag"])
+            self.assertTrue(bot._routing_rule_owned(matching[0]))
+
     def test_no_outbounds_means_no_rules(self):
         outs, rules, tests = bot.build_xray_sections([])
         self.assertEqual(rules, [])

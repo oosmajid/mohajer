@@ -1151,6 +1151,16 @@ def ob_catchall_index(obs):
             return i
     return None
 
+def _direct_domain_rule(obs, **scope):
+    domains = list(dict.fromkeys(
+        domain[1:] for outbound in obs for domain in (outbound.get("domains") or [])
+        if domain and domain.startswith("!") and len(domain) > 1
+    ))
+    if domains:
+        return {"type": "field", "domain": domains, "outboundTag": "mj-direct:exception", **scope}
+    return None
+
+
 def build_xray_sections(obs, custom=None):
     """-> (outbounds, routing rules, loopback test inbounds).
 
@@ -1183,8 +1193,11 @@ def build_xray_sections(obs, custom=None):
         if user_catch is not None:
             # Match the global catch-all's safety rule, but only for this link.
             rules.append({"type": "field", "user": user, "ip": ["geoip:private"], "outboundTag": "direct"})
+        direct_rule = _direct_domain_rule(user_obs, user=user)
+        if direct_rule:
+            rules.append(direct_rule)
         for o in user_obs:
-            doms = [d for d in (o.get("domains") or []) if d]
+            doms = [d for d in (o.get("domains") or []) if d and not d.startswith("!")]
             if doms:
                 rules.append({"type": "field", "user": user, "domain": doms,
                               "outboundTag": ob_user_xtag(token, o["tag"])})
@@ -1195,10 +1208,15 @@ def build_xray_sections(obs, custom=None):
     if catch is not None:
         # never push LAN/loopback (incl. our own tunnel plumbing) through the upstream
         rules.append({"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"})
+    direct_rule = _direct_domain_rule(obs)
+    if direct_rule:
+        rules.append(direct_rule)
     for o in obs:
-        doms = [d for d in (o.get("domains") or []) if d]
+        doms = [d for d in (o.get("domains") or []) if d and not d.startswith("!")]
         if doms:
             rules.append({"type": "field", "domain": doms, "outboundTag": ob_xtag(o["tag"])})
+    if any(rule["outboundTag"] == "mj-direct:exception" for rule in rules):
+        outs.append({**direct, "tag": "mj-direct:exception"})
     outs.append({"tag": "block", "protocol": "blackhole", "settings": {}})
     return outs, rules, tests
 
@@ -2960,7 +2978,7 @@ def _render_link_outbounds(obs, editable):
                         "style='width:100%%;max-width:100%%'>"
                         "<label class=hint for='ob_link_%d'>لینک خروجی</label>"
                         "<textarea id='ob_link_%d' name='ob_link_%d' rows=3 dir=ltr>%s</textarea>"
-                        "<label class=hint for='ob_dom_%d'>دامنه‌ها؛ هر خط یکی. خالی = خروجی همهٔ ترافیک</label>"
+                        "<label class=hint for='ob_dom_%d'>دامنه‌ها، هر خط یکی. برای مسیر مستقیم: <code dir=ltr>!geosite:youtube</code>. خالی = همهٔ ترافیک</label>"
                         "<textarea id='ob_dom_%d' name='ob_dom_%d' rows=3 dir=ltr>%s</textarea>"
                         "<label class=row><input type=checkbox name='ob_delete_%d'>حذف این خروجی</label>"
                         "</div></div>" % (i, i, i, tag, i, i, i, link, i, i, i, domains, i))
@@ -2976,7 +2994,7 @@ def _render_link_outbounds(obs, editable):
                     "<input type=text name=new_ob_tag maxlength=24 placeholder='نام کوتاه، مثلاً clean-ai' "
                     "style='width:100%;max-width:100%'>"
                     "<textarea name=new_ob_link rows=3 dir=ltr placeholder='vless://… یا socks://…'></textarea>"
-                    "<label class=hint for=new_ob_dom>دامنه‌ها؛ هر خط یکی. خالی = همهٔ ترافیک</label>"
+                    "<label class=hint for=new_ob_dom>دامنه‌ها، هر خط یکی. برای مسیر مستقیم: <code dir=ltr>!geosite:youtube</code>. خالی = همهٔ ترافیک</label>"
                     "<textarea id=new_ob_dom name=new_ob_dom rows=3 dir=ltr></textarea>"
                     "</div></div>")
     elif not rows:
@@ -3090,7 +3108,7 @@ def _ob_card(i, o, csrf):
         "<details><summary class=hint>نمایش لینک اتصال</summary><p class=hint dir=ltr style='word-break:break-all;text-align:left'>%s</p></details>"
         "<span class='pill oball' id='all-%s' style='display:none'></span>"
         "<label class=hint style='margin-top:8px'>دامنه‌هایی که از این خروجی بروند "
-        "(هر خط یکی) — <b>خالی بگذارید تا همهٔ ترافیک از اینجا برود</b>:</label>"
+        "(هر خط یکی). برای مسیر مستقیم: <code dir=ltr>!geosite:youtube</code>. <b>خالی بگذارید تا همهٔ ترافیک از اینجا برود</b>:</label>"
         "<textarea name='dom_%s' data-tag='%s' rows=4 form=obform "
         "placeholder='خالی = همهٔ ترافیک&#10;یا مثلاً:&#10;geosite:google&#10;claude.ai'>%s</textarea>"
         "<div class=obres id='res-%s'%s>%s</div>"
